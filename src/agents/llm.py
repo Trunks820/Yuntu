@@ -71,6 +71,7 @@ TRACE_TRUTH_OBSERVATION_REVISION = 1
 TRACE_TRUTH_MAX_RETURNED_CALLS = 100
 _TRACE_TRUTH_ROLES = frozenset({
     "intent", "extract", "grouping", "selector", "writer", "review",
+    "route_planner",
 })
 _TRACE_TRUTH_PURPOSES = frozenset({
     "INTENT_PARSE",
@@ -450,6 +451,7 @@ VALID_ROLES = frozenset({
     "review",
     "grouping",
     "selector",
+    "route_planner",
 })
 
 # Keyed by (provider, base_url, api_key, verify_ssl) so relay profiles stay isolated.
@@ -3176,6 +3178,7 @@ async def chat_with_usage(
     role: str,
     temperature: float = 0.3,
     json_mode: bool = False,
+    max_tokens: int | None = None,
 ) -> tuple[str, dict]:
     """Like chat() but also returns usage metadata.
 
@@ -3184,5 +3187,10 @@ async def chat_with_usage(
                 "token_input": int, "token_output": int, "latency_ms": int})
     """
     return await _do_chat(
-        system, user, role=role, temperature=temperature, json_mode=json_mode
+        system,
+        user,
+        role=role,
+        temperature=temperature,
+        json_mode=json_mode,
+        max_tokens=max_tokens,
     )

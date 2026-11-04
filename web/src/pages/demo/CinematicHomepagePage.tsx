@@ -802,8 +802,7 @@ export default function CinematicHomepagePage() {
           <i /> <small>YUNTU</small>
         </Link>
         <div className="cmp-header-right">
-          <Link to="/classic">经典模式</Link>
-          <Link to="/history">历史记录</Link>
+          <Link to="/explore">手机规划</Link>
         </div>
       </header>
 

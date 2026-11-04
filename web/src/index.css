@@ -28,29 +28,61 @@
 
 @layer base {
   :root {
-    --color-primary-500: #0f766e;
-    --color-primary-600: #0c625b;
-    --color-accent-400: #fb923c;
-    --color-accent-500: #f97316;
-    --color-sand-100: #f3f4f6;
-    --color-sand-200: #e5e7eb;
+    /*
+     * 云途全局色板：取值以手机端 .ym 那套为准（手机端是用户认可的基准）。
+     * tailwind.config.js 的 primary / accent / sand 指向同一组值；
+     * 下面 --color-* 是历史名字，继续保留给现有代码，值统一从这里取。
+     */
+    --yt-green: #166c5b; /* 主绿 */
+    --yt-deep: #143c35; /* 深绿 */
+    --yt-ink: #173b35; /* 墨色 */
+    --yt-muted: #65705f; /* 次要文字：纸色底上 ≥4.5:1 */
+    --yt-paper: #f7f5ef; /* 纸色底 */
+    --yt-paper-soft: #f1efe6; /* 纸色次级底 */
+    --yt-card: #fffef9; /* 卡片白 */
+    --yt-mint: #dce9d6; /* 薄荷 */
+    --yt-line: #dedfd3; /* 分隔线 */
+    --yt-warning: #a35b48; /* 警示（原橙色系） */
+    --yt-warning-soft: #b57e6b; /* 警示浅色 */
+
+    /*
+     * 字体：两端共用一套来源。手机端 .ym 的 --sans / --serif 引用的就是这里；
+     * Satoshi 只覆盖拉丁字母与数字，中文紧跟在其后，不会被排在后面失效。
+     */
+    --font-sans:
+      "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui,
+      sans-serif;
+    --font-display:
+      "Satoshi", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC",
+      system-ui, sans-serif;
+    --font-mono:
+      ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+      "Courier New", monospace;
+    --font-serif: "Noto Serif CJK SC", "Songti SC", "STSong", "SimSun", serif;
+
+    /* 历史名字保留，值指向上面的全局色板 */
+    --color-primary-500: var(--yt-green);
+    --color-primary-600: var(--yt-green);
+    --color-accent-400: var(--yt-warning-soft);
+    --color-accent-500: var(--yt-warning);
+    --color-sand-100: var(--yt-paper-soft);
+    --color-sand-200: var(--yt-line);
 
     /* 基础色板 */
-    --color-white: #ffffff;
+    --color-white: var(--yt-card);
     --color-black: #000000;
-    --color-surface: #ffffff;
-    --color-bg-secondary: #f8f9fa;
-    --color-bg-tertiary: #e3f0f5;
-    --color-ink: #1c3640;
+    --color-surface: var(--yt-card);
+    --color-bg-secondary: var(--yt-paper);
+    --color-bg-tertiary: var(--yt-mint);
+    --color-ink: var(--yt-ink);
   }
 
   body {
     margin: 0;
-    font-family:
-      "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", system-ui,
-      sans-serif;
+    font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    /* 底色：冷灰 / 暖色都收敛到同一套色板 */
     background-color: var(--color-white);
     color: var(--color-ink);
   }
@@ -59,8 +91,7 @@
   h2,
   h3,
   h4 {
-    font-family:
-      "Satoshi", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    font-family: var(--font-display);
   }
 }
 
@@ -120,7 +151,7 @@
   }
 
   .ambient-glow-sphere {
-    background: radial-gradient(circle, rgba(15, 118, 110, 0.18) 0%, rgba(249, 115, 22, 0.12) 45%, transparent 70%);
+    background: radial-gradient(circle, rgba(22, 108, 91, 0.18) 0%, rgba(163, 91, 72, 0.12) 45%, transparent 70%);
     filter: blur(40px);
   }
 
@@ -378,3 +409,5 @@
     background: rgba(255, 252, 247, 0.98);
   }
 }
+
+

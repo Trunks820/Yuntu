@@ -258,6 +258,36 @@ class Settings(BaseSettings):
     selector_api_key: str = ""
     selector_temperature: float = 0.3
 
+    # v0.14 route planner. Off: the existing selector route stays in charge.
+    # An empty key falls back to GEMINI_API_KEY inside resolve_role_config.
+    route_planner_provider: str = "gemini"
+    route_planner_relay_profile: str = ""
+    route_planner_model: str = "gemini-2.5-flash"
+    route_planner_api_key: str = ""
+    route_planner_temperature: float = 0.3
+    route_planner_timeout_seconds: float = 50.0
+    route_planner_max_tokens: int = 16000
+    route_planner_reasoning_effort: str = "low"
+    route_planner_urban_commute_cap_minutes: int = 150
+    route_planner_taxi_when_transit_over_minutes: int = 40
+    route_planner_taxi_ratio: float = 0.5
+    route_planner_enabled: bool = False
+    route_planner_deadline_seconds: float = 70.0
+    route_planner_amap_time_budget_seconds: float = 25.0
+    route_planner_hotel_lodging_enabled: bool = False
+    route_planner_hotel_lodging_radius_meters: int = 3000
+    route_planner_hotel_lodging_pages: int = 2
+    route_planner_hotel_lodging_timeout_seconds: float = 3.0
+    route_planner_hotel_lodging_cache_ttl_seconds: int = 7 * 24 * 60 * 60
+    route_planner_hotel_lodging_min_hotels: int = 5
+    route_planner_lodging_first_enabled: bool = False
+    route_planner_lodging_first_top_count: int = 12
+    route_planner_lodging_first_drift_km: float = 3.0
+    # Off: lodging copy stays on the previous path. On still has no priced API.
+    lodging_section_v2_enabled: bool = False
+    lodging_price_wait_seconds: float = 5.0
+    lodging_checkin_offset_days: int = 14
+
     @model_validator(mode="after")
     def _validate_commute_mode_settings(self) -> "Settings":
         if self.trip_job_timeout_seconds <= 0:
@@ -335,6 +365,17 @@ class Settings(BaseSettings):
                 raise ValueError(f"{field_name} must be positive")
         positive_fields = (
             "grouping_wall_timeout_seconds",
+            "route_planner_timeout_seconds",
+            "route_planner_deadline_seconds",
+            "route_planner_amap_time_budget_seconds",
+            "route_planner_hotel_lodging_radius_meters",
+            "route_planner_hotel_lodging_pages",
+            "route_planner_hotel_lodging_timeout_seconds",
+            "route_planner_hotel_lodging_cache_ttl_seconds",
+            "route_planner_hotel_lodging_min_hotels",
+            "route_planner_lodging_first_top_count",
+            "route_planner_lodging_first_drift_km",
+            "lodging_price_wait_seconds",
             "export_pdf_city_photo_timeout_seconds",
             "amap_poi_detail_timeout",
             "route_estimate_road_factor",
@@ -365,6 +406,22 @@ class Settings(BaseSettings):
         for field_name in non_negative_fields:
             if int(getattr(self, field_name)) < 0:
                 raise ValueError(f"{field_name} must be non-negative")
+        if int(self.lodging_checkin_offset_days) < 0:
+            raise ValueError("LODGING_CHECKIN_OFFSET_DAYS must not be negative")
+        if int(self.route_planner_max_tokens) < 256:
+            raise ValueError("ROUTE_PLANNER_MAX_TOKENS must be at least 256")
+        if int(self.route_planner_urban_commute_cap_minutes) <= 0:
+            raise ValueError("ROUTE_PLANNER_URBAN_COMMUTE_CAP_MINUTES must be positive")
+        if int(self.route_planner_taxi_when_transit_over_minutes) <= 0:
+            raise ValueError(
+                "ROUTE_PLANNER_TAXI_WHEN_TRANSIT_OVER_MINUTES must be positive"
+            )
+        if not 0 < float(self.route_planner_taxi_ratio) <= 1:
+            raise ValueError("ROUTE_PLANNER_TAXI_RATIO must be > 0 and <= 1")
+        if self.route_planner_reasoning_effort not in {"minimal", "low", "medium", "high"}:
+            raise ValueError(
+                "ROUTE_PLANNER_REASONING_EFFORT must be minimal, low, medium, or high"
+            )
         return self
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

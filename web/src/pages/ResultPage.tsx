@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { PlanSummaryCard } from "@/components/result/PlanSummaryCard";
+import { MobilePlanView } from "@/pages/mobile/MobilePlanView";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { DetailSkeleton } from "@/components/skeleton/DetailSkeleton";
 import { ShareDialog } from "@/components/share/ShareDialog";
 import { SafeDeliveryNotice } from "@/components/result/SafeDeliveryNotice";
@@ -24,6 +26,7 @@ export default function ResultPage() {
   const queryString = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
 
   const navigate = useNavigate();
+  const isMobile = useIsMobileViewport();
   const storeResult = useTripStore((s) => s.result);
   const setResult = useTripStore((s) => s.setResult);
 
@@ -115,9 +118,43 @@ export default function ResultPage() {
     );
   }
 
-  if (result.plans.length === 1) return <DetailSkeleton />;
-
   const { city, request, plans } = result;
+
+  if (isMobile && plans.length === 1) {
+    const plan = plans[0];
+    const timePref = result.time_preferences;
+    const timePrefText =
+      timePref?.daily_start || timePref?.daily_end
+        ? `${timePref.daily_start ?? "出发"}–${timePref.daily_end ?? "返回"}`
+        : null;
+    return (
+      <>
+        <MobilePlanView
+          result={result}
+          plan={plan}
+          jobId={jobId}
+          cityCovers={images}
+          weatherDays={result.weather?.days}
+          timePrefText={timePrefText}
+          packing={plan.packing_checklist ?? []}
+          tips={plan.travel_tips ?? []}
+          transportSlot={null}
+          costSlot={null}
+          pdfLoading={false}
+          onPdf={() => navigate(`/plan/${resultId}/${plan.plan_id}${queryString}`)}
+          onShare={() => setShareOpen(true)}
+          onBack={() => navigate("/")}
+          onOpenPlace={() => navigate(`/plan/${resultId}/${plan.plan_id}${queryString}`)}
+        />
+        <ShareDialog
+          open={shareOpen}
+          onClose={() => setShareOpen(false)}
+          recordId={String(result.result_id)}
+          jobId={jobId ?? undefined}
+        />
+      </>
+    );
+  }
 
   return (
     <div className="relative min-h-screen">

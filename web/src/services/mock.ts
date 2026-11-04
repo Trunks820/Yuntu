@@ -1,5 +1,6 @@
 import type { AsyncSubmitResponse, JobResponse, TripResult } from "@/types/trip";
 import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 
 const MOCK_JOB_ID = "mock-job-001";
 const MOCK_RESULT_ID = "mock-result-001";
@@ -11,7 +12,7 @@ export function resetMock() {
 }
 
 export async function mockSubmitTrip(
-  formData: TripFormData,
+  formData: TripFormData | TripSubmitRequest,
 ): Promise<AsyncSubmitResponse> {
   resetMock();
   await delay(400);

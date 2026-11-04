@@ -162,12 +162,37 @@ class ResultDay(BaseModel):
     narrative: str
 
 
+class ResultLodgingDisplayGroup(BaseModel):
+    kind: str
+    label: str
+    hotels: list[str] = Field(default_factory=list)
+    nightly_low_cny: int | None = None
+    nightly_high_cny: int | None = None
+
+
+class ResultLodgingDisplayNotice(BaseModel):
+    kind: str
+    text: str = ""
+
+
+class ResultLodgingDisplay(BaseModel):
+    layout: Literal["user_lodging", "homestay", "tiers", "brands", "area_only"]
+    area_label: str
+    caption: str = ""
+    groups: list[ResultLodgingDisplayGroup] = Field(default_factory=list)
+    notices: list[ResultLodgingDisplayNotice] = Field(default_factory=list)
+    round_trip_minutes_low: int | None = None
+    round_trip_minutes_high: int | None = None
+    price_status: Literal["sourced", "待核实"] = "待核实"
+
+
 class ResultAccommodation(BaseModel):
     name: str
     latitude: float
     longitude: float
     source: Literal["user_specified", "auto_recommended"]
     reason: str | None = None
+    display: ResultLodgingDisplay | None = None
 
 
 class ResultTransportOption(BaseModel):
@@ -383,6 +408,54 @@ def _assert_result_contract(condition: bool, reason: str) -> None:
         raise ResultContractUnsupported(reason)
 
 
+def _display_has_sourced_price(display: dict[str, Any] | None) -> bool:
+    if not isinstance(display, dict):
+        return False
+    if display.get("price_status") == "sourced":
+        return True
+    for group in display.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        if group.get("nightly_low_cny") is not None and group.get("nightly_high_cny") is not None:
+            return True
+    return False
+
+
+def _pending_lodging_display(raw: dict[str, Any]) -> dict[str, Any]:
+    """No priced hotel API. Missing nightly bounds stay 待核实."""
+    from src.agents.lodging_section import build_lodging_display
+    from src.agents.schema import AccommodationSuggestion
+
+    try:
+        suggestion = AccommodationSuggestion.model_validate(
+            {
+                "name": raw.get("name"),
+                "latitude": raw.get("latitude"),
+                "longitude": raw.get("longitude"),
+                "source": raw.get("source"),
+                "reason": raw.get("reason") or "",
+                "user_input_unmatched": raw.get("user_input_unmatched") or "",
+            }
+        )
+        display = build_lodging_display(accommodation=suggestion).model_dump(mode="json")
+    except Exception:
+        display = {
+            "layout": "area_only",
+            "area_label": str(raw.get("name") or "").strip(),
+            "caption": "",
+            "groups": [],
+            "notices": [],
+        }
+    display["price_status"] = "待核实"
+    display["groups"] = [
+        {**group, "nightly_low_cny": None, "nightly_high_cny": None}
+        if isinstance(group, dict)
+        else group
+        for group in display.get("groups") or []
+    ]
+    return display
+
+
 def _project_accommodation(plan: dict[str, Any]) -> ResultAccommodation | None:
     raw = plan.get("accommodation")
     if raw is None:
@@ -395,8 +468,14 @@ def _project_accommodation(plan: dict[str, Any]) -> ResultAccommodation | None:
         bool(str(raw.get("name") or "").strip()),
         "plan accommodation name is required",
     )
+    projected = dict(raw)
+    existing = projected.get("display") if isinstance(projected.get("display"), dict) else None
+    if _display_has_sourced_price(existing):
+        projected["display"] = {**existing, "price_status": "sourced"}
+    else:
+        projected["display"] = _pending_lodging_display(projected)
     try:
-        return ResultAccommodation.model_validate(raw)
+        return ResultAccommodation.model_validate(projected)
     except ValidationError as exc:
         raise ResultContractUnsupported("plan accommodation is invalid") from exc
 

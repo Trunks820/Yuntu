@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import replace
 
 from src.agents.food_authorization import (
@@ -555,3 +556,39 @@ def meal_role_recovery_metrics(
         "meal_role_recovered_count": len(recovered),
         "meal_role_recovered_stops": recovered[:10],
     }
+
+
+_LIGHT_FOOD_TYPES = {"cafe", "coffee", "dessert", "bakery", "milk_tea", "tea"}
+_LIGHT_FOOD_WORDS = (
+    "咖啡",
+    "烘焙",
+    "面包",
+    "甜品",
+    "蛋糕",
+    "三明治",
+    "奶茶",
+    "茶饮",
+    "cafe",
+    "coffee",
+    "bakery",
+)
+_NIGHT_HINT_CLOCK_RE = re.compile(r"\d{1,2}\s*[:：]\s*\d{2}")
+_NIGHT_HINT_NEGATION_RE = re.compile(r"(?:不要|别|不宜|不适合).{0,12}(?:夜|晚)")
+
+
+def is_light_food_place(place) -> bool:
+    """Cafe, bakery and tea stops are light food, not a seated meal."""
+    place_type = str(getattr(place, "place_type", "") or "").lower()
+    if place_type in _LIGHT_FOOD_TYPES:
+        return True
+    blob = f"{getattr(place, 'name', '')} {place_type}".lower()
+    return any(word in blob for word in _LIGHT_FOOD_WORDS)
+
+
+def _night_hint_clauses(hint: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[。；;]", hint or "") if part.strip()]
+
+
+def _night_activity_bound_to_place(clause: str, place_name: str) -> bool:
+    name = (place_name or "").strip()
+    return len(name) >= 2 and name in (clause or "")

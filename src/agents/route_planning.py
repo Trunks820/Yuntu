@@ -10061,3 +10061,101 @@ def _parenthetical_base_name(name: str) -> str:
         if len(base) >= 2:
             return base
     return ""
+
+
+ROUTE_NIGHT_HINT_PREFIX = "夜游："
+
+
+def route_night_visit_intervals(day_group, request=None) -> dict[int, tuple[int, int]]:
+    """Public routes do not publish clocked night intervals.
+
+    Preference checks treat a missing interval as unscheduled instead of
+    inventing a visit window.
+    """
+    del day_group, request
+    return {}
+
+
+def route_night_hint(place, interval) -> str:
+    start, end = interval
+    return f"{ROUTE_NIGHT_HINT_PREFIX}{place.name} {int(start)}-{int(end)}"
+
+
+def route_night_gap(day, request=None):
+    """No clocked evening slot exists to miss on the public planner."""
+    del day, request
+    return None
+
+
+async def _v2_verify_traffic(
+    route,
+    *,
+    request,
+    provider,
+    known,
+    known_access,
+    attempted_access,
+    access_walk_rejections,
+    city,
+    citycode,
+    deadline,
+    mode,
+    metrics,
+    must_ids,
+    eligible_ids,
+    coverage=None,
+):
+    """Upgrade estimated legs with the existing Amap resolver, then re-check the day.
+
+    Already quoted facts in ``known`` / ``known_access`` win. A missing provider
+    leaves the estimates in place.
+    """
+    del access_walk_rejections, must_ids, eligible_ids, coverage
+    settings = get_settings()
+    known = {} if known is None else known
+    known_access = {} if known_access is None else known_access
+    if provider is not None:
+        await _v2_resolve_access(
+            route,
+            provider,
+            known_access,
+            attempted_access,
+            city=city,
+            citycode=citycode,
+            deadline=deadline,
+        )
+        for day in route.day_groups:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if not day.commute_legs:
+                continue
+            remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else 60
+            daily_budget = (
+                day.traffic_policy.daily_limit_minutes
+                if day.traffic_policy is not None
+                else daily_commute_budget_minutes(request, settings)
+            )
+            day.commute_legs = await _resolve_precise_legs(
+                day,
+                day.commute_legs,
+                city=city,
+                citycode=citycode,
+                generation_mode=mode,
+                requested_commute_mode=request.commute_mode,
+                daily_budget=daily_budget,
+                single_leg_max=single_leg_max_minutes(mode, settings),
+                provider=provider,
+                metrics=metrics,
+                known_precise_legs=known,
+                concurrency=settings.amap_route_enrichment_concurrency,
+                timeout_seconds=min(
+                    remaining,
+                    max(settings.amap_route_timeout, 1) * max(1, len(day.commute_legs)),
+                ),
+            )
+    for day in route.day_groups:
+        day.commute_legs = [
+            known.get((leg.from_place_id, leg.to_place_id, leg.mode), leg).model_copy(deep=True)
+            for leg in day.commute_legs
+        ]
+        _v2_finalize_day(day, request)

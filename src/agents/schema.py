@@ -119,6 +119,36 @@ class AccommodationRequest(BaseModel):
     longitude: float | None = None
 
 
+class LodgingDisplayNotice(BaseModel):
+    """One lodging sentence that is not a price band."""
+
+    kind: str
+    text: str = ""
+
+
+class LodgingDisplayGroup(BaseModel):
+    """One lodging tier or homestay row. Prices stay empty without a source."""
+
+    kind: str
+    label: str
+    hotels: list[str] = Field(default_factory=list)
+    nightly_low_cny: int | None = None
+    nightly_high_cny: int | None = None
+
+
+class LodgingDisplay(BaseModel):
+    """Structured lodging paragraph. Missing sourced prices use 待核实."""
+
+    layout: Literal["user_lodging", "homestay", "tiers", "brands", "area_only"]
+    area_label: str
+    caption: str = ""
+    groups: list[LodgingDisplayGroup] = Field(default_factory=list)
+    notices: list[LodgingDisplayNotice] = Field(default_factory=list)
+    round_trip_minutes_low: int | None = None
+    round_trip_minutes_high: int | None = None
+    price_status: Literal["sourced", "待核实"] = "待核实"
+
+
 class AccommodationSuggestion(BaseModel):
     """Resolved accommodation anchor.
 
@@ -132,6 +162,7 @@ class AccommodationSuggestion(BaseModel):
     source: Literal["user_specified", "auto_recommended"]
     reason: str = ""
     user_input_unmatched: str = ""
+    display: LodgingDisplay | None = None
 
 
 class AccommodationAnchor(BaseModel):
@@ -785,6 +816,7 @@ class PlanOutput(BaseModel):
     transport: TransportSuggestion | None = None
     packing_checklist: list[PackingChecklistGroup] | None = None
     travel_tips: list[TravelTip] | None = None
+    code_lodging_section: str = ""
     poi_fragments: list[PoiNarrativeFragment] = Field(
         default_factory=list,
         exclude=True,
@@ -963,6 +995,9 @@ class RoutePlan(BaseModel):
         default=None,
         exclude=True,
     )
+    planner_source: str = ""
+    preference_coverage: list[dict] = Field(default_factory=list)
+    nearby_lodging_hotel_names: list[str] | None = None
 
 
 PublishedVariant = Literal["normal", "safe"]

@@ -1,4 +1,5 @@
 import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 
 const PENDING_SUBMISSION_KEY = "yuntu_pending_submission";
 
@@ -9,7 +10,7 @@ export interface PendingSubmission {
   created_at: number;
 }
 
-export function generateFingerprint(formData: TripFormData): string {
+export function generateFingerprint(formData: TripFormData | TripSubmitRequest): string {
   const normalized = {
     accommodation: formData.accommodation
       ? {

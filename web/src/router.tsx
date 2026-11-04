@@ -2,20 +2,22 @@
 import { createBrowserRouter } from "react-router-dom";
 import { lazy, Suspense } from "react";
 import App from "./App";
+import { useIsMobileViewport } from "./hooks/useIsMobileViewport";
 
 const CinematicHomepagePage = lazy(() => import("./pages/demo/CinematicHomepagePage"));
-const InputPage = lazy(() => import("./pages/InputPage"));
+const MobileHomePage = lazy(() => import("./pages/mobile/MobileHomePage"));
+const MobileExplorePage = lazy(() => import("./pages/mobile/MobileExplorePage"));
+const MobileInspirationPage = lazy(() => import("./pages/mobile/MobileInspirationPage"));
 const PlanningPage = lazy(() => import("./pages/PlanningPage"));
 const ResultPage = lazy(() => import("./pages/ResultPage"));
 const PlanDetailPage = lazy(() => import("./pages/PlanDetailPage"));
-const DemoResultPage = lazy(() => import("./pages/DemoResultPage"));
-const PlanDetailDemoLight = lazy(() => import("./pages/PlanDetailDemoLight"));
-const PlanDetailClassicPage = lazy(
-  () => import("./pages/PlanDetailClassicPage"),
-);
 const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
-const DemoInputCapsule = lazy(() => import("./pages/demo/DemoInputCapsule"));
-const DemoPlanningPage = lazy(() => import("./pages/demo/DemoPlanningPage"));
+
+/** 手机视口用手机首页，宽屏继续用现有沉浸首页。 */
+function ResponsiveHomePage() {
+  const mobile = useIsMobileViewport();
+  return mobile ? <MobileHomePage /> : <CinematicHomepagePage />;
+}
 
 function LazyPage({ children }: { children: React.ReactNode }) {
   return (
@@ -32,49 +34,6 @@ function LazyPage({ children }: { children: React.ReactNode }) {
   );
 }
 
-const demoRoutes = [
-  {
-    path: "demo/input-capsule",
-    element: (
-      <LazyPage>
-        <DemoInputCapsule />
-      </LazyPage>
-    ),
-  },
-  {
-    path: "demo/planning",
-    element: (
-      <LazyPage>
-        <DemoPlanningPage />
-      </LazyPage>
-    ),
-  },
-  {
-    path: "demo",
-    element: (
-      <LazyPage>
-        <DemoResultPage />
-      </LazyPage>
-    ),
-  },
-  {
-    path: "demo/detail-light",
-    element: (
-      <LazyPage>
-        <PlanDetailDemoLight />
-      </LazyPage>
-    ),
-  },
-  {
-    path: "demo/detail-classic",
-    element: (
-      <LazyPage>
-        <PlanDetailClassicPage />
-      </LazyPage>
-    ),
-  },
-];
-
 export const router = createBrowserRouter([
   {
     path: "/",
@@ -84,23 +43,23 @@ export const router = createBrowserRouter([
         index: true,
         element: (
           <LazyPage>
-            <CinematicHomepagePage />
+            <ResponsiveHomePage />
           </LazyPage>
         ),
       },
       {
-        path: "classic",
+        path: "explore",
         element: (
           <LazyPage>
-            <InputPage />
+            <MobileExplorePage />
           </LazyPage>
         ),
       },
       {
-        path: "cinematic",
+        path: "explore/inspiration",
         element: (
           <LazyPage>
-            <CinematicHomepagePage />
+            <MobileInspirationPage />
           </LazyPage>
         ),
       },
@@ -128,7 +87,6 @@ export const router = createBrowserRouter([
           </LazyPage>
         ),
       },
-      ...demoRoutes,
       {
         path: "*",
         element: (
