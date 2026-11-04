@@ -21,3 +21,5 @@ export function getDayPalette(dayNumber: number): DayPalette {
   const index = Math.max(0, dayNumber - 1) % DAY_PALETTES.length;
   return DAY_PALETTES[index];
 }
+
+

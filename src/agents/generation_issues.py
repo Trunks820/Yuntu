@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Any, Literal
 
@@ -829,3 +831,14 @@ def collect_deterministic_generation_issues(
     )
     issues.extend(map_publish_findings_to_issues(publish_result.findings))
     return issues
+
+
+def body_review_snapshot(payload: dict) -> str:
+    """Stable fingerprint of one review context. Not a secret."""
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def review_issue_id(issue: GenerationIssue) -> str:
+    raw = json.dumps(issue.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]

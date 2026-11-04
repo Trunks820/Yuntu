@@ -1,4 +1,5 @@
 import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 import type {
   AsyncSubmitResponse,
   Artifact,
@@ -107,7 +108,7 @@ function mapStatus(raw: string): JobStatus {
 /* ---------- 提交与任务 API ---------- */
 
 export async function submitTrip(
-  formData: TripFormData,
+  formData: TripFormData | TripSubmitRequest,
   requestId?: string,
 ): Promise<AsyncSubmitResponse> {
   if (USE_MOCK) return mockSubmitTrip(formData);

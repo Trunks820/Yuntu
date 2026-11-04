@@ -171,12 +171,37 @@ export interface TripDay {
 
 export type AccommodationSource = "user_specified" | "auto_recommended";
 
+export interface LodgingDisplayGroup {
+  kind: string;
+  label: string;
+  hotels?: string[];
+  nightly_low_cny?: number | null;
+  nightly_high_cny?: number | null;
+}
+
+export interface LodgingDisplayNotice {
+  kind: string;
+  text: string;
+}
+
+export interface LodgingDisplay {
+  layout: "user_lodging" | "homestay" | "tiers" | "brands" | "area_only";
+  area_label: string;
+  caption?: string;
+  groups?: LodgingDisplayGroup[];
+  notices?: LodgingDisplayNotice[];
+  round_trip_minutes_low?: number | null;
+  round_trip_minutes_high?: number | null;
+  price_status?: "sourced" | "待核实";
+}
+
 export interface AccommodationInfo {
   name: string;
   latitude: number;
   longitude: number;
   source: AccommodationSource;
   reason?: string | null;
+  display?: LodgingDisplay | null;
 }
 
 export interface PackingChecklistGroup {

@@ -742,6 +742,32 @@ async def _run_trip_workflow_inner(
     route_metrics = route_planning.RoutePlanningMetrics()
 
     async def run_route_planning():
+        if bool(getattr(settings, "route_planner_enabled", False)):
+            try:
+                from src.agents import route_planner
+                from src.agents.schema import AccommodationAnchor
+
+                lodging_anchor = None
+                if accommodation is not None:
+                    lodging_anchor = AccommodationAnchor(
+                        suggestion=accommodation,
+                        location_precision="point",
+                    )
+                planner_result = await route_planner.plan_route(
+                    trip_request,
+                    retrieval,
+                    lodging_anchor=lodging_anchor,
+                    settings=settings,
+                )
+                if _route_planner_usable(planner_result, trip_request.days):
+                    logger.info("route planner qualified; using model route")
+                    return [planner_result.plan]
+                logger.warning(
+                    "route planner not usable reason=%s; using selector route",
+                    getattr(planner_result, "reason", ""),
+                )
+            except Exception:
+                logger.exception("route planner failed; using selector route")
         try:
             route_signature = inspect.signature(
                 route_planning.plan_routes
@@ -1133,6 +1159,19 @@ async def _run_trip_workflow_inner(
     generation_metrics.setdefault("review_required_for_complete_body", False)
     generation_metrics.setdefault("review_ran", bool(generation_metrics.get("review_ran")))
     generation_metrics["workflow_deadline_seconds"] = 180
+    plans = _apply_preference_evidence(
+        plans, route_plans, trip_request, generation_metrics
+    )
+    _attach_lodging_displays(plans, route_plans, trip_request, settings)
+    _record_route_diagnostics(
+        generation_metrics,
+        trip_request=trip_request,
+        selector_input=selector_input,
+        retrieval=retrieval,
+        route_plans=route_plans,
+        route_metrics=route_metrics,
+        accommodation=accommodation,
+    )
     if publish_result is None:
         raise RuntimeError("pipeline completed without publish_result")
     if route_plans:
@@ -1240,6 +1279,124 @@ async def _run_trip_workflow_inner(
     elapsed = time.monotonic() - t0
     logger.info("Workflow complete in %.1fs", elapsed)
     return result
+
+
+def _route_planner_usable(result, days: int) -> bool:
+    plan = getattr(result, "plan", None) if result is not None else None
+    groups = getattr(plan, "day_groups", None) if plan is not None else None
+    return bool(
+        result is not None
+        and getattr(result, "qualified", False)
+        and plan is not None
+        and int(days) > 0
+        and len(groups or []) == int(days)
+    )
+
+
+def _apply_preference_evidence(plans, route_plans, trip_request, generation_metrics):
+    """Record preference evidence and splice fixed notices. Failures stay local."""
+    from src.agents.explicit_preference_fulfillment import (
+        evaluate_explicit_preference_fulfillment,
+    )
+    from src.agents.preference_notices import apply_preference_notices
+    from src.agents.preferences import normalize_preferences
+
+    updated = []
+    for index, plan in enumerate(plans):
+        route = route_plans[index] if index < len(route_plans) else None
+        try:
+            updated.append(apply_preference_notices(plan, route, trip_request))
+        except Exception:
+            logger.warning("preference notices skipped", exc_info=True)
+            updated.append(plan)
+    try:
+        normalized = normalize_preferences(trip_request.preferences)
+        generation_metrics["preference_dimensions"] = sorted(
+            normalized.scoring_dimensions
+        )
+        generation_metrics["preference_family"] = bool(
+            normalized.family_arrangement
+        )
+    except Exception:
+        logger.warning("preference normalize skipped", exc_info=True)
+    try:
+        report = evaluate_explicit_preference_fulfillment(
+            trip_request=trip_request,
+            route_plans=route_plans,
+            plans=updated,
+        )
+        payload = report.to_dict()
+        generation_metrics["explicit_preference_fulfillment"] = {
+            "dimensions": list(payload.get("dimensions") or [])[:12],
+            "finding_count": len(payload.get("findings") or []),
+            "decision_count": len(payload.get("route_decisions") or []),
+        }
+    except Exception:
+        logger.warning("explicit preference fulfillment skipped", exc_info=True)
+    return updated
+
+
+def _attach_lodging_displays(plans, route_plans, trip_request, settings) -> None:
+    """Build lodging copy without a priced hotel API."""
+    if not bool(getattr(settings, "lodging_section_v2_enabled", False)):
+        return
+    from src.agents.lodging_section import (
+        build_lodging_display,
+        render_lodging_display_text,
+    )
+
+    for index, plan in enumerate(plans):
+        accommodation = plan.accommodation
+        if accommodation is None:
+            continue
+        route_plan = route_plans[index] if index < len(route_plans) else None
+        try:
+            display = build_lodging_display(
+                accommodation=accommodation,
+                route_plan=route_plan,
+                trip_request=trip_request,
+                prices=None,
+                nearby_hotel_names=getattr(
+                    route_plan, "nearby_lodging_hotel_names", None
+                ),
+            )
+        except Exception:
+            logger.warning("lodging display build failed", exc_info=True)
+            continue
+        plan.accommodation = accommodation.model_copy(update={"display": display})
+        try:
+            plan.code_lodging_section = render_lodging_display_text(
+                plan.accommodation, display
+            )
+        except Exception:
+            logger.warning("lodging display text failed", exc_info=True)
+
+
+def _record_route_diagnostics(
+    generation_metrics,
+    *,
+    trip_request,
+    selector_input,
+    retrieval,
+    route_plans,
+    route_metrics,
+    accommodation,
+) -> None:
+    from src.agents import route_diagnostics
+
+    try:
+        summary, _replay = route_diagnostics.build_route_observation(
+            request=trip_request,
+            selector_input=selector_input,
+            retrieval=retrieval,
+            plans=route_plans,
+            metrics=route_metrics,
+            elapsed_ms=None,
+            accommodation=accommodation,
+        )
+        generation_metrics["route_diagnostics"] = summary.model_dump(mode="json")
+    except Exception:
+        logger.warning("route diagnostics skipped", exc_info=True)
 
 
 def _must_include_anchor_active() -> bool:

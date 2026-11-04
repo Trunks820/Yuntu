@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
 import type { TripPlan } from "@/types/trip";
 import { cleanSummary, cleanTags } from "@/utils/format";
+import { ThumbsUp, Gauge, Route, ChevronRight } from "lucide-react";
 
 interface PlanSummaryCardProps {
   plan: TripPlan;
@@ -38,7 +39,7 @@ export function PlanSummaryCard({ plan, image, recommended, index = 0, onClick }
         <img src={image} alt={plan.title} className="h-full w-full object-cover" />
         {recommended && (
           <div className="absolute left-3 top-3 flex items-center rounded-full bg-accent-500 px-3 py-1 text-xs font-bold text-white shadow-md">
-            <i className="fas fa-thumbs-up mr-1.5" aria-hidden="true" /> 推荐
+            <ThumbsUp size={14} className="mr-1.5" aria-hidden="true" /> 推荐
           </div>
         )}
       </div>
@@ -65,22 +66,24 @@ export function PlanSummaryCard({ plan, image, recommended, index = 0, onClick }
         <div className="mt-auto flex items-center justify-between border-t border-dashed border-gray-200 pt-3">
           <div className="flex flex-col">
             <span className="mb-0.5 flex items-center text-[11px] text-gray-400">
-              <i className="fas fa-gauge-high mr-1 text-primary-600" aria-hidden="true" /> 行程节奏
+              <Gauge size={14} className="mr-1 text-primary-600" aria-hidden="true" /> 行程节奏
             </span>
             <span className="text-base font-bold text-primary-700">{paceText}</span>
           </div>
           <div className="flex flex-col items-end">
             <span className="mb-0.5 flex items-center text-[11px] text-gray-400">
-              <i className="fas fa-route mr-1 text-primary-600" aria-hidden="true" /> 总通勤
+              <Route size={14} className="mr-1 text-primary-600" aria-hidden="true" /> 总通勤
             </span>
             <span className="text-sm font-semibold text-gray-700">{commuteText}</span>
           </div>
         </div>
 
         <div className="mt-3 flex items-center justify-center gap-1 text-sm font-semibold text-primary-600 transition-transform group-hover:translate-x-0.5">
-          查看详情 <i className="fas fa-chevron-right text-xs" aria-hidden="true" />
+          查看详情 <ChevronRight size={12} aria-hidden="true" />
         </div>
       </div>
     </button>
   );
 }
+
+

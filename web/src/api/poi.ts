@@ -1,4 +1,6 @@
 import { ApiRequestError } from "@/services/errors";
+import { fetchDestinations } from "@/api/destinations";
+import type { PlaceGalleryImage } from "@/types/trip";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
@@ -88,6 +90,40 @@ export async function fetchPoiCatalog(
   query.set("limit", String(limit));
   
   return request<PoiCatalogResponse>(`/trip/poi-catalog?${query.toString()}`, undefined, signal);
+}
+
+export type PoiInspirationCity = { city: string };
+
+export type PoiInspirationPlace = SelectablePoi & {
+  city?: string;
+  gallery?: PlaceGalleryImage[];
+};
+
+export async function fetchPoiInspirationCities(
+  signal?: AbortSignal,
+): Promise<{ cities: PoiInspirationCity[] }> {
+  const dest = await fetchDestinations();
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+  const cities = (dest.destinations ?? [])
+    .map((item) => item.name?.trim())
+    .filter((name): name is string => Boolean(name))
+    .map((city) => ({ city }));
+  return { cities };
+}
+
+export async function fetchPoiInspiration(
+  city: string,
+  afterId = 0,
+  limit = 8,
+  signal?: AbortSignal,
+): Promise<{ places: PoiInspirationPlace[]; next_after_id: number | null }> {
+  const catalog = await fetchPoiCatalog(city, "", afterId, limit, signal);
+  return {
+    places: catalog.places.map((place) => ({ ...place, city, gallery: [] })),
+    next_after_id: catalog.next_after_id,
+  };
 }
 
 export async function checkPoiSelection(

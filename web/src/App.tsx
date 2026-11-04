@@ -1,28 +1,32 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import Header from "./components/layout/Header";
 import { Toast } from "./components/feedback/Toast";
 import { ArtifactTaskNotice } from "./components/feedback/ArtifactTaskNotice";
 import { TripTaskNotice } from "./components/feedback/TripTaskNotice";
+import { useIsMobileViewport } from "./hooks/useIsMobileViewport";
 import { useOnline } from "./hooks/useOnline";
 import { useShareImageTaskStore } from "./stores/shareImageTaskStore";
 import { useTripTaskStore } from "./stores/tripTaskStore";
+
+const MobileTaskToast = lazy(() => import("./components/mobile/MobileTaskToast"));
 
 /** 沉浸式页面自带顶栏/全屏背景，隐藏全局 Header 避免双层栏 */
 function isImmersiveRoute(pathname: string): boolean {
   return (
     pathname === "/" ||
-    pathname === "/classic" ||
+    pathname === "/explore" ||
+    pathname.startsWith("/explore/") ||
     pathname.startsWith("/planning/") ||
-    pathname.startsWith("/plan/") ||
-    pathname.startsWith("/demo/")
+    pathname.startsWith("/plan/")
   );
 }
 
 export default function App() {
   const online = useOnline();
   const location = useLocation();
+  const isMobileViewport = useIsMobileViewport();
   const immersive = isImmersiveRoute(location.pathname);
   const initShareImageStore = useShareImageTaskStore((s) => s.initStore);
   const initTripTaskStore = useTripTaskStore((s) => s.initStore);
@@ -53,8 +57,16 @@ export default function App() {
         </ErrorBoundary>
       </div>
       <Toast />
-      <ArtifactTaskNotice />
-      <TripTaskNotice />
+      {isMobileViewport ? (
+        <Suspense fallback={null}>
+          <MobileTaskToast />
+        </Suspense>
+      ) : (
+        <>
+          <ArtifactTaskNotice />
+          <TripTaskNotice />
+        </>
+      )}
     </div>
   );
 }

@@ -82,6 +82,22 @@ def day_policy(places, request, settings, context, anchor):
         poi_leg_limits=poi,access_leg_limits=access,resolution_state=context.state,
         location_precision=anchor.location_precision if anchor else "unknown")
 
+def is_remote_distance(km: float) -> bool:
+    """Same 20 km cutoff the urban/excursion day classifier already uses."""
+    try:
+        return float(km) >= 20
+    except (TypeError, ValueError):
+        return False
+
+
+def excursion_daily_limit_minutes(request, settings) -> int:
+    """Excursion-day commute cap. Urban days use the planner's own cap."""
+    pace = detect_pace_mode(request)
+    base = {"relaxed": 180, "default": 240, "compact": 270}[pace]
+    mode, _reason = generation_base_mode(request, settings)
+    return math.ceil(base * daily_commute_budget_factor(mode, settings))
+
+
 def recommendation_reason(plan):
     values = [sum(a.duration_minutes for a in d.access_legs) for d in plan.day_groups if len(d.access_legs)==2]
     if len(values)!=len(plan.day_groups) or not values: return "住宿往返时间暂未完整核算"
