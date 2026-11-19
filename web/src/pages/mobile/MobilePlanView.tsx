@@ -12,6 +12,7 @@ import { exactTimeSourceLabel, governedExactTime, periodLabel } from "@/utils/sc
 import { cleanSummary, cleanTags } from "@/utils/format";
 import { categoryName } from "@/constants/places";
 import { SafeDeliveryNotice } from "@/components/result/SafeDeliveryNotice";
+import { QuotaSettlementNotice } from "@/components/result/QuotaSettlementNotice";
 import { MustIncludeNotice } from "@/components/detail/MustIncludeNotice";
 import { CONCEPT_ASSETS } from "@/assets/mobile-concepts/conceptImages";
 import { Icon } from "@/components/mobile/mobileUi";
@@ -199,6 +200,7 @@ export const MobilePlanView: React.FC<MobilePlanViewProps> = ({
                       const period = periodLabel(place.schedule?.period);
                       const leg = day.commute_legs.find((l) => l.from_place_id === place.place_id);
                       const stay = stayText(place.stay_minutes);
+                      const stopNote = place.activity_note?.trim() || place.brief;
                       return (
                         <article key={`${place.place_id}-${i}`} className="day-stop">
                           <div className="stop-top">
@@ -211,7 +213,7 @@ export const MobilePlanView: React.FC<MobilePlanViewProps> = ({
                           <button type="button" className="stop-title" onClick={() => onOpenPlace(place.place_id)}>
                             <h4>{place.name}</h4>
                           </button>
-                          {(place.activity_note || place.brief) && <p>{place.activity_note || place.brief}</p>}
+                          {stopNote && <p>{stopNote}</p>}
                           <div className="tag-row">
                             {stay && (
                               <span className="reason">
@@ -277,6 +279,7 @@ export const MobilePlanView: React.FC<MobilePlanViewProps> = ({
                 {costSlot}
               </div>
 
+              <QuotaSettlementNotice delivery={result.delivery} />
               <div className="result-disclaimer">
                 地点、开放时间与费用以实际情况为准，出发前建议再确认一次。
               </div>
@@ -327,5 +330,3 @@ export const MobilePlanView: React.FC<MobilePlanViewProps> = ({
     </div>
   );
 };
-
-

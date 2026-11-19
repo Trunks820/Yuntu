@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import re
 
+# "7 天", "20:00", "一两天", "十点"; not an ordinal "第二天" or a bare "8月".
+_LEAD_TIME = (
+    r"(?:\d+\s*(?:天|日|周|个月|个?小时|点)|\d{1,2}\s*[:：]\s*\d{2}|"
+    r"(?<![第一二三四五六七八九十两半])[一二三四五六七八九十两半]+\s*(?:天|日|周|个月|个?小时|点))"
+)
+
 UNSUPPORTED_FACT_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         "source_voice_claim",
@@ -60,6 +66,13 @@ UNSUPPORTED_FACT_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         "booking_claim",
         r"(?:不用|无需|免|不需要|不必|提前|记得|建议|最好|需要)?预约",
+    ),
+    (
+        # timeline only: a booking reminder that names a lead time or a
+        # release hour ("提前7天预约", "每天20:00放票").
+        "booking_detail_claim",
+        r"(?:预约|放票|开票|开抢)[^。；！？\n]{0,12}" + _LEAD_TIME + r"[^。；！？\n]*|"
+        + _LEAD_TIME + r"[^。；！？\n]{0,16}(?:预约|放票|开票|开抢|抢票|买票|购票)",
     ),
     (
         "history_culture_claim",
@@ -260,10 +273,76 @@ _DENIED_VERIFIABLE_HARD_FACT_RE = re.compile(
 )
 
 
+_SIGNBOARD_SENTENCE_BREAK_RE = re.compile(r"[。！？!?；;\n\r<>]")
+_SIGNBOARD_VISUAL_RE = re.compile(r"拍摄|拍照|取景|构图|镜头|画面|观察|查看")
+_SIGNBOARD_OBJECT_RE = re.compile(
+    r"店铺|商铺|店面|门头|灯箱|墙面|街景|建筑|标识|文字|字体|字样|边框"
+)
+_SIGNBOARD_FOOD_RE = re.compile(
+    r"菜|餐|食|吃|喝|尝|口味|味道|好吃|可口|分量|必点|"
+    r"点(?:单|餐|这|它|个|一|招牌)|主打|供应|推荐|享用|来(?:一?[份道杯碗])"
+)
+_SIGNBOARD_SUFFIX_RE = re.compile(
+    r"^[，,、]|^(?:和|与|及|或)(?:建筑|灯箱|店面|门头|墙面|街景|标识)|"
+    r"^(?:上(?:的)?|的)(?:文字|字体|图案|轮廓|颜色|边框|外观|反光|细节)|"
+    r"^(?:纳入|放入|放在|框入|拍入)"
+)
+
+
+def _is_visual_signboard(text: str, start: int, end: int) -> bool:
+    """Disambiguate one bare signboard word without granting fact authority.
+
+    Only an explicit, short visual context qualifies. Food, missing context,
+    unknown noun suffixes and context across sentence/markup boundaries retain
+    the original conservative treatment. Inspect each occurrence independently.
+    """
+    if text[start:end] != "招牌":
+        return False
+    left = 0
+    for boundary in _SIGNBOARD_SENTENCE_BREAK_RE.finditer(text, 0, start):
+        left = boundary.end()
+    boundary = _SIGNBOARD_SENTENCE_BREAK_RE.search(text, end)
+    right = boundary.start() if boundary else len(text)
+    context = text[left:right]
+    if (len(context) > 96
+            or not _SIGNBOARD_VISUAL_RE.search(context)
+            or not _SIGNBOARD_OBJECT_RE.search(context)):
+        return False
+    if _SIGNBOARD_FOOD_RE.search(context):
+        return False
+    suffix = text[end:right].lstrip()
+    return not suffix or bool(_SIGNBOARD_SUFFIX_RE.match(suffix))
+
+
+def _prompt_version() -> str:
+    try:
+        from src.config import get_settings
+    except ImportError:  # pragma: no cover
+        return "v6"
+    return str(getattr(get_settings(), "writer_prompt_version", "v6") or "").strip()
+
+
+def _timeline_tiers() -> bool:
+    """v0.15.1: the timeline and article prompts read their checks from writing_tiers."""
+    return _prompt_version() in ("timeline", "article")
+
+
+def _hard_markers() -> tuple[str, ...] | frozenset[str]:
+    if not _timeline_tiers():
+        return VERIFIABLE_HARD_FACT_MARKERS
+    from src.agents.writing_tiers import added_hard_markers, released_hard_markers
+    released = released_hard_markers()
+    return (*(marker for marker in VERIFIABLE_HARD_FACT_MARKERS if marker not in released),
+            *added_hard_markers())
+
+
 def has_verifiable_hard_fact_marker(text: str) -> bool:
     value = text or ""
     return (
-        any(marker in value for marker in VERIFIABLE_HARD_FACT_MARKERS)
+        any(marker in value for marker in _hard_markers()
+            if marker != "招牌")
+        or any(not _is_visual_signboard(value, match.start(), match.end())
+               for match in re.finditer("招牌", value))
         or bool(_VERIFIABLE_CLOCK_TIME_RE.search(value))
         or bool(_VERIFIABLE_TRANSIT_DURATION_RE.search(value))
     )
@@ -302,10 +381,28 @@ def is_safe_soft_expression(snippet: str, evidence: str = "") -> bool:
     return has_soft_expression_marker(snippet) or has_soft_evidence_marker(evidence)
 
 
+# The v6 prompt keeps its own checks; booking_claim already covers these there.
+_TIMELINE_ONLY_FACT_REASONS = frozenset({"booking_detail_claim"})
+
+
 def unsupported_fact_pattern_matches(text: str) -> list[tuple[str, re.Match[str]]]:
+    if _prompt_version() == "article":
+        # v0.15.1 D1/D2: no wording list for the article; prices, clocks and
+        # restrictions are checked per stop against the material (article_writer).
+        return []
     matches: list[tuple[str, re.Match[str]]] = []
+    allowed: frozenset[str] = _TIMELINE_ONLY_FACT_REASONS
+    if _timeline_tiers():
+        from src.agents.writing_tiers import allowed_fact_reasons
+        allowed = allowed_fact_reasons()
     for fact_reason, pattern in UNSUPPORTED_FACT_PATTERNS:
-        matches.extend((fact_reason, match) for match in re.finditer(pattern, text))
+        if fact_reason in allowed:
+            continue
+        for match in re.finditer(pattern, text):
+            if (fact_reason == "signature_dish_claim"
+                    and _is_visual_signboard(text, match.start(), match.end())):
+                continue
+            matches.append((fact_reason, match))
     return matches
 
 

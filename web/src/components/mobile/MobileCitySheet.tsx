@@ -131,5 +131,3 @@ export const MobileLiveCityPicker: React.FC<{
     />
   );
 };
-
-

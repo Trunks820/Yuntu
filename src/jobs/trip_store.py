@@ -20,6 +20,14 @@ from src.jobs.projection_outbox import (
     insert_trip_step,
 )
 from src.pipeline.db import get_session_factory
+from src.jobs.generation_delivery import (
+    GenerationDelivery,
+    GenerationPolicyVersion,
+    RouteDiagnostics,
+    RouteSearchObservation,
+    pending_delivery,
+    validate_delivery_for_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +82,10 @@ class RequestIdConflictError(Exception):
     """Same request_id with a different message."""
 
 
+class GenerationPolicyNotEnabledError(Exception):
+    """A recognized policy cannot create new work in this release slice."""
+
+
 @dataclass(frozen=True)
 class TripJobRecord:
     job_id: str
@@ -95,6 +107,8 @@ class TripJobRecord:
     finished_time: datetime | None
     updated_time: datetime
     user_display_name: str | None = None
+    generation_policy_version: GenerationPolicyVersion = "legacy"
+    delivery: GenerationDelivery | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +119,8 @@ class AsyncTripJobCreateResult:
     queue_position: int
     message: str
     cached: bool
+    generation_policy_version: GenerationPolicyVersion = "legacy"
+    delivery: GenerationDelivery | None = None
 
 
 def _normalize_message(message: str) -> str:
@@ -155,6 +171,13 @@ def _row_to_record(row) -> TripJobRecord:
 
         trip_request_json = json.loads(trip_request_json) if trip_request_json else None
 
+    raw_delivery = getattr(row, "delivery_json", None)
+    if isinstance(raw_delivery, str):
+        raw_delivery = json.loads(raw_delivery) if raw_delivery else None
+    policy = getattr(row, "generation_policy_version", None) or "legacy"
+    if policy == "v0.12" and raw_delivery is None:
+        raise ValueError("v0.12 job is missing delivery_json")
+
     return TripJobRecord(
         job_id=row.job_id,
         request_id=row.request_id,
@@ -175,6 +198,12 @@ def _row_to_record(row) -> TripJobRecord:
         started_time=row.started_time,
         finished_time=row.finished_time,
         updated_time=row.updated_time,
+        generation_policy_version=policy,
+        delivery=(
+            GenerationDelivery.model_validate(raw_delivery)
+            if policy == "v0.12" and raw_delivery is not None
+            else None
+        ),
     )
 
 
@@ -272,6 +301,7 @@ async def get_trip_job_by_id(job_id: str) -> TripJobRecord | None:
                                user_display_name, user_query,
                                status, current_stage, result_type, trip_request_json,
                                result_record_id, reply_text, plan_count, error_message, error_code,
+                               generation_policy_version, delivery_json,
                                created_time, started_time, finished_time, updated_time
                         FROM travel_trip_job
                         WHERE job_id = :job_id
@@ -306,6 +336,7 @@ async def get_trip_job_by_request_id(request_id: str) -> TripJobRecord | None:
                        user_display_name, user_query,
                        status, current_stage, result_type, trip_request_json,
                        result_record_id, reply_text, plan_count, error_message, error_code,
+                       generation_policy_version, delivery_json,
                        created_time, started_time, finished_time, updated_time
                 FROM travel_trip_job
                 WHERE request_id = :request_id
@@ -320,6 +351,8 @@ async def get_trip_job_by_request_id(request_id: str) -> TripJobRecord | None:
 
 async def get_trip_result_delivery_metadata(
     result_record_id: int | None,
+    *,
+    job_id: str | None = None,
 ) -> dict[str, str] | None:
     """Read authoritative delivery fields from the persisted result metrics."""
     if result_record_id is None:
@@ -328,16 +361,54 @@ async def get_trip_result_delivery_metadata(
     async with factory() as session:
         result = await session.execute(
             text("""
-                SELECT quality_metrics
-                FROM travel_plan_record
-                WHERE id = :result_record_id
+                SELECT plan.quality_metrics,
+                       job.generation_policy_version,
+                       job.delivery_json,
+                       job.status,
+                       job.result_type,
+                       job.result_record_id
+                FROM travel_plan_record AS plan
+                LEFT JOIN LATERAL (
+                    SELECT generation_policy_version, delivery_json, status,
+                           result_type, result_record_id
+                    FROM travel_trip_job
+                    WHERE result_record_id = plan.id
+                      AND (
+                          CAST(:job_id AS VARCHAR) IS NULL
+                          OR job_id = CAST(:job_id AS VARCHAR)
+                      )
+                    ORDER BY id ASC
+                    LIMIT 1
+                ) AS job ON TRUE
+                WHERE plan.id = :result_record_id
             """),
-            {"result_record_id": result_record_id},
+            {"result_record_id": result_record_id, "job_id": job_id},
         )
         row = result.one_or_none()
     if row is None:
         return None
     metrics = row.quality_metrics if isinstance(row.quality_metrics, dict) else {}
+    policy = getattr(row, "generation_policy_version", None) or "legacy"
+    if policy == "v0.12":
+        if metrics.get("generation_policy_version") != "v0.12":
+            return None
+        if not {"published_variant", "delivery_status", "delivery"}.issubset(metrics):
+            return None
+        try:
+            job_delivery = GenerationDelivery.model_validate(row.delivery_json)
+            result_delivery = GenerationDelivery.model_validate(metrics["delivery"])
+            if job_delivery != result_delivery:
+                return None
+            validate_delivery_for_job(
+                job_delivery,
+                status=str(row.status),
+                result_type=row.result_type,
+                result_record_id=row.result_record_id,
+                published_variant=metrics["published_variant"],
+                delivery_status=metrics["delivery_status"],
+            )
+        except (ValueError, TypeError):
+            return None
     variant = metrics.get("published_variant", "normal")
     status = metrics.get("delivery_status", "NORMAL")
     if variant not in {"normal", "safe"} or status not in {"NORMAL", "DEGRADED"}:
@@ -414,6 +485,8 @@ async def create_async_trip_job(
     source: str,
     conversation_id: str,
     user_display_name: str | None = None,
+    generation_policy_version: GenerationPolicyVersion = "legacy",
+    allow_new_v012: bool = False,
 ) -> AsyncTripJobCreateResult:
     user_query = _effective_user_query(
         message=message,
@@ -427,13 +500,18 @@ async def create_async_trip_job(
         raise ValueError("source is required")
     if not conversation_id.strip():
         raise ValueError("conversation_id is required")
+    if generation_policy_version not in {"legacy", "v0.12"}:
+        raise ValueError("unsupported generation_policy_version")
     display_name = (user_display_name or "").strip() or None
     if display_name is not None:
         display_name = display_name[:100]
 
     existing = await get_trip_job_by_request_id(request_id.strip())
     if existing is not None:
-        if existing.user_query == user_query:
+        if (
+            existing.user_query == user_query
+            and existing.generation_policy_version == generation_policy_version
+        ):
             queue_position = await queue_position_for_job(existing)
             return AsyncTripJobCreateResult(
                 job_id=existing.job_id,
@@ -442,9 +520,16 @@ async def create_async_trip_job(
                 queue_position=queue_position,
                 message=user_message_for_job(existing),
                 cached=True,
+                generation_policy_version=existing.generation_policy_version,
+                delivery=existing.delivery,
             )
         raise RequestIdConflictError(
             "request_id 已存在，但请求内容不一致",
+        )
+
+    if generation_policy_version == "v0.12" and not allow_new_v012:
+        raise GenerationPolicyNotEnabledError(
+            "generation_policy_version v0.12 is not enabled"
         )
 
     job_id = uuid.uuid4().hex
@@ -462,7 +547,8 @@ async def create_async_trip_job(
                         trip_request_json, status, current_stage,
                         projection_version, trace_completeness,
                         guide_result_state, request_field_provenance,
-                        request_user_supplied_json
+                        request_user_supplied_json, generation_policy_version,
+                        delivery_json
                     ) VALUES (
                         :job_id, :request_id, :source, :conversation_id,
                         :user_display_name, :user_query,
@@ -470,7 +556,8 @@ async def create_async_trip_job(
                         CAST(:trip_request_json AS jsonb), 'PENDING', 'PENDING',
                         1, 'COMPLETE', 'NOT_APPLICABLE',
                         CAST(:request_field_provenance AS jsonb),
-                        CAST(:request_user_supplied_json AS jsonb)
+                        CAST(:request_user_supplied_json AS jsonb),
+                        :generation_policy_version, CAST(:delivery_json AS jsonb)
                     )
                 """),
                 {
@@ -495,6 +582,12 @@ async def create_async_trip_job(
                         request_user_supplied_json or {},
                         ensure_ascii=False,
                     ),
+                    "generation_policy_version": generation_policy_version,
+                    "delivery_json": (
+                        pending_delivery().model_dump_json()
+                        if generation_policy_version == "v0.12"
+                        else None
+                    ),
                 },
             )
             await emit_trip_projection_commit(
@@ -508,7 +601,10 @@ async def create_async_trip_job(
         raced = await get_trip_job_by_request_id(request_id.strip())
         if raced is None:
             raise
-        if raced.user_query == user_query:
+        if (
+            raced.user_query == user_query
+            and raced.generation_policy_version == generation_policy_version
+        ):
             queue_position = await queue_position_for_job(raced)
             return AsyncTripJobCreateResult(
                 job_id=raced.job_id,
@@ -517,6 +613,8 @@ async def create_async_trip_job(
                 queue_position=queue_position,
                 message=user_message_for_job(raced),
                 cached=True,
+                generation_policy_version=raced.generation_policy_version,
+                delivery=raced.delivery,
             )
         raise RequestIdConflictError(
             "request_id 已存在，但请求内容不一致",
@@ -530,6 +628,8 @@ async def create_async_trip_job(
         queue_position=queue_position,
         message=STAGE_USER_MESSAGES["PENDING"],
         cached=False,
+        generation_policy_version=generation_policy_version,
+        delivery=(pending_delivery() if generation_policy_version == "v0.12" else None),
     )
 
 
@@ -548,7 +648,7 @@ async def expire_stale_trip_jobs(*, timeout_seconds: int) -> int:
     async with factory() as session:
         stale_rows = await session.execute(
             text("""
-                SELECT job_id
+                SELECT job_id, generation_policy_version, delivery_json
                 FROM travel_trip_job
                 WHERE status IN ('PENDING', 'RUNNING')
                   AND COALESCE(started_time, created_time)
@@ -558,8 +658,21 @@ async def expire_stale_trip_jobs(*, timeout_seconds: int) -> int:
             """),
             {"timeout_seconds": timeout_seconds},
         )
-        job_ids = [str(row.job_id) for row in stale_rows]
-        for job_id in job_ids:
+        stale_jobs = list(stale_rows)
+        job_ids = [str(row.job_id) for row in stale_jobs]
+        for stale_job in stale_jobs:
+            job_id = str(stale_job.job_id)
+            delivery_json = None
+            if str(stale_job.generation_policy_version or "legacy") == "v0.12":
+                current_delivery = GenerationDelivery.model_validate(
+                    stale_job.delivery_json
+                )
+                delivery_json = GenerationDelivery(
+                    outcome="FAILED",
+                    review_state=current_delivery.review_state,
+                    reason_code="TIMEOUT",
+                    selector_source=current_delivery.selector_source,
+                ).model_dump_json()
             await session.execute(
                 text("""
                     UPDATE travel_trip_job
@@ -567,10 +680,13 @@ async def expire_stale_trip_jobs(*, timeout_seconds: int) -> int:
                         current_stage = 'TIMEOUT',
                         error_code = 'TIMEOUT',
                         error_message = '规划超时，请稍后重试',
-                        finished_time = NOW()
+                        finished_time = NOW(),
+                        delivery_json = COALESCE(
+                            CAST(:delivery_json AS jsonb), delivery_json
+                        )
                     WHERE job_id = :job_id
                 """),
-                {"job_id": job_id},
+                {"job_id": job_id, "delivery_json": delivery_json},
             )
             step_ids = await close_all_running_steps(
                 session,
@@ -587,7 +703,56 @@ async def expire_stale_trip_jobs(*, timeout_seconds: int) -> int:
     return len(job_ids)
 
 
-async def claim_next_pending_trip_job(*, max_concurrency: int) -> TripJobRecord | None:
+async def purge_expired_route_replays() -> int:
+    """Clear only expired sensitive replay bodies; durable summaries remain."""
+    factory = get_session_factory()
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT job_id
+                    FROM travel_trip_job
+                    WHERE route_replay_data IS NOT NULL
+                      AND route_replay_expires_at <= NOW()
+                    ORDER BY id
+                    FOR UPDATE
+                    """
+                )
+            )
+        ).all()
+        for row in rows:
+            job_id = str(row.job_id)
+            await session.execute(
+                text(
+                    """
+                    UPDATE travel_trip_job
+                    SET route_replay_data = NULL,
+                        route_replay_expires_at = NULL,
+                        route_diagnostics = CASE
+                            WHEN route_diagnostics IS NULL THEN NULL
+                            ELSE jsonb_set(
+                                route_diagnostics,
+                                '{replay_available}',
+                                'false'::jsonb,
+                                true
+                            )
+                        END
+                    WHERE job_id = :job_id
+                    """
+                ),
+                {"job_id": job_id},
+            )
+            await emit_trip_projection_commit(session, job_id=job_id)
+        await session.commit()
+        return len(rows)
+
+
+async def claim_next_pending_trip_job(
+    *,
+    max_concurrency: int,
+    allow_v012: bool = False,
+) -> TripJobRecord | None:
     """Atomically claim one PENDING job if concurrency allows."""
     factory = get_session_factory()
     async with factory() as session:
@@ -602,6 +767,13 @@ async def claim_next_pending_trip_job(*, max_concurrency: int) -> TripJobRecord 
                 SELECT j.job_id
                 FROM travel_trip_job j
                 WHERE j.status = 'PENDING'
+                  AND (
+                    j.generation_policy_version = 'legacy'
+                    OR (
+                      :allow_v012
+                      AND j.generation_policy_version = 'v0.12'
+                    )
+                  )
                   AND NOT EXISTS (
                     SELECT 1
                     FROM travel_trip_job r
@@ -613,6 +785,7 @@ async def claim_next_pending_trip_job(*, max_concurrency: int) -> TripJobRecord 
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             """),
+            {"allow_v012": bool(allow_v012)},
         )
         row = pick.first()
         if row is None:
@@ -917,6 +1090,97 @@ async def update_trip_job_trip_request(job_id: str, trip_request: dict) -> None:
         await session.commit()
 
 
+async def _prepare_terminal_delivery(
+    session,
+    *,
+    job_id: str,
+    delivery: GenerationDelivery | dict | None,
+    status: str,
+    result_type: str | None,
+    result_record_id: int | None,
+) -> tuple[bool, str | None]:
+    """Lock the job and validate/fix v0.12 result metadata in this transaction."""
+    job_row = (await session.execute(
+        text("""
+            SELECT status, generation_policy_version
+            FROM travel_trip_job
+            WHERE job_id = :job_id
+            FOR UPDATE
+        """),
+        {"job_id": job_id},
+    )).mappings().one_or_none()
+    if job_row is None:
+        return False, None
+    row_status = (
+        job_row.status if hasattr(job_row, "status") else job_row["status"]
+    )
+    if str(row_status) != "RUNNING":
+        return False, None
+    row_policy = (
+        job_row.generation_policy_version
+        if hasattr(job_row, "generation_policy_version")
+        else job_row["generation_policy_version"]
+    )
+    policy = str(row_policy or "legacy")
+    if policy == "legacy":
+        if delivery is not None:
+            raise ValueError("legacy job cannot persist v0.12 delivery")
+        return True, None
+    if policy != "v0.12":
+        raise ValueError("unsupported persisted generation policy")
+    if delivery is None:
+        raise ValueError("v0.12 terminal transition requires delivery")
+    parsed = (
+        delivery
+        if isinstance(delivery, GenerationDelivery)
+        else GenerationDelivery.model_validate(delivery)
+    )
+    variant: str | None = None
+    delivery_status: str | None = None
+    if result_record_id is not None:
+        plan_row = (await session.execute(
+            text("""
+                SELECT quality_metrics
+                FROM travel_plan_record
+                WHERE id = :result_record_id
+                FOR UPDATE
+            """),
+            {"result_record_id": result_record_id},
+        )).mappings().one_or_none()
+        if plan_row is None:
+            raise ValueError("v0.12 result record does not exist")
+        metrics = (
+            plan_row["quality_metrics"]
+            if isinstance(plan_row["quality_metrics"], dict)
+            else {}
+        )
+        variant = metrics.get("published_variant")
+        delivery_status = metrics.get("delivery_status")
+    validate_delivery_for_job(
+        parsed,
+        status=status,
+        result_type=result_type,
+        result_record_id=result_record_id,
+        published_variant=variant,
+        delivery_status=delivery_status,
+    )
+    serialized = parsed.model_dump_json()
+    if result_record_id is not None:
+        await session.execute(
+            text("""
+                UPDATE travel_plan_record
+                SET quality_metrics = COALESCE(quality_metrics, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'generation_policy_version', 'v0.12',
+                        'delivery', CAST(:delivery_json AS jsonb)
+                    )
+                WHERE id = :result_record_id
+            """),
+            {"result_record_id": result_record_id, "delivery_json": serialized},
+        )
+    return True, serialized
+
+
 async def mark_trip_job_success(
     job_id: str,
     *,
@@ -925,6 +1189,9 @@ async def mark_trip_job_success(
     result_type: str,
     result_record_id: int | None,
     trip_request_json: dict,
+    delivery: GenerationDelivery | dict | None = None,
+    route_diagnostics: dict | None = None,
+    route_replay_data: dict | None = None,
 ) -> None:
     factory = get_session_factory()
     async with factory() as session:
@@ -944,6 +1211,49 @@ async def mark_trip_job_success(
             source=row.source,
             conversation_id=row.conversation_id,
         )
+        active, delivery_json = await _prepare_terminal_delivery(
+            session,
+            job_id=job_id,
+            delivery=delivery,
+            status="SUCCESS",
+            result_type=result_type,
+            result_record_id=result_record_id,
+        )
+        if not active:
+            await session.rollback()
+            return
+        diagnostics_json = None
+        replay_json = None
+        if route_diagnostics is not None:
+            try:
+                projected_diagnostics = RouteDiagnostics.model_validate(
+                    route_diagnostics
+                )
+                projected_diagnostics.replay_available = False
+                if route_replay_data:
+                    candidate_replay = json.dumps(
+                        route_replay_data, ensure_ascii=False, sort_keys=True
+                    )
+                    if len(candidate_replay.encode()) <= 262144:
+                        replay_json = candidate_replay
+                        projected_diagnostics.replay_available = True
+                diagnostics_json = projected_diagnostics.model_dump_json()
+                if len(diagnostics_json.encode()) > 16384:
+                    diagnostics_json = None
+                    replay_json = None
+            except Exception as exc:
+                logger.warning(
+                    "route observation validation failed job_id=%s error_type=%s",
+                    job_id, type(exc).__name__,
+                )
+                diagnostics_json = RouteDiagnostics(
+                    evidence_state="UNAVAILABLE",
+                    stop_reason="ERROR",
+                    candidate_count=None,
+                    search=RouteSearchObservation(),
+                    truncated=False,
+                    replay_available=False,
+                ).model_dump_json()
         result = await session.execute(
             text("""
                 UPDATE travel_trip_job
@@ -956,7 +1266,8 @@ async def mark_trip_job_success(
                     trip_request_json = CAST(:trip_request_json AS jsonb),
                     error_code = NULL,
                     error_message = NULL,
-                    finished_time = NOW()
+                    finished_time = NOW(),
+                    delivery_json = COALESCE(CAST(:delivery_json AS jsonb), delivery_json)
                 WHERE job_id = :job_id
                   AND status = 'RUNNING'
             """),
@@ -967,9 +1278,65 @@ async def mark_trip_job_success(
                 "plan_count": plan_count,
                 "result_record_id": result_record_id,
                 "trip_request_json": json.dumps(trip_request_json, ensure_ascii=False),
+                "delivery_json": delivery_json,
             },
         )
         if result.rowcount:
+            if diagnostics_json is not None:
+                try:
+                    async with session.begin_nested():
+                        await session.execute(
+                            text(
+                                """
+                                UPDATE travel_trip_job
+                                SET route_diagnostics = CAST(:diagnostics AS jsonb),
+                                    route_replay_data = CAST(:replay AS jsonb),
+                                    route_replay_expires_at = CASE
+                                        WHEN :replay IS NOT NULL
+                                        THEN created_time + INTERVAL '7 days'
+                                        ELSE NULL
+                                    END
+                                WHERE job_id = :job_id
+                                """
+                            ),
+                            {
+                                "job_id": job_id,
+                                "diagnostics": diagnostics_json,
+                                "replay": replay_json,
+                            },
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "route observation persistence failed job_id=%s error_type=%s",
+                        job_id, type(exc).__name__,
+                    )
+                    unavailable_json = RouteDiagnostics(
+                        evidence_state="UNAVAILABLE",
+                        stop_reason="ERROR",
+                        candidate_count=None,
+                        search=RouteSearchObservation(),
+                        truncated=False,
+                        replay_available=False,
+                    ).model_dump_json()
+                    try:
+                        async with session.begin_nested():
+                            await session.execute(
+                                text(
+                                    """
+                                    UPDATE travel_trip_job
+                                    SET route_diagnostics = CAST(:diagnostics AS jsonb),
+                                        route_replay_data = NULL,
+                                        route_replay_expires_at = NULL
+                                    WHERE job_id = :job_id
+                                    """
+                                ),
+                                {"job_id": job_id, "diagnostics": unavailable_json},
+                            )
+                    except Exception as marker_exc:
+                        logger.warning(
+                            "route observation unavailable marker failed job_id=%s error_type=%s",
+                            job_id, type(marker_exc).__name__,
+                        )
             step_ids = await close_all_running_steps(
                 session,
                 job_id=job_id,
@@ -991,9 +1358,17 @@ async def mark_trip_job_failed(
     error_detail: str,
     step_metadata: dict | None = None,
     ensure_terminal_step: bool = False,
+    delivery: GenerationDelivery | dict | None = None,
 ) -> None:
     factory = get_session_factory()
     async with factory() as session:
+        active, delivery_json = await _prepare_terminal_delivery(
+            session, job_id=job_id, delivery=delivery, status="FAILED",
+            result_type=None, result_record_id=None,
+        )
+        if not active:
+            await session.rollback()
+            return
         result = await session.execute(
             text("""
                 UPDATE travel_trip_job
@@ -1002,7 +1377,8 @@ async def mark_trip_job_failed(
                     error_code = :error_code,
                     error_message = :error_message,
                     error_detail = :error_detail,
-                    finished_time = NOW()
+                    finished_time = NOW(),
+                    delivery_json = COALESCE(CAST(:delivery_json AS jsonb), delivery_json)
                 WHERE job_id = :job_id
                   AND status = 'RUNNING'
             """),
@@ -1011,6 +1387,7 @@ async def mark_trip_job_failed(
                 "error_code": error_code,
                 "error_message": error_message,
                 "error_detail": error_detail[:4000],
+                "delivery_json": delivery_json,
             },
         )
         if result.rowcount:
@@ -1042,11 +1419,17 @@ async def mark_trip_job_failed(
         await session.commit()
 
 
-async def mark_trip_job_rejected(job_id: str, *, error_code: str) -> None:
+async def mark_trip_job_rejected(
+    job_id: str,
+    *,
+    error_code: str,
+    delivery: GenerationDelivery | dict | None = None,
+) -> None:
     await mark_trip_job_rejected_with_message(
         job_id,
         error_code=error_code,
         error_message=None,
+        delivery=delivery,
     )
 
 
@@ -1057,9 +1440,17 @@ async def mark_trip_job_rejected_with_message(
     error_message: str | None = None,
     step_metadata: dict | None = None,
     ensure_terminal_evidence: bool = False,
+    delivery: GenerationDelivery | dict | None = None,
 ) -> None:
     factory = get_session_factory()
     async with factory() as session:
+        active, delivery_json = await _prepare_terminal_delivery(
+            session, job_id=job_id, delivery=delivery, status="REJECTED",
+            result_type=None, result_record_id=None,
+        )
+        if not active:
+            await session.rollback()
+            return
         result = await session.execute(
             text("""
                 UPDATE travel_trip_job
@@ -1067,7 +1458,8 @@ async def mark_trip_job_rejected_with_message(
                     current_stage = 'CITY_GATE_REJECTED',
                     error_code = :error_code,
                     error_message = :error_message,
-                    finished_time = NOW()
+                    finished_time = NOW(),
+                    delivery_json = COALESCE(CAST(:delivery_json AS jsonb), delivery_json)
                 WHERE job_id = :job_id
                   AND status = 'RUNNING'
             """),
@@ -1075,6 +1467,7 @@ async def mark_trip_job_rejected_with_message(
                 "job_id": job_id,
                 "error_code": error_code,
                 "error_message": error_message,
+                "delivery_json": delivery_json,
             },
         )
         if result.rowcount:
@@ -1112,9 +1505,17 @@ async def mark_trip_job_timeout(
     error_detail: str | None = None,
     step_metadata: dict | None = None,
     ensure_terminal_step: bool = False,
+    delivery: GenerationDelivery | dict | None = None,
 ) -> None:
     factory = get_session_factory()
     async with factory() as session:
+        active, delivery_json = await _prepare_terminal_delivery(
+            session, job_id=job_id, delivery=delivery, status="TIMEOUT",
+            result_type=None, result_record_id=None,
+        )
+        if not active:
+            await session.rollback()
+            return
         result = await session.execute(
             text("""
                 UPDATE travel_trip_job
@@ -1123,7 +1524,8 @@ async def mark_trip_job_timeout(
                     error_code = 'TIMEOUT',
                     error_message = '规划超时，请稍后重试',
                     error_detail = COALESCE(:error_detail, error_detail),
-                    finished_time = NOW()
+                    finished_time = NOW(),
+                    delivery_json = COALESCE(CAST(:delivery_json AS jsonb), delivery_json)
                 WHERE job_id = :job_id
                   AND status = 'RUNNING'
             """),
@@ -1132,6 +1534,7 @@ async def mark_trip_job_timeout(
                 # Keep short non-truncated-JSON summary only. Full observation is
                 # stored in step metadata JSONB by the worker.
                 "error_detail": (error_detail or "")[:1000] or None,
+                "delivery_json": delivery_json,
             },
         )
         if result.rowcount:

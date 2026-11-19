@@ -306,5 +306,3 @@ export const useMobileTripStore = create<MobileTripState>()((set, get) => {
     },
   };
 });
-
-

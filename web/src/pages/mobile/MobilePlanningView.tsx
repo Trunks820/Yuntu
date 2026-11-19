@@ -1,5 +1,6 @@
 import React from "react";
 import type { TripSubmitRequest } from "@/types/tripRequest";
+import type { QuotaState } from "@/types/trip";
 import { CITY_PLACEHOLDER, cityPhotoSources } from "@/utils/cityPhotoSources";
 import { CONCEPT_ASSETS } from "@/assets/mobile-concepts/conceptImages";
 import { MOBILE_SCENES, SCENE_CATEGORY_INTEREST_MAP } from "@/types/mobile";
@@ -15,6 +16,13 @@ const GEN_PHASES: [string, string][] = [
   ["装订好，这本只属于这次的旅行", "下一页，就能看到选择如何改变行程。"],
 ];
 
+/** 与桌面等待页同一套文案：严格依据权威 quota_state，不虚假断言退额 */
+const QUOTA_NOTE: Partial<Record<QuotaState, string>> = {
+  RELEASED: "本次失败未扣除额度（已自动退还）",
+  RESERVED: "额度已预占，结算待确认",
+  UNKNOWN: "额度状态待确认",
+};
+
 const INTEREST_LABELS: Record<string, string> = Object.fromEntries(
   MOBILE_SCENES.map((s) => [SCENE_CATEGORY_INTEREST_MAP[s.category], s.tag]),
 );
@@ -29,6 +37,7 @@ export interface MobilePlanningViewProps {
   /** 状态暂时无法确认（含超时） */
   unknownState: boolean;
   errorMessage: string | null;
+  quotaState: QuotaState | null;
   networkUnstable: boolean;
   pauseReason: string | null;
   retrying: boolean;
@@ -51,6 +60,7 @@ export const MobilePlanningView: React.FC<MobilePlanningViewProps> = ({
   failed,
   unknownState,
   errorMessage,
+  quotaState,
   networkUnstable,
   pauseReason,
   retrying,
@@ -142,6 +152,12 @@ export const MobilePlanningView: React.FC<MobilePlanningViewProps> = ({
                 ))}
               </div>
 
+              {failed && quotaState && QUOTA_NOTE[quotaState] && (
+                <p className="paper-note state-note" style={{ marginTop: 20 }}>
+                  <Icon name="info" />
+                  {QUOTA_NOTE[quotaState]}
+                </p>
+              )}
               {networkUnstable && !failed && !unknownState && !pauseReason && (
                 <p className="paper-note state-note" style={{ marginTop: 20 }} role="status">
                   网络有点弱，正在继续同步进度…
@@ -204,5 +220,3 @@ export const MobilePlanningView: React.FC<MobilePlanningViewProps> = ({
     </div>
   );
 };
-
-

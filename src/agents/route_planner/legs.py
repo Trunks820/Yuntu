@@ -584,5 +584,3 @@ def quoted_known_access(estimator, lodge: CandidatePlace | None, lodging_source:
         )
         known[_v2_access_key(leg, place)] = leg
     return known
-
-

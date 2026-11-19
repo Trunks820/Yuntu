@@ -1,0 +1,1726 @@
+/* =========================================================================
+   Yuntu PC Spread — Start ("出发"：左边一张大相框，右边一步只问一件事)
+   Source of truth: docs/design/yuntu-spread-20261022/styles.css (#view-start)
+   Scoped strictly under .yuntu-spread so mobile / legacy pages are untouched.
+   ========================================================================= */
+
+.yuntu-spread:has(#view-start) {
+  background: var(--paper);
+}
+
+.yuntu-spread .desk:has(> #view-start) {
+  padding: 8px 48px 36px;
+}
+
+.yuntu-spread .desk #view-start,
+.yuntu-spread .desk #view-start * {
+  box-sizing: border-box;
+}
+
+.yuntu-spread .desk #view-start .gallery {
+  width: min(1600px, 100%);
+  height: 100%;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 56px;
+}
+
+/* ───────── 左页：大相框 + 扉页/出发票 ───────── */
+.yuntu-spread .desk #view-start .hero {
+  margin: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.yuntu-spread .desk #view-start .hero-frame {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--paper-2);
+}
+
+.yuntu-spread .desk #view-start .hero-frame img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  animation: yuntu-spread-hero-in 0.5s var(--ease) backwards;
+}
+
+@keyframes yuntu-spread-hero-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.yuntu-spread .desk #view-start .hero-frame img.is-out {
+  animation: none;
+  opacity: 0;
+  transition: opacity 0.3s var(--ease);
+}
+
+.yuntu-spread .desk #view-start .hero-frame.is-loading::after,
+.yuntu-spread .desk #view-start .hero-frame.is-blank::after {
+  content: attr(data-label);
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 0 32px;
+  text-align: center;
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: var(--fs-xl);
+  color: var(--faint);
+}
+
+.yuntu-spread .desk #view-start .hero-cap {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  padding-top: 16px;
+  min-height: 64px;
+}
+
+.yuntu-spread .desk #view-start .cap-main {
+  min-width: 0;
+}
+
+.yuntu-spread .desk #view-start .cap-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: var(--fs-lg);
+  line-height: 1.4;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .cap-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  text-align: right;
+}
+
+.yuntu-spread .desk #view-start .cap-meta {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .hero-credit {
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  max-width: 22em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 扉页填空句子 */
+.yuntu-spread .desk #view-start .draft-sentence {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: 22px;
+  line-height: 1.6;
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+.yuntu-spread .desk #view-start .slot {
+  display: inline-block;
+  min-width: 2.2em;
+  margin: 0 0.1em;
+  padding: 0 0.1em;
+  border-bottom: 1.5px solid var(--line-strong);
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--green);
+  text-align: center;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .slot.is-filled {
+  border-bottom-color: var(--green);
+  animation: yuntu-spread-ink-in 0.4s var(--ease);
+}
+
+.yuntu-spread .desk #view-start .slot:not(:disabled):hover {
+  background: var(--green-tint);
+  border-bottom-color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .slot:disabled {
+  cursor: default;
+}
+
+.yuntu-spread .desk #view-start .slot .hint {
+  font-weight: 500;
+  color: var(--faint);
+}
+
+@keyframes yuntu-spread-ink-in {
+  from {
+    opacity: 0.15;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.yuntu-spread .desk #view-start .draft-notes {
+  margin: 6px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 18px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .draft-notes b {
+  margin-right: 6px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .cap-picks {
+  display: flex;
+  gap: 4px;
+  border-radius: var(--r-sm);
+}
+
+.yuntu-spread .desk #view-start .cap-picks img {
+  width: 48px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  background: var(--paper-2);
+}
+
+.yuntu-spread .desk #view-start .cap-picks:hover img {
+  opacity: 0.85;
+}
+
+/* ───────── 右页：步骤 → 问题 → 选项 → 底栏 ───────── */
+.yuntu-spread .desk #view-start .side {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.yuntu-spread .desk #view-start .side-head {
+  flex-shrink: 0;
+  padding: 4px 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.yuntu-spread .desk #view-start .steps {
+  display: flex;
+  gap: 26px;
+}
+
+.yuntu-spread .desk #view-start .step {
+  position: relative;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  transition: color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .step b {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.yuntu-spread .desk #view-start .step:not(:disabled):hover {
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .step[aria-current="step"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.yuntu-spread .desk #view-start .step[aria-current="step"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -15px;
+  height: 2px;
+  background: var(--green);
+}
+
+.yuntu-spread .desk #view-start .step:disabled {
+  color: var(--faint);
+  opacity: 0.6;
+  cursor: default;
+}
+
+.yuntu-spread .desk #view-start .side-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 28px 2px 20px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+  animation: yuntu-spread-start-in 0.25s var(--ease) both;
+}
+
+@keyframes yuntu-spread-start-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+.yuntu-spread .desk #view-start .ask-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+}
+
+.yuntu-spread .desk #view-start .ask h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: var(--fs-2xl);
+  line-height: 1.3;
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+.yuntu-spread .desk #view-start .ask h2:focus {
+  outline: none;
+}
+
+.yuntu-spread .desk #view-start .ask h2 em {
+  font-style: normal;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .ask .sub {
+  margin: 10px 0 0;
+  font-size: 15px;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .text-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 2px;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--green);
+  white-space: nowrap;
+}
+
+.yuntu-spread .desk #view-start .text-btn:hover:not(:disabled) {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.yuntu-spread .desk #view-start .text-btn:disabled {
+  color: var(--faint);
+  cursor: not-allowed;
+}
+
+.yuntu-spread .desk #view-start .text-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.yuntu-spread .desk #view-start .side-foot {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.yuntu-spread .desk #view-start .side-foot .turn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--green);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.yuntu-spread .desk #view-start .side-foot .turn:hover {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.yuntu-spread .desk #view-start .side-foot .turn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.yuntu-spread .desk #view-start .foot-end {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  min-width: 0;
+  margin-left: auto;
+}
+
+.yuntu-spread .desk #view-start .foot-note {
+  font-size: 13px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-wrap: pretty;
+}
+
+.yuntu-spread .desk #view-start .foot-note.is-block {
+  min-width: 0;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .foot-note.is-block b {
+  display: block;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .foot-note.is-err {
+  min-width: 0;
+  line-height: 1.6;
+  color: var(--cinnabar);
+}
+
+.yuntu-spread .desk #view-start .foot-action {
+  margin-left: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--green);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  white-space: nowrap;
+}
+
+.yuntu-spread .desk #view-start .foot-action:hover {
+  color: var(--deep);
+}
+
+.yuntu-spread .desk #view-start .side-foot .btn-primary {
+  flex-shrink: 0;
+  padding: 11px 24px;
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+/* ───────── 第一步：六张画面两列三行 ───────── */
+.yuntu-spread .desk #view-start .tiles {
+  flex: 1;
+  min-height: 300px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.yuntu-spread .desk #view-start .tile {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+}
+
+.yuntu-spread .desk #view-start .tile-ph {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--paper-2);
+}
+
+.yuntu-spread .desk #view-start .tile-ph.is-blank {
+  display: grid;
+  place-items: center;
+  padding: 8px;
+  border: 1px dashed var(--line-strong);
+  background: var(--paper-hi);
+}
+
+.yuntu-spread .desk #view-start .tile-ph.is-blank em {
+  font-style: normal;
+  font-family: var(--serif);
+  font-size: var(--fs-md);
+  color: var(--faint);
+}
+
+.yuntu-spread .desk #view-start .tile-ph img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.5s var(--ease);
+}
+
+.yuntu-spread .desk #view-start .tile:hover .tile-ph img {
+  transform: scale(1.04);
+}
+
+.yuntu-spread .desk #view-start .tile-lb {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.yuntu-spread .desk #view-start .tile[aria-pressed="true"] .tile-lb {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.yuntu-spread .desk #view-start .tile .no {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-pill);
+  display: grid;
+  place-items: center;
+  background: var(--green);
+  color: var(--surface);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px rgba(255, 254, 249, 0.9);
+  transform: scale(0);
+  transition: transform 0.3s var(--ease);
+}
+
+.yuntu-spread .desk #view-start .tile[aria-pressed="true"] .no {
+  transform: scale(1);
+}
+
+.yuntu-spread .desk #view-start .tile[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+.yuntu-spread .desk #view-start .tile[aria-disabled="true"]:hover .tile-ph img {
+  transform: none;
+}
+
+.yuntu-spread .desk #view-start .tile:focus-visible {
+  outline: none;
+}
+
+.yuntu-spread .desk #view-start .tile:focus-visible .tile-ph {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
+/* 卡片角上对勾 */
+.yuntu-spread .desk #view-start .mark {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-pill);
+  display: grid;
+  place-items: center;
+  background: var(--green);
+  color: var(--surface);
+  box-shadow: 0 0 0 2px rgba(255, 254, 249, 0.9);
+  transform: scale(0);
+  transition: transform 0.3s var(--ease);
+}
+
+.yuntu-spread .desk #view-start .mark svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 2.6;
+}
+
+.yuntu-spread .desk #view-start [aria-pressed="true"] > .mark,
+.yuntu-spread .desk #view-start [aria-pressed="true"] .tile-ph > .mark,
+.yuntu-spread .desk #view-start [aria-pressed="true"] .pace-art > .mark {
+  transform: scale(1);
+}
+
+/* ───────── 第二步：节奏 / 出行方式 / 避开项 ───────── */
+.yuntu-spread .desk #view-start .paces {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.yuntu-spread .desk #view-start .pace {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 8px 14px;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  transition: border-color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .pace:hover {
+  border-color: var(--line-strong);
+}
+
+.yuntu-spread .desk #view-start .pace[aria-pressed="true"] {
+  border-color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .pace-art {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: #f3eee0;
+}
+
+.yuntu-spread .desk #view-start .pace-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.yuntu-spread .desk #view-start .pace-name {
+  margin: 12px 6px 0;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: var(--fs-lg);
+  line-height: 1.3;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .pace[aria-pressed="true"] .pace-name {
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .pace-desc {
+  margin: 3px 6px 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .ico {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  fill: none;
+  stroke: #829375;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.yuntu-spread .desk #view-start .minis {
+  display: grid;
+  gap: 10px;
+}
+
+.yuntu-spread .desk #view-start .minis.c3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.yuntu-spread .desk #view-start .minis.c4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.yuntu-spread .desk #view-start .mini-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  text-align: left;
+  background: #fffdf7;
+  border: 1px solid #e0e0d0;
+  border-radius: var(--r-md);
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .mini-card b {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .mini-card small {
+  margin-top: -4px;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .mini-card:hover {
+  border-color: var(--line-strong);
+}
+
+.yuntu-spread .desk #view-start .mini-card[aria-pressed="true"] {
+  border-color: #628467;
+  background: #e8eeda;
+}
+
+.yuntu-spread .desk #view-start .mini-card[aria-pressed="true"] .ico {
+  stroke: var(--green);
+}
+
+.yuntu-spread .desk #view-start .mini-card[aria-pressed="true"] b {
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .mini-card .mark {
+  top: 10px;
+  right: 10px;
+  width: 18px;
+  height: 18px;
+}
+
+.yuntu-spread .desk #view-start .mini-card .mark svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* ───────── 第三步：城市照片墙，按地区筛 ───────── */
+.yuntu-spread .desk #view-start .region-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin-top: -6px;
+}
+
+.yuntu-spread .desk #view-start .region-tab {
+  position: relative;
+  padding: 4px 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .region-tab:hover {
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .region-tab[aria-pressed="true"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.yuntu-spread .desk #view-start .region-tab[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 2px;
+  background: var(--green);
+}
+
+.yuntu-spread .desk #view-start .city-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px 14px;
+}
+
+.yuntu-spread .desk #view-start .city-tile {
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  min-width: 0;
+}
+
+.yuntu-spread .desk #view-start .city-tile .tile-ph {
+  flex: none;
+  aspect-ratio: 16 / 10;
+}
+
+.yuntu-spread .desk #view-start .city-tile:hover .tile-ph img {
+  transform: scale(1.04);
+}
+
+.yuntu-spread .desk #view-start .city-tile:focus-visible {
+  outline: none;
+}
+
+.yuntu-spread .desk #view-start .city-tile:focus-visible .tile-ph {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
+.yuntu-spread .desk #view-start .city-lb {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.yuntu-spread .desk #view-start .city-lb b {
+  flex-shrink: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .city-lb span {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.yuntu-spread .desk #view-start .city-tile[aria-pressed="true"] .city-lb b {
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .city-catalog-state {
+  padding: 40px 24px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--paper-hi);
+  text-align: center;
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+}
+
+.yuntu-spread .desk #view-start .city-catalog-state p {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .city-catalog-state.is-err p {
+  color: var(--cinnabar);
+}
+
+/* ───────── 第四步：出发票 + 天数 + 日历 + 同行 + 更多 ───────── */
+.yuntu-spread .desk #view-start .hero.is-ticket .hero-cap {
+  display: block;
+  min-height: 0;
+  padding-top: 16px;
+}
+
+.yuntu-spread .desk #view-start .frame-credit {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  z-index: 1;
+  font-size: var(--fs-xs);
+  color: rgba(255, 255, 255, 0.92);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.yuntu-spread .desk #view-start .ticket {
+  background: #fffdf4;
+  border: 1px solid #e3dcc3;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 3px 8px -4px rgba(10, 25, 20, 0.18);
+  animation: yuntu-spread-start-in 0.3s var(--ease) both;
+}
+
+.yuntu-spread .desk #view-start .t-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 20px;
+  background: #e6ebd4;
+  border-bottom: 1px solid #d3d8bb;
+}
+
+.yuntu-spread .desk #view-start .t-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.06em;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .t-brand .brand-mark {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--deep);
+  color: var(--surface);
+  display: grid;
+  place-items: center;
+}
+
+.yuntu-spread .desk #view-start .t-brand .brand-mark svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.yuntu-spread .desk #view-start .t-head small {
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: #56613f;
+}
+
+.yuntu-spread .desk #view-start .t-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 24px 10px;
+}
+
+.yuntu-spread .desk #view-start .t-city {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: 40px;
+  line-height: 1.1;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .t-code {
+  margin: 4px 0 0;
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: #56613f;
+}
+
+.yuntu-spread .desk #view-start .route {
+  flex: 0 1 130px;
+  min-width: 60px;
+  height: 40px;
+  fill: none;
+  stroke: #8c9a74;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.yuntu-spread .desk #view-start .t-days {
+  text-align: right;
+}
+
+.yuntu-spread .desk #view-start .t-days strong {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 46px;
+  line-height: 1;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .t-days small {
+  margin-left: 4px;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .t-perf {
+  margin: 0 14px;
+  border-top: 1px dashed #cacdb8;
+}
+
+.yuntu-spread .desk #view-start .t-bottom {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 24px 12px;
+}
+
+.yuntu-spread .desk #view-start .t-tiny {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  color: #56613f;
+}
+
+.yuntu-spread .desk #view-start .t-date {
+  margin: 4px 0 0;
+  font-family: var(--serif);
+  font-size: 17px;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .t-date small {
+  margin: 0 2px 0 4px;
+  font-family: var(--sans);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .t-people {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* 小人：与手机端同源，命名为 person 避免和顶栏头像重名 */
+.yuntu-spread .desk #view-start .person {
+  position: relative;
+  display: inline-block;
+  width: 54px;
+  height: 79px;
+  margin: 0 3px;
+}
+
+.yuntu-spread .desk #view-start .person .head {
+  position: absolute;
+  left: 17px;
+  top: 7px;
+  z-index: 2;
+  width: 24px;
+  height: 28px;
+  background: #d8b99b;
+  border-radius: 45% 45% 46% 46%;
+  border-top: 6px solid #34493d;
+}
+
+.yuntu-spread .desk #view-start .person .body {
+  position: absolute;
+  bottom: 0;
+  left: 5px;
+  right: 0;
+  height: 42px;
+  background: var(--coat, #3b705a);
+  border-radius: 21px 21px 3px 3px;
+}
+
+.yuntu-spread .desk #view-start .person .body::after {
+  content: "";
+  position: absolute;
+  left: 23px;
+  top: 6px;
+  width: 1px;
+  height: 32px;
+  background: rgba(255, 255, 255, 0.19);
+}
+
+.yuntu-spread .desk #view-start .person.child {
+  width: 40px;
+  height: 54px;
+}
+
+.yuntu-spread .desk #view-start .person.child .head {
+  left: 12px;
+  top: 0;
+  width: 19px;
+  height: 22px;
+  border-top-width: 5px;
+}
+
+.yuntu-spread .desk #view-start .person.child .body {
+  height: 32px;
+  border-radius: 15px 15px 3px 3px;
+}
+
+.yuntu-spread .desk #view-start .person.child .body::after {
+  left: 17px;
+  height: 24px;
+}
+
+.yuntu-spread .desk #view-start .mini {
+  display: inline-flex;
+  align-items: flex-end;
+  height: 40px;
+  padding: 0 12px;
+}
+
+.yuntu-spread .desk #view-start .mini .person {
+  margin: 0 -12px;
+  transform: scale(0.5);
+  transform-origin: bottom center;
+}
+
+.yuntu-spread .desk #view-start .mini .person:nth-child(2n) {
+  transform: scale(0.5) rotate(5deg);
+}
+
+/* 天数 01-07 */
+.yuntu-spread .desk #view-start .kicker {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.yuntu-spread .desk #view-start .rail {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.yuntu-spread .desk #view-start .rail-day {
+  height: 62px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #fdfbf4;
+  border: 1px solid #dfe0cf;
+  border-radius: var(--r-md);
+  color: var(--ink);
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .rail-day b {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.yuntu-spread .desk #view-start .rail-day small {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .rail-day:hover {
+  border-color: var(--line-strong);
+}
+
+.yuntu-spread .desk #view-start .rail-day[aria-pressed="true"] {
+  background: var(--green);
+  border-color: var(--green);
+  color: var(--surface);
+  box-shadow: 0 4px 8px rgba(25, 110, 91, 0.13);
+}
+
+.yuntu-spread .desk #view-start .rail-day[aria-pressed="true"] small {
+  color: #dbe6cf;
+}
+
+.yuntu-spread .desk #view-start .split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 28px;
+  align-items: start;
+}
+
+/* 日历 */
+.yuntu-spread .desk #view-start .cal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.yuntu-spread .desk #view-start .cal-head b {
+  font-family: var(--serif);
+  font-size: var(--fs-md);
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .cal-nav {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-pill);
+  font-size: 18px;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .cal-nav:hover:not(:disabled) {
+  background: var(--green-tint);
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .cal-nav:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.yuntu-spread .desk #view-start .cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  row-gap: 2px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.yuntu-spread .desk #view-start .cal-grid .wd {
+  padding-bottom: 4px;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d {
+  position: relative;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d span {
+  position: relative;
+  z-index: 1;
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d:not(:disabled):not(.s):hover::before {
+  content: "";
+  position: absolute;
+  inset: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--green-tint);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d:disabled {
+  color: #b8bdb4;
+  cursor: default;
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d.in {
+  background: var(--mint);
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d.s,
+.yuntu-spread .desk #view-start .cal-grid .d.e {
+  font-weight: 700;
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d.s {
+  color: var(--surface);
+  background: linear-gradient(90deg, transparent 50%, var(--mint) 50%);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d.s.solo {
+  background: none;
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d.s::before {
+  content: "";
+  position: absolute;
+  inset: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--green);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d.e {
+  color: var(--green);
+  background: linear-gradient(90deg, var(--mint) 50%, transparent 50%);
+}
+
+.yuntu-spread .desk #view-start .cal-grid .d:focus-visible {
+  outline-offset: -2px;
+}
+
+.yuntu-spread .desk #view-start .cal-clear {
+  align-self: flex-start;
+}
+
+.yuntu-spread .desk #view-start .cal-note {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+/* 同行 */
+.yuntu-spread .desk #view-start .comps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.yuntu-spread .desk #view-start .comp {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 78px;
+  padding: 12px;
+  text-align: left;
+  background: #fffdf7;
+  border: 1px solid #e0e0d0;
+  border-radius: var(--r-md);
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .comp.wide {
+  grid-column: 1 / -1;
+  min-height: 58px;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+}
+
+.yuntu-spread .desk #view-start .comp > svg {
+  width: 22px;
+  height: 22px;
+  color: #829375;
+  flex: none;
+}
+
+.yuntu-spread .desk #view-start .comp b {
+  display: block;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .comp small {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .comp:hover {
+  border-color: var(--line-strong);
+}
+
+.yuntu-spread .desk #view-start .comp[aria-pressed="true"] {
+  border-color: #628467;
+  background: #e8eeda;
+}
+
+.yuntu-spread .desk #view-start .comp .mark {
+  top: 10px;
+  right: 10px;
+  width: 20px;
+  height: 20px;
+}
+
+.yuntu-spread .desk #view-start .comp .mark svg {
+  width: 12px;
+  height: 12px;
+}
+
+.yuntu-spread .desk #view-start .counts {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .steppers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  padding: 10px 14px;
+  background: #eeeedf;
+  border: 1px dashed #bdc6ac;
+  border-radius: var(--r-md);
+}
+
+.yuntu-spread .desk #view-start .stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .stepper button {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-sm);
+  background: #fcfcf4;
+  border: 1px solid #d6dec9;
+  font-size: var(--fs-md);
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .stepper button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.yuntu-spread .desk #view-start .stepper b {
+  min-width: 14px;
+  text-align: center;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+/* 还有要交代的 */
+.yuntu-spread .desk #view-start .more {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.yuntu-spread .desk #view-start .more summary {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.yuntu-spread .desk #view-start .more summary::-webkit-details-marker {
+  display: none;
+}
+
+.yuntu-spread .desk #view-start .more summary b {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .more summary span {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .more summary::after {
+  content: "展开";
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-start .more[open] summary::after {
+  content: "收起";
+}
+
+.yuntu-spread .desk #view-start .more-body {
+  display: grid;
+  gap: 18px;
+  padding-top: 16px;
+}
+
+.yuntu-spread .desk #view-start .field {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.yuntu-spread .desk #view-start .field-label {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-start .field-label span {
+  margin-left: 8px;
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.yuntu-spread .desk #view-start .field-help {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .field-help.is-err {
+  color: var(--cinnabar);
+}
+
+.yuntu-spread .desk #view-start .field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+.yuntu-spread .desk #view-start .input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  transition: border-color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .input::placeholder {
+  color: var(--faint);
+}
+
+.yuntu-spread .desk #view-start .input:hover {
+  border-color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .input:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 1px;
+  border-color: var(--green);
+}
+
+/* 想顺路去：地点目录搜索 */
+.yuntu-spread .desk #view-start .poi-search-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.yuntu-spread .desk #view-start .poi-search-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.yuntu-spread .desk #view-start .poi-search-btn {
+  flex-shrink: 0;
+  padding: 7px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--ink);
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.yuntu-spread .desk #view-start .poi-search-btn:hover:not(:disabled) {
+  border-color: var(--green);
+  background: var(--green-tint);
+}
+
+.yuntu-spread .desk #view-start .poi-search-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.yuntu-spread .desk #view-start .poi-catalog-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.yuntu-spread .desk #view-start .poi-meta {
+  margin-left: 6px;
+  font-size: 11px;
+  opacity: 0.78;
+}
+
+.yuntu-spread .desk #view-start .poi-load-more {
+  align-self: flex-start;
+  font-size: var(--fs-xs);
+}
+
+/* ───────── 高度/宽度响应式，与原型保持一致 ───────── */
+@media (max-height: 820px) {
+  .yuntu-spread .desk #view-start .gallery {
+    gap: 44px;
+  }
+
+  .yuntu-spread .desk #view-start .side-body {
+    gap: 18px;
+    padding-top: 20px;
+  }
+
+  .yuntu-spread .desk #view-start .ask h2 {
+    font-size: var(--fs-xl);
+  }
+
+  .yuntu-spread .desk #view-start .ask .sub {
+    margin-top: 6px;
+    font-size: var(--fs-sm);
+  }
+
+  .yuntu-spread .desk #view-start .tiles {
+    gap: 12px;
+  }
+
+  .yuntu-spread .desk #view-start .draft-sentence {
+    font-size: var(--fs-lg);
+  }
+
+  .yuntu-spread .desk #view-start .pace-art {
+    aspect-ratio: 16 / 10;
+  }
+
+  .yuntu-spread .desk #view-start .pace-name {
+    margin-top: 8px;
+    font-size: 18px;
+  }
+
+  .yuntu-spread .desk #view-start .pace-desc {
+    display: none;
+  }
+
+  .yuntu-spread .desk #view-start .mini-card {
+    padding: 9px 12px;
+    gap: 4px;
+  }
+
+  .yuntu-spread .desk #view-start .mini-card small {
+    display: none;
+  }
+
+  .yuntu-spread .desk #view-start .rail-day {
+    height: 48px;
+  }
+
+  .yuntu-spread .desk #view-start .rail-day b {
+    font-size: 20px;
+  }
+
+  .yuntu-spread .desk #view-start .cal-grid .d {
+    height: 26px;
+  }
+
+  .yuntu-spread .desk #view-start .comp {
+    min-height: 0;
+    padding: 8px 12px;
+    gap: 2px;
+  }
+
+  .yuntu-spread .desk #view-start .comp.wide {
+    min-height: 0;
+  }
+
+  .yuntu-spread .desk #view-start .comp small {
+    display: none;
+  }
+
+  .yuntu-spread .desk #view-start .t-main {
+    padding: 8px 20px 6px;
+  }
+
+  .yuntu-spread .desk #view-start .t-city {
+    font-size: 30px;
+  }
+
+  .yuntu-spread .desk #view-start .t-days strong {
+    font-size: 36px;
+  }
+
+  .yuntu-spread .desk #view-start .t-bottom {
+    padding: 6px 20px 8px;
+  }
+
+  .yuntu-spread .desk #view-start .t-date {
+    font-size: 15px;
+  }
+}
+
+@media (min-height: 1000px) {
+  .yuntu-spread .desk #view-start .side-body {
+    gap: 32px;
+    padding-top: 36px;
+  }
+
+  .yuntu-spread .desk #view-start .pace-art {
+    aspect-ratio: 1 / 1;
+  }
+
+  .yuntu-spread .desk #view-start .pace-name {
+    font-size: 22px;
+  }
+
+  .yuntu-spread .desk #view-start .pace-desc {
+    font-size: var(--fs-sm);
+  }
+
+  .yuntu-spread .desk #view-start .mini-card {
+    padding: 16px 16px 14px;
+    gap: 8px;
+  }
+
+  .yuntu-spread .desk #view-start .mini-card .ico {
+    width: 26px;
+    height: 26px;
+  }
+
+  .yuntu-spread .desk #view-start .mini-card b {
+    font-size: 15px;
+  }
+
+  .yuntu-spread .desk #view-start .city-grid {
+    gap: 22px 16px;
+  }
+
+  .yuntu-spread .desk #view-start .rail-day {
+    height: 74px;
+  }
+
+  .yuntu-spread .desk #view-start .rail-day b {
+    font-size: 28px;
+  }
+
+  .yuntu-spread .desk #view-start .cal-grid .d {
+    height: 38px;
+  }
+
+  .yuntu-spread .desk #view-start .comp {
+    min-height: 92px;
+    padding: 16px;
+  }
+
+  .yuntu-spread .desk #view-start .comp.wide {
+    min-height: 64px;
+  }
+
+  .yuntu-spread .desk #view-start .comp b {
+    font-size: 15px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .yuntu-spread .desk:has(> #view-start) {
+    padding: 8px 28px 32px;
+  }
+
+  .yuntu-spread .desk #view-start .gallery {
+    gap: 36px;
+  }
+
+  .yuntu-spread .desk #view-start .city-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yuntu-spread .desk #view-start .hero-frame img,
+  .yuntu-spread .desk #view-start .slot.is-filled,
+  .yuntu-spread .desk #view-start .side-body,
+  .yuntu-spread .desk #view-start .ticket {
+    animation: none;
+  }
+
+  .yuntu-spread .desk #view-start .hero-frame img.is-out,
+  .yuntu-spread .desk #view-start .tile-ph img,
+  .yuntu-spread .desk #view-start .tile .no,
+  .yuntu-spread .desk #view-start .mark {
+    transition: none;
+  }
+}

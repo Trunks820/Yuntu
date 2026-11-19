@@ -1,4 +1,4 @@
-import type { TripDay, TripPlace, AccommodationInfo, TripMustInclude } from "@/types/trip";
+import type { TripDay, AccommodationInfo, TripMustInclude } from "@/types/trip";
 import { AccommodationTimelineNode } from "@/components/detail/AccommodationCard";
 import {
   formatDistance,
@@ -7,6 +7,7 @@ import {
   commuteModeIcon,
   cleanBrief,
 } from "@/utils/format";
+import { exactTimeSourceLabel, governedExactTime, periodLabel } from "@/utils/schedule";
 import { categoryIcon, categoryName, isAnchorRole } from "@/constants/places";
 import {
   MapPin,
@@ -20,13 +21,6 @@ import {
   Navigation,
 } from "lucide-react";
 
-const PERIOD_LABEL: Record<string, string> = {
-  morning: "上午",
-  afternoon: "下午",
-  evening: "傍晚",
-  night: "夜间",
-};
-
 function formatStayDuration(minutes?: number | null): string {
   if (!minutes || minutes <= 0) return "自由漫游";
   if (minutes >= 60) {
@@ -35,16 +29,6 @@ function formatStayDuration(minutes?: number | null): string {
     return mins > 0 ? `建议 ${hours}小时${mins}分` : `建议 ${hours}小时`;
   }
   return `建议 ${minutes}分钟`;
-}
-
-function placeTimeLabel(place: TripPlace): string | null {
-  const s = place.schedule;
-  if (!s) return null;
-  if (s.exact_start) {
-    return s.exact_end ? `${s.exact_start} – ${s.exact_end}` : s.exact_start;
-  }
-  if (s.period && PERIOD_LABEL[s.period]) return PERIOD_LABEL[s.period];
-  return null;
 }
 
 export interface DayCardProps {
@@ -128,7 +112,7 @@ export function DayCard({
             </button>
           </div>
           <p
-            className={`text-sm sm:text-base leading-relaxed text-gray-700 transition-all ${
+            className={`text-sm sm:text-base leading-relaxed text-gray-700 transition-all whitespace-pre-line ${
               narrativeExpanded ? "" : "line-clamp-2"
             }`}
           >
@@ -157,8 +141,12 @@ export function DayCard({
           );
           const isLast = placeIndex === day.places.length - 1;
           const anchor = isAnchorRole(place.role);
-          const timeLabel = placeTimeLabel(place);
+          const period = periodLabel(place.schedule?.period);
+          const exact = governedExactTime(place.schedule);
+          const timeLabel = [period, exact?.text].filter(Boolean).join(" ") || null;
           const stayDuration = formatStayDuration(place.stay_minutes);
+          const note = place.activity_note?.trim() ?? "";
+          const brief = cleanBrief(place.brief);
           const scheduledMustInclude = mustInclude?.find(
             (mi) => mi.status === "scheduled" && mi.place_id != null && mi.place_id === place.place_id,
           );
@@ -237,6 +225,11 @@ export function DayCard({
                             <span className="text-primary-700 font-medium">{timeLabel}</span>
                           </>
                         )}
+                        {exact && (
+                          <span className="rounded bg-primary-50 px-1.5 py-0.5 text-[10px] font-medium text-primary-700">
+                            {exactTimeSourceLabel(exact.source)}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -253,12 +246,12 @@ export function DayCard({
                 </div>
 
                 {/* 详情与说明描述 */}
-                {(cleanBrief(place.brief) || place.activity_note) && (
+                {(brief || note) && (
                   <div className="mt-3 border-t border-gray-100/90 pt-3 text-sm leading-relaxed">
-                    {place.activity_note ? (
-                      <p className="font-normal text-gray-700">{place.activity_note}</p>
+                    {note ? (
+                      <p className="font-normal text-gray-700 whitespace-pre-line">{note}</p>
                     ) : (
-                      <p className="text-gray-500">{cleanBrief(place.brief)}</p>
+                      <p className="text-gray-500">{brief}</p>
                     )}
                   </div>
                 )}
@@ -347,5 +340,3 @@ export function DayCard({
     </div>
   );
 }
-
-

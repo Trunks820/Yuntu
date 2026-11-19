@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 
 from src.agents.generation_issues import GenerationIssue
+from src.agents.poi_alias import mask_evidenced_place_references
+from src.agents.schema import CandidatePlace
 from src.agents.route_planning import _is_day_heading_line, _parse_day_heading_number
 from src.agents.text_quality import BANNED_DATABASE_PHRASES
 from src.agents.writer_repair_contract import RepairSanitizerAction
@@ -15,23 +17,6 @@ DAY_HEADING_RE = re.compile(
     r"([^\n]*?)(?:\*\*)?\s*$"
 )
 SENTENCE_SEGMENT_RE = re.compile(r"([^。！？；;\n]*[。！？；;\n]?)")
-RISKY_CONTRACT_SEGMENT_RE = re.compile(
-    r"轻松时光|安静的单人时光|自在的单人时光|完美的句号|能量场|"
-    r"边走边吃|慢慢闲逛|顺路看看|打卡点|氛围|氛围感拉满|经典拍照机位|"
-    r"知名景点|值得|感受一下|到此一游|风貌区|挺有意思|暖宝宝|小游戏|服务细节|"
-    r"随手拍都有大片感|大片感|拍照记录|拍照留念|"
-    r"核心商业区|随意转转|核心点串起来|节奏不紧|随走随停|"
-    r"视野开阔|随意漫步|夜景收尾|路线卖点|人气旺|吃法建议|"
-    r"需要预约|无需预约|不用预约|不需要预约|提前预约|预约|"
-    r"门票|票价|购票|买票|售票|检票|购买[^。；\n]{0,8}票|"
-    r"建议(?:打车|坐车|乘车|乘坐|步行|地铁|公交|自驾|开车)|"
-    r"打车前往|坐车前往|乘车前往|步行几分钟就能到|步行几分钟可到|"
-    r"打车或坐车|打车或乘车|灵活调整|灵活加减|根据当天状态安排|"
-    r"根据自己状态|节奏可以自己说了算|"
-    r"可自行权衡|自行权衡|到场再看|到现场再看|根据自己兴趣选择|"
-    r"可以根据(?:自己|个人)?兴趣选择"
-)
-
 
 def _remove_banned_database_phrases(
     text: str,
@@ -80,7 +65,7 @@ def _remove_known_snippets(
         if issue.reason == "long_transfer_missing_or_misleading":
             continue
         snippet = issue.snippet.strip()
-        if not snippet or snippet not in sanitized:
+        if not snippet or sanitized.count(snippet) != 1:
             continue
         sanitized = sanitized.replace(snippet, "")
         pattern_reason = ""
@@ -101,6 +86,8 @@ def _remove_disallowed_name_segments(
     *,
     disallowed_candidate_names: list[str],
     allowed_candidate_names: list[str] | None = None,
+    reference_place: CandidatePlace | None = None,
+    reference_locked_names: set[str] | None = None,
 ) -> tuple[str, list[RepairSanitizerAction]]:
     actions: list[RepairSanitizerAction] = []
     if not text or not disallowed_candidate_names:
@@ -115,7 +102,10 @@ def _remove_disallowed_name_segments(
     for piece in pieces:
         if not piece:
             continue
-        searchable_piece = piece
+        searchable_piece = (mask_evidenced_place_references(
+            piece, place=reference_place, candidate_names=[*names, *allowed_names],
+            locked_names=reference_locked_names or set(),
+        ) if reference_place is not None else piece)
         for allowed_name in allowed_names:
             if allowed_name and allowed_name in searchable_piece:
                 searchable_piece = searchable_piece.replace(
@@ -206,39 +196,6 @@ def _remove_cross_day_segments(
     return "".join(sanitized_parts), actions
 
 
-def _remove_risky_contract_segments(
-    text: str,
-    *,
-    issues: list[GenerationIssue],
-) -> tuple[str, list[RepairSanitizerAction]]:
-    actions: list[RepairSanitizerAction] = []
-    if not text:
-        return text, actions
-    should_clean = any(
-        issue.reason in {
-            "unsupported_fact_expansion",
-            "food_place_written_as_attraction",
-            "long_transfer_missing_or_misleading",
-        }
-        and issue.publish_action != "RECORD_ONLY"
-        for issue in issues
-    )
-    if not should_clean:
-        return text, actions
-    sanitized_parts: list[str] = []
-    for piece in SENTENCE_SEGMENT_RE.split(text):
-        if not piece:
-            continue
-        if RISKY_CONTRACT_SEGMENT_RE.search(piece):
-            actions.append(RepairSanitizerAction(
-                action="remove_risky_contract_segment",
-                target=piece.strip()[:160],
-                reason="v074_contract_risky_expression",
-            ))
-            continue
-        sanitized_parts.append(piece)
-    return "".join(sanitized_parts), actions
-
 
 def _cleanup_sanitized_text(text: str) -> str:
     cleaned = re.sub(r"[ \t]{2,}", " ", text)
@@ -255,6 +212,8 @@ def sanitize_repair_text(
     disallowed_candidate_names: list[str],
     allowed_candidate_names: list[str] | None = None,
     locked_day_names: list[list[str]] | None = None,
+    reference_place: CandidatePlace | None = None,
+    reference_locked_names: set[str] | None = None,
 ) -> tuple[str, list[RepairSanitizerAction]]:
     """Remove only known risky snippets; never invent replacement facts."""
     sanitized, database_actions = _remove_banned_database_phrases(
@@ -266,14 +225,12 @@ def sanitize_repair_text(
         sanitized,
         disallowed_candidate_names=disallowed_candidate_names,
         allowed_candidate_names=allowed_candidate_names,
+        reference_place=reference_place,
+        reference_locked_names=reference_locked_names,
     )
     sanitized, cross_day_actions = _remove_cross_day_segments(
         sanitized,
         locked_day_names=locked_day_names,
-    )
-    sanitized, risky_actions = _remove_risky_contract_segments(
-        sanitized,
-        issues=issues,
     )
     return (
         _cleanup_sanitized_text(sanitized),
@@ -282,6 +239,5 @@ def sanitize_repair_text(
             *snippet_actions,
             *name_actions,
             *cross_day_actions,
-            *risky_actions,
         ],
     )

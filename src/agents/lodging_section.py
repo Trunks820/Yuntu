@@ -269,7 +269,6 @@ def build_lodging_display(
             area_label=accommodation.name,
             round_trip_minutes_low=None if span is None else span[0],
             round_trip_minutes_high=None if span is None else span[1],
-            price_status="待核实",
         )
     unmatched = _unmatched_lodging_name(accommodation, trip_request)
     area_label = _area_label(accommodation.name)
@@ -305,7 +304,6 @@ def build_lodging_display(
         caption=caption,
         groups=groups,
         notices=notices,
-        price_status=_sourced_price_status(groups),
     )
 
 
@@ -344,8 +342,6 @@ def render_lodging_display_text(
     for notice in display.notices:
         if notice.kind == "holiday" and notice.text:
             lines.append(notice.text)
-    if display.price_status != "sourced" and not any("待核实" in line for line in lines):
-        lines.append("房价：待核实")
     return "\n".join(lines)
 
 
@@ -429,14 +425,6 @@ def _area_label(name: str) -> str:
             cleaned = cleaned[: -len(suffix)]
             break
     return f"{cleaned}一带"
-
-
-def _sourced_price_status(groups: list[LodgingDisplayGroup]) -> str:
-    """A nightly band is shown only when both ends came from a sourced lookup."""
-    for group in groups:
-        if group.nightly_low_cny is not None and group.nightly_high_cny is not None:
-            return "sourced"
-    return "待核实"
 
 
 def _prices_found(prices: HotelTierResult | None) -> bool:
@@ -817,5 +805,3 @@ def parse_price_observed_at(value: str, fallback: datetime) -> datetime:
     if fallback.tzinfo is None:
         return fallback.replace(tzinfo=timezone.utc)
     return fallback
-
-

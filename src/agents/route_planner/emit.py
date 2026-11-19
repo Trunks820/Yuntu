@@ -18,7 +18,11 @@ from src.agents.route_planning import (
 from src.agents.schema import (
     AccommodationAnchor,
     CandidatePlace,
+    DayTimeline,
+    DayTimelineItem,
+    RouteDayGroup,
     RoutePlan,
+    TimelineMove,
     TripRequest,
 )
 
@@ -37,6 +41,9 @@ from src.agents.route_planner.places import (
 from src.agents.route_planner.legs import _apply_scheduled_legs
 
 from src.agents.route_planner.schedule import (
+    _stay,
+    diversify_same_day_pots,
+    drop_unrequested_snacks,
     schedule_day,
     repick_meals,
 )
@@ -54,6 +61,9 @@ from src.agents.route_planner.lodging import (
 
 # get_settings is read from the package so tests can patch route_planner.get_settings.
 import src.agents.route_planner as _route_planner_pkg
+
+INPLACE_LUNCH_REST_HINT = "午饭后在附近找地方坐下歇一会儿"
+INPLACE_DINNER_REST_HINT = "晚饭前在附近找地方坐下歇一会儿"
 
 
 
@@ -98,6 +108,7 @@ async def arrange(
     hotel_query=None,
     hotel_cache=None,
     preset_lodging: CandidatePlace | None = None,
+    amap_ids: set[int] | None = None,
 ) -> tuple[dict, list[str], CandidatePlace | None, str, str]:
     adjustments = []
     # None, or a settings object with the flag off, keeps the model anchor.
@@ -131,6 +142,7 @@ async def arrange(
     if isinstance(lodge, CandidatePlace) and lodge.place_id and lodge.place_id not in by_id:
         by_id[lodge.place_id] = lodge
     adjustments.extend(_attach_places(plan, by_id, rules))
+    adjustments.extend(drop_unrequested_snacks(plan, rules))
     used = {
         stop["_place"].place_id
         for day in plan.get("days") or []
@@ -170,6 +182,33 @@ async def arrange(
                     settings=settings,
                 )
             )
+    swapped_days: list[dict] = []
+    adjustments.extend(
+        await diversify_same_day_pots(
+            plan,
+            lodge,
+            rules=rules,
+            fetch_restaurants=fetch_restaurants,
+            session=session,
+            city=rules.city,
+            used_ids=used,
+            amap_ids=amap_ids,
+            swapped_days=swapped_days,
+        )
+    )
+    # Same as after repick_meals: the legs were for the old shop.
+    for day in swapped_days:
+        adjustments.extend(
+            await schedule_day(
+                day,
+                rules=rules,
+                lodge=lodge,
+                protected=_protected_ids(list(by_id.values()), rules),
+                estimator=estimator,
+                request=request,
+                settings=settings,
+            )
+        )
     for place in (stop.get("_place") for day in plan.get("days") or [] for stop in day.get("stops") or []):
         if isinstance(place, CandidatePlace) and place.place_id not in by_id:
             by_id[place.place_id] = place
@@ -184,6 +223,56 @@ def _day_places(day: dict) -> list[CandidatePlace]:
             continue
         places.append(place)
     return places
+
+
+def _move(value) -> TimelineMove:
+    value = value if isinstance(value, dict) else {}
+    minutes = value.get("minutes")
+    return TimelineMove(
+        mode=str(value.get("mode") or "步行"),
+        minutes=minutes if isinstance(minutes, int) and not isinstance(minutes, bool) else None,
+    )
+
+
+def _scheduled_timeline(day: dict, group: RouteDayGroup) -> DayTimeline | None:
+    """The clock ``schedule_day`` left on the stops, read as is.
+
+    None when the day was never scheduled or its stops no longer line up
+    with the emitted places; a reader then estimates instead.
+    """
+    start = day.get("_start_minute")
+    end = day.get("_return_minute")
+    if not isinstance(start, int) or not isinstance(end, int):
+        return None
+    items: list[DayTimelineItem] = []
+    for stop in day.get("stops") or []:
+        kind = stop.get("kind")
+        place = stop.get("_place")
+        if kind != "rest" and not isinstance(place, CandidatePlace):
+            continue
+        arrive = stop.get("time")
+        if kind not in {"sight", "lunch", "dinner", "snack", "night", "rest"} or not isinstance(arrive, str):
+            return None
+        items.append(DayTimelineItem(
+            kind=kind,
+            place_id=None if kind == "rest" else int(place.place_id),
+            arrive=arrive,
+            stay_minutes=_stay(stop),
+            wait_minutes=int(stop.get("wait_minutes") or 0),
+            rest_via_lodge=bool(stop.get("_rest_via_lodge")),
+            move_to_next=_move(stop.get("move_to_next")),
+        ))
+    if [item.place_id for item in items if item.place_id is not None] != [
+        place.place_id for place in group.places
+    ]:
+        return None
+    return DayTimeline(
+        source="scheduler",
+        start=_fmt(start),
+        depart_move=_move(day.get("_depart_move")),
+        items=items,
+        return_at=_fmt(end),
+    )
 
 
 def _assigned_stop_kinds(day: dict) -> dict[int, str]:
@@ -272,9 +361,12 @@ async def emit_route_plan(
     for day, group in zip(plan.get("days") or [], route.day_groups):
         # Read kinds after drops and meal swaps. place_id, not visit order.
         group.stop_kinds = _assigned_stop_kinds(day)
+        group.timeline = _scheduled_timeline(day, group)
         stops = day.get("stops") or []
         lunch_rest = False
         dinner_rest = False
+        inplace_lunch = False
+        inplace_dinner = False
         for index, stop in enumerate(stops):
             if stop.get("kind") != "rest":
                 continue
@@ -282,14 +374,28 @@ async def emit_route_plan(
                 (item.get("kind") for item in stops[index + 1 :] if item.get("kind") != "rest"),
                 "",
             )
-            if nxt_kind == "dinner" or stop.get("_rest_slot") == "pre_dinner" or stop.get("_idle_fill"):
-                dinner_rest = True
+            dinnerish = (
+                nxt_kind == "dinner"
+                or stop.get("_rest_slot") == "pre_dinner"
+                or stop.get("_idle_fill")
+            )
+            if stop.get("_rest_via_lodge"):
+                if dinnerish:
+                    dinner_rest = True
+                else:
+                    lunch_rest = True
+            elif dinnerish:
+                inplace_dinner = True
             else:
-                lunch_rest = True
+                inplace_lunch = True
         if lunch_rest and PROGRAM_REST_HINT not in group.time_hints:
             group.time_hints.append(PROGRAM_REST_HINT)
         if dinner_rest and PROGRAM_PRE_DINNER_REST_HINT not in group.time_hints:
             group.time_hints.append(PROGRAM_PRE_DINNER_REST_HINT)
+        if inplace_lunch and INPLACE_LUNCH_REST_HINT not in group.time_hints:
+            group.time_hints.append(INPLACE_LUNCH_REST_HINT)
+        if inplace_dinner and INPLACE_DINNER_REST_HINT not in group.time_hints:
+            group.time_hints.append(INPLACE_DINNER_REST_HINT)
         for stop in stops:
             if stop.get("kind") == "night" and stop.get("_place") is not None:
                 group.time_hints.append(f"晚饭后去{stop['_place'].name}")
@@ -328,5 +434,3 @@ def _emit_failure_issue(exc: BaseException) -> str:
     if not detail:
         return f"交给现有路线格式失败：{label}"
     return f"交给现有路线格式失败：{label}：{detail}"
-
-

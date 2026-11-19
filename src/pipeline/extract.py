@@ -13,7 +13,8 @@ from sqlalchemy import text
 
 from src.agents.llm import chat_with_usage, resolve_role_config
 from src.pipeline.db import get_session_factory
-from src.pipeline.visit_duration import fact_from_value
+from src.pipeline.place_merge import SaveTransactionRestart, record_redirected_children, upsert_source_place
+from src.pipeline.visit_duration import fact_from_value, original_source_title
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个旅游数据分析助手。从小红书�
 - 只提取明确提到的地点，不要推测
 - 如果原文明确写了某地点建议游玩/停留/打卡/路过拍照时长，visit_duration 填结构化对象；否则填 null
 - visit_duration.raw 保留原始表达（如"30分钟"、"半小时"、"1-2小时"、"半天"、"路过拍拍"），不要换算成裸字符串
+- visit_duration.evidence_text 必须逐字摘录原文并保留对象、否定、交通、排队及局部活动语境；不得用改写后的建议替代原文
+- 只有整点完整游览的明确分钟/小时才可采用；半天/全天仅是原文粒度，区域/组合/路线串时长不能复制给成员
 
 ## 城市过滤规则（必须严格遵守）
 
@@ -130,7 +133,8 @@ def _sanitize_place(p: dict) -> dict:
     return p
 
 
-def _visit_duration_fact_from_place(p: dict) -> tuple[dict, float] | None:
+def _visit_duration_fact_from_place(p: dict, *, source_text: str | None = None,
+                                    source_title: str = "") -> tuple[dict, float] | None:
     """Build a structured visit_duration fact from sanitized LLM place output."""
     confidence = p.get("confidence", 1.0)
     candidates: list[tuple[object, str, float, bool]] = []
@@ -165,6 +169,8 @@ def _visit_duration_fact_from_place(p: dict) -> tuple[dict, float] | None:
             place_type=p.get("place_type"),
             evidence=evidence,
             require_duration_hint=require_hint,
+            source_text=source_text,
+            source_title=source_title,
         )
         if fact is None:
             continue
@@ -244,6 +250,48 @@ async def fetch_pending_raw_items(
         ]
 
 
+ERROR_RECEIPT_VERSION = "extract-error.v1"
+
+
+def classify_extract_error(exc: BaseException) -> dict:
+    """Only typed HTTP status attributes prove an upstream billing failure.
+
+    Persist a safe receipt, never provider response bodies or exception text.
+    A wrapper may preserve the actual transport exception as its cause/context.
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(current, "status_code", None)
+        if status is None:
+            status = getattr(getattr(current, "response", None), "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            return {"version": ERROR_RECEIPT_VERSION, "category": "upstream_http",
+                    "http_status": status}
+        current = current.__cause__ or current.__context__
+    return {"version": ERROR_RECEIPT_VERSION, "category": "call_failure"}
+
+
+def extract_error_receipt(value: object) -> dict | None:
+    """Read the exact structured receipt, not arbitrary occurrences of 402."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(value, dict) or value.get("version") != ERROR_RECEIPT_VERSION:
+        return None
+    if value.get("category") == "upstream_http" and type(value.get("http_status")) is int:
+        return value if 100 <= value["http_status"] <= 599 else None
+    return None
+
+
+def is_upstream_402(value: object) -> bool:
+    receipt = extract_error_receipt(value)
+    return bool(receipt and receipt["http_status"] == 402)
+
+
 async def call_llm_extract(raw_text: str, city: str, title: str = "") -> tuple[dict | None, dict]:
     """Call LLM (role=extract) via unified client. Returns (parsed_json, usage_meta).
 
@@ -269,7 +317,8 @@ async def call_llm_extract(raw_text: str, city: str, title: str = "") -> tuple[d
     except Exception as exc:
         latency_ms = (time.monotonic_ns() - t0) // 1_000_000
         return None, {
-            "error": str(exc),
+            "error": "extraction call failed",
+            "error_info": classify_extract_error(exc),
             "provider": _provider,
             "model": _model,
             "latency_ms": latency_ms,
@@ -288,7 +337,25 @@ async def call_llm_extract(raw_text: str, city: str, title: str = "") -> tuple[d
 async def save_extract_result(
     raw_item: dict, parsed: dict | None, meta: dict
 ) -> int:
-    """Write extract_log, content, place, mention, fact to database."""
+    """Save parsed output; restart its owned transaction once on identity drift.
+
+    The failed save's session context closes/rolls back before this catch,
+    releasing every stale lock and write, including log/content/raw status.
+    Reuse parsed/meta; this boundary never calls the extraction model.
+    """
+    for attempt in range(2):
+        try:
+            return await _save_extract_result_once(raw_item, parsed, meta)
+        except SaveTransactionRestart:
+            if attempt == 1:
+                raise
+            logger.warning("D1 parsed save transaction restart raw_item=%s retry=1", raw_item["id"])
+
+
+async def _save_extract_result_once(
+    raw_item: dict, parsed: dict | None, meta: dict
+) -> int:
+    """One complete caller-owned save transaction; errors roll back on close."""
     factory = get_session_factory()
     raw_text = raw_item.get("raw_text") or ""
     ih = _input_hash(raw_text)
@@ -306,6 +373,9 @@ async def save_extract_result(
         status = "SUCCESS"
     else:
         status = "FAILED"
+
+    persisted_error = (json.dumps(meta["error_info"], sort_keys=True)
+                       if extract_error_receipt(meta.get("error_info")) else meta.get("error"))
 
     async with factory() as session:
         # 1. travel_extract_log
@@ -334,7 +404,7 @@ async def save_extract_result(
                 "output_raw": meta.get("raw_output", ""),
                 "output_json": json.dumps(parsed, ensure_ascii=False) if parsed else None,
                 "status": status,
-                "error": meta.get("error"),
+                "error": persisted_error,
                 "tok_in": meta.get("token_input", 0),
                 "tok_out": meta.get("token_output", 0),
                 "latency": meta.get("latency_ms", 0),
@@ -358,7 +428,7 @@ async def save_extract_result(
             """),
             {
                 "status": parse_status,
-                "error": meta.get("error"),
+                "error": persisted_error,
                 "id": raw_item["id"],
             },
         )
@@ -433,26 +503,15 @@ async def save_extract_result(
             place_type = p["place_type"]
             confidence = p["confidence"]
 
-            # 3. travel_place — upsert by (city, normalized_name)
-            place_result = await session.execute(
-                text("""
-                    INSERT INTO travel_place (city, name, normalized_name, place_type)
-                    VALUES (:city, :name, :normalized, :ptype)
-                    ON CONFLICT (city, normalized_name)
-                    DO UPDATE SET updated_time = NOW()
-                    RETURNING id
-                """),
-                {
-                    "city": city,
-                    "name": place_name,
-                    "normalized": normalized,
-                    "ptype": place_type,
-                },
+            # Resolve before any upsert row lock; hold identity through child writes.
+            place_id = await upsert_source_place(
+                session, city=city, name=place_name,
+                normalized_name=normalized, place_type=place_type,
             )
-            place_id = place_result.fetchone()[0]
+            children = {"travel_content_place_mention": [], "travel_place_fact": []}
 
             # 4. travel_content_place_mention
-            await session.execute(
+            mention_result = await session.execute(
                 text("""
                     INSERT INTO travel_content_place_mention
                         (content_id, place_id, place_name_text,
@@ -462,6 +521,7 @@ async def save_extract_result(
                         (:cid, :pid, :name_text,
                          :context, :mtype, :sentiment,
                          :route_order, :confidence)
+                    RETURNING id
                 """),
                 {
                     "cid": content_id,
@@ -474,13 +534,14 @@ async def save_extract_result(
                     "confidence": confidence,
                 },
             )
+            children["travel_content_place_mention"].append(mention_result.scalar_one())
 
             # 5. travel_place_fact — reason as recommendation or warning
             reason = p["reason"]
             if reason:
                 mention_type = p.get("mention_type", "recommend")
                 fact_type = "warning" if mention_type == "avoid" else "recommendation"
-                await session.execute(
+                fact_result = await session.execute(
                     text("""
                         INSERT INTO travel_place_fact
                             (place_id, source_platform, source_id, source_url,
@@ -488,6 +549,7 @@ async def save_extract_result(
                         VALUES
                             (:pid, 'xhs', :source_id, :source_url,
                              :fact_type, CAST(:fact_value AS jsonb), :confidence)
+                        RETURNING id
                     """),
                     {
                         "pid": place_id,
@@ -501,11 +563,13 @@ async def save_extract_result(
                         "confidence": confidence,
                     },
                 )
+                children["travel_place_fact"].append(fact_result.scalar_one())
 
-            visit_duration_fact = _visit_duration_fact_from_place(p)
+            visit_duration_fact = _visit_duration_fact_from_place(
+                p, source_text=raw_text, source_title=original_source_title(raw_item.get("raw_json")))
             if visit_duration_fact:
                 fact_value, fact_confidence = visit_duration_fact
-                await session.execute(
+                fact_result = await session.execute(
                     text("""
                         INSERT INTO travel_place_fact
                             (place_id, source_platform, source_id, source_url,
@@ -513,6 +577,7 @@ async def save_extract_result(
                         VALUES
                             (:pid, 'xhs', :source_id, :source_url,
                              'visit_duration', CAST(:fact_value AS jsonb), :confidence)
+                        RETURNING id
                     """),
                     {
                         "pid": place_id,
@@ -522,6 +587,8 @@ async def save_extract_result(
                         "confidence": fact_confidence,
                     },
                 )
+                children["travel_place_fact"].append(fact_result.scalar_one())
+            await record_redirected_children(session, place_id=place_id, children=children)
 
         await session.commit()
         logger.info(

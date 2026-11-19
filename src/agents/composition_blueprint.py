@@ -17,23 +17,48 @@ from src.agents.food_resolver import (
     FoodEnrichmentResult,
     resolve_food_attachment,
 )
+from src.agents.preferences import (
+    CITYWALK,
+    CULTURE,
+    NIGHT_VIEW,
+    DIMENSION_TAGS,
+    candidate_is_tea_place,
+    candidate_matches_dimension,
+)
 from src.agents.schema import (
     CandidatePlace,
     CompositionBlueprint,
     CompositionCommute,
     CompositionDay,
     CompositionStop,
+    RouteDayGroup,
     RoutePlan,
     TripRequest,
     parse_hhmm,
 )
 
 FOOD_TYPES = {"restaurant", "food", "market"}
-SNACK_TYPES = {"snack", "dessert", "bakery", "milk_tea"}
+SNACK_TYPES = {"snack", "snack_shop", "dessert", "bakery", "milk_tea"}
 COFFEE_TYPES = {"cafe", "coffee", "tea"}
 PHOTO_TYPES = {"photo_spot"}
 COFFEE_MARKERS = ("coffee", "cafe", "咖啡", "茶", "茶歇")
 SNACK_MARKERS = ("dessert", "bakery", "甜品", "面包", "蛋糕", "奶茶")
+# Restaurant names only. Bare 茶 would mark 茶人村 as a cafe.
+_LIGHT_COFFEE_NAME_MARKERS = ("咖啡", "cafe", "coffee")
+_LIGHT_SNACK_NAME_MARKERS = (
+    "烘焙",
+    "面包",
+    "bakery",
+    "甜品",
+    "dessert",
+    "蛋糕",
+    "cake",
+    "三明治",
+    "sandwich",
+    "奶茶",
+    "茶饮",
+    "糖水",
+)
 FULL_MEAL_MARKERS = (
     "午餐",
     "晚餐",
@@ -73,26 +98,53 @@ def _has_full_meal_evidence(place: CandidatePlace) -> bool:
     return any(marker in text for marker in FULL_MEAL_MARKERS)
 
 
+def _light_food_kind_from_name(name: str) -> str | None:
+    """Coffee or snack from the store name. A full-meal name stays a meal."""
+    folded = (name or "").casefold()
+    if any(marker.casefold() in folded for marker in FULL_MEAL_MARKERS):
+        return None
+    if any(marker.casefold() in folded for marker in _LIGHT_COFFEE_NAME_MARKERS):
+        return "coffee"
+    if any(marker.casefold() in folded for marker in _LIGHT_SNACK_NAME_MARKERS):
+        return "snack"
+    return None
+
+
 def _light_food_kind(place: CandidatePlace) -> str | None:
-    text = _candidate_text(place)
-    place_type = place.place_type.lower()
+    place_type = (place.place_type or "").lower()
     if place_type in COFFEE_TYPES:
         return "coffee"
     if place_type in SNACK_TYPES:
         return "snack"
     # A service mentioned inside a museum/park/street does not own its role.
-    # Keyword inference is only for untyped candidates and their identity name;
-    # recommendation prose and warnings can contain negation or nearby shops.
-    if place_type not in {"", "other"}:
+    # Keyword inference reads the place name only. Recommendation prose and
+    # warnings mention nearby shops and must not assign this place's role.
+    if place_type in {"", "other"}:
+        text = (place.name or "").lower()
+        if any(marker in text for marker in FULL_MEAL_MARKERS):
+            return None
+        if any(marker in text for marker in COFFEE_MARKERS):
+            return "coffee"
+        if any(marker in text for marker in SNACK_MARKERS):
+            return "snack"
         return None
-    text = place.name.lower()
-    if any(marker in text for marker in FULL_MEAL_MARKERS):
-        return None
-    if any(marker in text for marker in COFFEE_MARKERS):
-        return "coffee"
-    if any(marker in text for marker in SNACK_MARKERS):
-        return "snack"
+    if place_type == "restaurant":
+        return _light_food_kind_from_name(place.name or "")
     return None
+
+
+def is_light_food_place(place: CandidatePlace) -> bool:
+    """Coffee, bakery, dessert, sandwich or similar top-up.
+
+    Tea houses are not top-ups. The store name is enough even when the type is
+    restaurant or photo_spot. Visitor lines are not consulted.
+    """
+    named = _light_food_kind_from_name(place.name or "")
+    if candidate_is_tea_place(place) and named is None:
+        return False
+    if named is not None:
+        return True
+    return _light_food_kind(place) is not None
 
 
 def is_photo_stop(place: CandidatePlace) -> bool:
@@ -130,24 +182,127 @@ def trip_is_food_focused(req: TripRequest) -> bool:
     return any(marker in text for marker in ("美食", "吃", "小吃", "咖啡", "火锅"))
 
 
+# Night phrases already used as structured tags, plus the route evening phrase
+# 夜游. Bridge names, 江景 and 天际线 are not night evidence.
+_NIGHT_VIEW_PHRASES = tuple(DIMENSION_TAGS[NIGHT_VIEW] | {"夜游"})
+# Time hints are not identity. Only these activities, written against a place
+# that is actually on the day, count as an arrangement.
+_NIGHT_HINT_ACTIVITIES = ("夜景", "夜游", "灯光")
+_NIGHT_HINT_CLAUSE_RE = re.compile(r"[，,。；;！？!?、]")
+_NIGHT_HINT_CLOCK_RE = re.compile(r"\d{1,2}[:：]\d{2}")
+_NIGHT_HINT_NEGATION_RE = re.compile(
+    r"(?:不是|没有|不安排|不要|不可|不能|不会|不|没|无|非|勿|别).{0,8}(?:夜景|夜游|灯光)"
+    r"|(?:夜景|夜游|灯光).{0,6}(?:不安排|不要|不可|不能|不是|没有|不|没|无|并非)"
+)
+_CITYWALK_PHRASES = ("商圈", "步行", "citywalk", "街区", "老街")
+_SLOW_PHRASES = ("公园", "咖啡", "书院", "休闲")
+_SLOW_PLACE_TYPES = frozenset({"park", "garden"})
+_CULTURE_PHRASES = ("博物馆", "纪念", "历史", "文化", "古城", "老城")
+
+
+def _place_identity_text(place: CandidatePlace) -> str:
+    """Name, type and category tags. Reason and warning prose is not identity."""
+    return " ".join(
+        str(part)
+        for part in (place.name, place.place_type, *(place.category_tags or []))
+        if part
+    )
+
+
+def _identity_has_phrase(place: CandidatePlace, phrases: tuple[str, ...]) -> bool:
+    text = _place_identity_text(place).casefold()
+    return any(phrase.casefold() in text for phrase in phrases)
+
+
+def _place_supports_night(place: CandidatePlace) -> bool:
+    return _identity_has_phrase(place, _NIGHT_VIEW_PHRASES)
+
+
+def _night_hint_clauses(hint: str) -> list[str]:
+    return [
+        part.strip()
+        for part in _NIGHT_HINT_CLAUSE_RE.split(hint)
+        if part.strip()
+    ]
+
+
+def _night_activity_bound_to_place(clause: str, place_name: str) -> bool:
+    """The activity word has to sit against this place, not another name."""
+    name = place_name.strip()
+    if len(name) < 2:
+        return False
+    return any(
+        f"{name}{activity}" in clause or f"{activity}{name}" in clause
+        for activity in _NIGHT_HINT_ACTIVITIES
+    )
+
+
+def _clause_schedules_night_for_day(clause: str, place_names: list[str]) -> bool:
+    """A clock-timed night activity for one of today's places.
+
+    "{name}适合安排在傍晚或夜间" is only a suggestion. Bare 夜间, a negated
+    activity, another place, or suggestion prose does not count.
+    """
+    if "建议" in clause or "适合安排" in clause:
+        return False
+    if _NIGHT_HINT_CLOCK_RE.search(clause) is None:
+        return False
+    if _NIGHT_HINT_NEGATION_RE.search(clause):
+        return False
+    return any(
+        _night_activity_bound_to_place(clause, name) for name in place_names
+    )
+
+
+def _time_hints_support_night(
+    time_hints: list[str],
+    places: list[CandidatePlace],
+) -> bool:
+    names = [place.name.strip() for place in places if (place.name or "").strip()]
+    for hint in time_hints:
+        for clause in _night_hint_clauses(hint):
+            if _clause_schedules_night_for_day(clause, names):
+                return True
+    return False
+
+
 def _theme_for_day(
     places: list[CandidatePlace],
     *,
     trip_request: TripRequest,
+    day_group: RouteDayGroup | None = None,
 ) -> tuple[str, str]:
-    text = " ".join(_candidate_text(place) for place in places)
-    food_count = sum(1 for place in places if is_food_place(place))
-    if any(marker in text for marker in ("平潭", "岛", "海", "郊", "环岛", "远郊")):
+    """Locked day kind wins. Night hints need a real schedule for today's place."""
+    policy = day_group.traffic_policy if day_group is not None else None
+    day_kind = policy.day_kind if policy is not None else None
+    if day_kind == "excursion":
         return "day_trip", "远郊一日"
-    if any(marker in text for marker in ("夜景", "江景", "桥", "灯光", "天际线")):
+
+    time_hints = list(day_group.time_hints) if day_group is not None else []
+    if any(_place_supports_night(place) for place in places) or (
+        _time_hints_support_night(time_hints, places)
+    ):
         return "night_view", "夜景打卡"
+    food_count = sum(1 for place in places if is_food_place(place))
     if trip_is_food_focused(trip_request) and food_count >= 2:
         return "food_walk", "美食慢逛"
-    if any(marker in text for marker in ("街", "巷", "商圈", "步行", "citywalk")):
+    if any(
+        candidate_matches_dimension(place, CITYWALK)
+        or _identity_has_phrase(place, _CITYWALK_PHRASES)
+        for place in places
+    ):
         return "citywalk", "街区漫步"
-    if any(marker in text for marker in ("公园", "茶", "咖啡", "寺", "书院", "休闲")):
-        return "slow_day", "慢节奏休闲"
-    if any(marker in text for marker in ("博物馆", "纪念", "历史", "文化", "古城", "老城")):
+    if any(
+        (place.place_type or "").strip().lower() in _SLOW_PLACE_TYPES
+        or _identity_has_phrase(place, _SLOW_PHRASES)
+        for place in places
+    ):
+        return "slow_day", "散步休闲活动"
+    if any(
+        candidate_matches_dimension(place, CULTURE)
+        or _identity_has_phrase(place, _CULTURE_PHRASES)
+        for place in places
+    ):
         return "culture_day", "人文老城"
     return "classic_day", "经典顺路游"
 
@@ -188,10 +343,94 @@ def _stop_hint(
     return "作为次要活动简洁说明"
 
 
+def _activity_role(
+    place: CandidatePlace,
+    anchor_id: int | None,
+) -> tuple[str, str | None, str]:
+    if is_context_stop(place):
+        return "transfer_context", None, "light"
+    if is_photo_stop(place):
+        return "photo_stop", None, "normal"
+    if place.place_id == anchor_id:
+        return "anchor_activity", None, "high"
+    return "secondary_activity", None, "normal"
+
+
+def _legacy_stop_role(
+    place: CandidatePlace,
+    anchor_id: int | None,
+    food_seen: int,
+) -> tuple[str, str | None, str, int]:
+    """Guess lunch, then dinner, from food order. Selector days still use this."""
+    place_type = place.place_type.lower()
+    light_kind = _light_food_kind(place)
+    meal_slot = None
+    role = "secondary_activity"
+    emphasis = "normal"
+    if light_kind == "coffee":
+        role = "coffee_stop"
+        meal_slot = "coffee"
+    elif light_kind == "snack":
+        role = "snack_stop"
+        meal_slot = "snack"
+    elif place_type in FOOD_TYPES:
+        food_seen += 1
+        if food_seen == 1:
+            role = "meal_stop"
+            meal_slot = "lunch"
+        elif food_seen == 2:
+            role = "meal_stop"
+            meal_slot = "dinner"
+        else:
+            role = "optional_stop"
+            meal_slot = "late_night_optional"
+            emphasis = "light"
+    else:
+        role, meal_slot, emphasis = _activity_role(place, anchor_id)
+    return role, meal_slot, emphasis, food_seen
+
+
+def _assigned_kind(stop_kinds: dict, place_id: int) -> str | None:
+    kind = stop_kinds.get(place_id)
+    if kind is None:
+        kind = stop_kinds.get(str(place_id))
+    if kind in {"lunch", "dinner", "snack", "night", "sight"}:
+        return kind
+    return None
+
+
+def _assigned_stop_role(
+    place: CandidatePlace,
+    stop_kinds: dict,
+    anchor_id: int | None,
+) -> tuple[str, str | None, str]:
+    """Use the planner stop type. Do not invent lunch or dinner by order."""
+    kind = _assigned_kind(stop_kinds, place.place_id)
+    if kind == "lunch":
+        return "meal_stop", "lunch", "normal"
+    if kind == "dinner":
+        return "meal_stop", "dinner", "normal"
+    if kind == "snack":
+        if _light_food_kind(place) == "coffee":
+            return "coffee_stop", "coffee", "normal"
+        return "snack_stop", "snack", "normal"
+    if kind in {"night", "sight"}:
+        return _activity_role(place, anchor_id)
+    light_kind = _light_food_kind(place)
+    if light_kind == "coffee":
+        return "coffee_stop", "coffee", "normal"
+    if light_kind == "snack":
+        return "snack_stop", "snack", "normal"
+    if (place.place_type or "").lower() in FOOD_TYPES:
+        return "optional_stop", "late_night_optional", "light"
+    return _activity_role(place, anchor_id)
+
+
 def _build_day_stops(
     day_places: list[CandidatePlace],
     *,
     trip_request: TripRequest,
+    stop_kinds: dict | None = None,
 ) -> list[CompositionStop]:
     food_seen = 0
     non_food = [place for place in day_places if not is_food_place(place)]
@@ -207,39 +446,21 @@ def _build_day_stops(
             ),
         ).place_id
 
+    assigned = dict(stop_kinds or {})
     stops = []
     for place in day_places:
-        place_type = place.place_type.lower()
-        light_kind = _light_food_kind(place)
-        meal_slot = None
-        role = "secondary_activity"
-        emphasis = "normal"
-        if light_kind == "coffee":
-            role = "coffee_stop"
-            meal_slot = "coffee"
-        elif light_kind == "snack":
-            role = "snack_stop"
-            meal_slot = "snack"
-        elif place_type in FOOD_TYPES:
-            food_seen += 1
-            if food_seen == 1:
-                role = "meal_stop"
-                meal_slot = "lunch"
-            elif food_seen == 2:
-                role = "meal_stop"
-                meal_slot = "dinner"
-            else:
-                role = "optional_stop"
-                meal_slot = "late_night_optional"
-                emphasis = "light"
-        elif is_context_stop(place):
-            role = "transfer_context"
-            emphasis = "light"
-        elif is_photo_stop(place):
-            role = "photo_stop"
-        elif place.place_id == anchor_id:
-            role = "anchor_activity"
-            emphasis = "high"
+        if assigned:
+            role, meal_slot, emphasis = _assigned_stop_role(
+                place,
+                assigned,
+                anchor_id,
+            )
+        else:
+            role, meal_slot, emphasis, food_seen = _legacy_stop_role(
+                place,
+                anchor_id,
+                food_seen,
+            )
 
         stops.append(CompositionStop(
             place_id=place.place_id,
@@ -269,6 +490,7 @@ def build_base_composition_blueprints(
             theme_code, theme_label = _theme_for_day(
                 places,
                 trip_request=trip_request,
+                day_group=day_group,
             )
             commutes = []
             for leg in day_group.commute_legs:
@@ -303,7 +525,11 @@ def build_base_composition_blueprints(
                 day=day_group.day,
                 theme_code=theme_code,
                 theme_label=theme_label,
-                stops=_build_day_stops(places, trip_request=trip_request),
+                stops=_build_day_stops(
+                    places,
+                    trip_request=trip_request,
+                    stop_kinds=day_group.stop_kinds,
+                ),
                 commutes=commutes,
                 writing_notes=notes,
             ))
@@ -556,39 +782,3 @@ def meal_role_recovery_metrics(
         "meal_role_recovered_count": len(recovered),
         "meal_role_recovered_stops": recovered[:10],
     }
-
-
-_LIGHT_FOOD_TYPES = {"cafe", "coffee", "dessert", "bakery", "milk_tea", "tea"}
-_LIGHT_FOOD_WORDS = (
-    "咖啡",
-    "烘焙",
-    "面包",
-    "甜品",
-    "蛋糕",
-    "三明治",
-    "奶茶",
-    "茶饮",
-    "cafe",
-    "coffee",
-    "bakery",
-)
-_NIGHT_HINT_CLOCK_RE = re.compile(r"\d{1,2}\s*[:：]\s*\d{2}")
-_NIGHT_HINT_NEGATION_RE = re.compile(r"(?:不要|别|不宜|不适合).{0,12}(?:夜|晚)")
-
-
-def is_light_food_place(place) -> bool:
-    """Cafe, bakery and tea stops are light food, not a seated meal."""
-    place_type = str(getattr(place, "place_type", "") or "").lower()
-    if place_type in _LIGHT_FOOD_TYPES:
-        return True
-    blob = f"{getattr(place, 'name', '')} {place_type}".lower()
-    return any(word in blob for word in _LIGHT_FOOD_WORDS)
-
-
-def _night_hint_clauses(hint: str) -> list[str]:
-    return [part.strip() for part in re.split(r"[。；;]", hint or "") if part.strip()]
-
-
-def _night_activity_bound_to_place(clause: str, place_name: str) -> bool:
-    name = (place_name or "").strip()
-    return len(name) >= 2 and name in (clause or "")

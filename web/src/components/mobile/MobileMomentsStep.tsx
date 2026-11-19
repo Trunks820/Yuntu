@@ -132,5 +132,3 @@ export const MobileMomentsStep: React.FC<MobileMomentsStepProps> = ({
     </>
   );
 };
-
-

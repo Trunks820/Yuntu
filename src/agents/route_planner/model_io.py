@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import re
 import time
 
@@ -23,6 +24,21 @@ from src.agents.route_planner.places import coerce_place_id
 
 # RoutePlannerCall is built through the package. Importing planner here would cycle.
 import src.agents.route_planner as _route_planner_pkg
+
+logger = logging.getLogger(__name__)
+
+# The backup leg starts only with this much left of both the single call
+# (50s) and the whole step (70s). Neither limit is extended for it.
+BACKUP_MIN_SECONDS = 20.0
+
+_BAD_KEY_MARKERS = (
+    "api key not valid",
+    "api_key_invalid",
+    "api key expired",
+    "valid api key",
+    "invalid api key",
+    "invalid auth key",
+)
 
 
 
@@ -113,7 +129,7 @@ async def _invoke(caller, system: str, user: str, *, settings: Settings, calls: 
     started = time.perf_counter()
     try:
         result = await asyncio.wait_for(caller(system, user), timeout=float(settings.route_planner_timeout_seconds))
-    except Exception:
+    except Exception as exc:
         calls.append(
             _route_planner_pkg.RoutePlannerCall(
                 index=len(calls) + 1,
@@ -124,6 +140,7 @@ async def _invoke(caller, system: str, user: str, *, settings: Settings, calls: 
                 completion_tokens=0,
                 provider="",
                 model="",
+                backup_reason=str(getattr(exc, "route_planner_backup_reason", "") or ""),
             )
         )
         raise
@@ -141,19 +158,51 @@ async def _invoke(caller, system: str, user: str, *, settings: Settings, calls: 
             completion_tokens=int(usage.get("completion_tokens") or usage.get("token_output") or 0),
             provider=str(usage.get("provider") or ""),
             model=str(usage.get("model") or ""),
+            backup_reason=str(usage.get("backup_reason") or ""),
         )
     )
     return text
 
 
-async def _default_caller(system: str, user: str, settings: Settings):
+def backup_switch_reason(exc: BaseException) -> str | None:
+    """Why a failed primary call may go to the backup leg, or None.
+
+    Only a clear failure switches: the endpoint is stopped, the key is
+    refused, quota or balance is used up, a 5xx, or no connection. A call
+    that was merely slow, or returned bad output, does not.
+    """
+    import httpx
+    import openai
+
+    from src.agents.route_planner.planner import _exception_blob, classify_planner_call_failure
+
+    kind, status = classify_planner_call_failure(exc)
+    if kind in {"timeout", "bad_output"}:
+        return None
+    if getattr(exc, "model_request_not_started", False):
+        return "primary_stopped"
+    if kind in {"quota", "rate_limited", "server_error"}:
+        return kind
+    if status in {401, 403}:
+        return "auth"
+    # Gemini answers a bad or expired key with 400, not 401.
+    if status == 400 and any(marker in _exception_blob(exc) for marker in _BAD_KEY_MARKERS):
+        return "auth"
+    if isinstance(exc, (httpx.ConnectError, openai.APIConnectionError)):
+        return "connect"
+    return None
+
+
+async def _call_leg(system: str, user: str, settings: Settings, *, timeout: float,
+                    config=None, endpoint_name: str | None = None):
     with llm.llm_call_context(
         call_reason="route_planner",
         safe_purpose="ROUTE_PLANNER",
         max_tokens_request=int(settings.route_planner_max_tokens),
-        relay_request_timeout_seconds=float(settings.route_planner_timeout_seconds),
+        relay_request_timeout_seconds=timeout,
         reasoning_effort=str(settings.route_planner_reasoning_effort),
-        route_planner_timeout_seconds=float(settings.route_planner_timeout_seconds),
+        route_planner_timeout_seconds=timeout,
+        direct_endpoint_name=endpoint_name,
     ):
         return await llm.chat_with_usage(
             system,
@@ -162,7 +211,44 @@ async def _default_caller(system: str, user: str, settings: Settings):
             temperature=float(settings.route_planner_temperature),
             json_mode=True,
             max_tokens=int(settings.route_planner_max_tokens),
+            role_config_override=config,
         )
+
+
+async def _default_caller(system: str, user: str, settings: Settings, *,
+                          step_started: float | None = None):
+    """Primary leg, then the backup leg on a clear failure with time left."""
+    from src.model_routes import route_leg
+
+    call_limit = float(settings.route_planner_timeout_seconds)
+    call_started = time.perf_counter()
+    try:
+        return await _call_leg(system, user, settings, timeout=call_limit)
+    except Exception as exc:
+        reason = backup_switch_reason(exc)
+        if reason is None:
+            raise
+        now = time.perf_counter()
+        remaining = call_limit - (now - call_started)
+        if step_started is not None:
+            remaining = min(remaining, float(settings.route_planner_deadline_seconds) - (now - step_started))
+        if remaining < BACKUP_MIN_SECONDS:
+            raise
+        try:
+            config = llm.route_planner_backup_config(settings)
+        except ValueError:
+            # No backup key on this server: behave as before the backup existed.
+            raise exc from None
+        leg = route_leg("route_planner", "backup")
+        logger.warning("route_planner switches to backup reason=%s remaining=%.1f", reason, remaining)
+        try:
+            text, usage = await _call_leg(
+                system, user, settings, timeout=remaining,
+                config=config, endpoint_name=leg.endpoint_id)
+        except Exception as backup_exc:
+            backup_exc.route_planner_backup_reason = reason
+            raise
+        return text, {**dict(usage or {}), "backup_reason": reason}
 
 
 def _repair_user(prepared: PreparedRoute, previous: dict, adjustments: list[str], issues: list[str]) -> str:
@@ -182,5 +268,3 @@ async def _read_plan(caller, system, user, *, settings, calls, repaired: bool) -
     retry_user = user if JSON_RETRY_HINT in user else f"{user}\n{JSON_RETRY_HINT}"
     text = await _invoke(caller, system, retry_user, settings=settings, calls=calls, repaired=repaired, json_retry=True)
     return parse_model_plan(text)
-
-

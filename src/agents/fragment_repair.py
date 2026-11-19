@@ -13,17 +13,25 @@ from typing import Any
 import httpx
 import openai
 
+from src.agents.model_json import decode_model_json
 from src.agents.activity_completion import completion_sentence_for_contract
 from src.agents.evidence_strength import StructuredEvidencePayload
 from src.agents.fact_expression_taxonomy import has_hard_fact_marker
 from src.agents.final_writer import _merge_locked_place_fields
 from src.agents.generation_issues import GenerationIssue
-from src.agents.llm import LLMTransportError, chat, llm_call_context, _call_context
+from src.agents.llm import (
+    LLMTransportError,
+    RoleConfig,
+    chat,
+    llm_call_context,
+    resolve_role_config,
+    _call_context,
+)
 from src.agents.preflight import PreflightFinding, collect_phrase_preflight
 from src.agents.poi_fragments import (
     fragment_for_span,
     replace_fragment_range,
-    replace_fragment_text,
+    replace_fragment_body,
 )
 from src.agents.publish_gate import PLACEHOLDER_PHRASES
 from src.agents.route_planning import (
@@ -633,7 +641,7 @@ def deterministic_unsupported_fact_fragment_repair(
                     plans=[plan],
                     failure_reason="no_matching_fragment",
                 )
-            replaced = replace_fragment_text(
+            replaced = replace_fragment_body(
                 candidate,
                 plan_index=stable_key[0],
                 day=stable_key[1],
@@ -797,6 +805,7 @@ def deterministic_unsupported_fact_fragment_repair(
         summary=plan.summary,
         accommodation=plan.accommodation,
         transport=plan.transport,
+        code_lodging_section=plan.code_lodging_section,
     )
     if route_plan_violations([repaired], [route_plan]):
         return FragmentRepairResult(
@@ -956,6 +965,7 @@ async def call_fragment_repair_llm(
     *,
     plan_text: str,
     targets: list[RepairTarget],
+    generator: str | None = None,
 ) -> dict[str, str]:
     """Ask Writer role for replacement_text only. Returns target_id -> text."""
     if not targets:
@@ -984,10 +994,22 @@ async def call_fragment_repair_llm(
     generation_index = parent_ctx.get("generation_index")
     if generation_index is None:
         generation_index = parent_ctx.get("publish_retry_round") or 0
+    role_config_override: RoleConfig | None = None
+    if generator == "opus":
+        role_config_override = resolve_role_config("writer")
+    elif generator == "ds_flash":
+        from src.agents.llm import writer_standby_config
+        from src.config import get_settings
+
+        role_config_override = writer_standby_config(get_settings(), agent="repair")
+    elif generator is not None:
+        raise FragmentRepairCallFailure("unsupported_generator")
+
     with llm_call_context(
         call_reason="fragment_repair",
         role="writer",
         stage="FRAGMENT_REPAIR",
+        key_agent="repair",
         generation_index=int(generation_index or 0),
         publish_retry_round=parent_ctx.get("publish_retry_round"),
         job_id=parent_ctx.get("job_id"),
@@ -999,9 +1021,10 @@ async def call_fragment_repair_llm(
             role="writer",
             temperature=0.1,
             json_mode=True,
+            role_config_override=role_config_override,
         )
     try:
-        data = json.loads(raw)
+        data = decode_model_json(raw)
     except json.JSONDecodeError:
         raise FragmentRepairCallFailure("invalid_json")
     repairs = data.get("repairs") if isinstance(data, dict) else None
@@ -1139,6 +1162,7 @@ def apply_fragment_repairs(
             summary=plan.summary,
             accommodation=plan.accommodation,
             transport=plan.transport,
+            code_lodging_section=plan.code_lodging_section,
         )
     )
     if route_plan_violations([repaired], [route_plan]):
@@ -1169,6 +1193,7 @@ async def maybe_fragment_repair_plan(
     route_plan: RoutePlan,
     plan_index: int = 1,
     issue_codes: set[str] | None = None,
+    generator: str | None = None,
 ) -> FragmentRepairResult:
     base_hash, targets = build_targets_from_preflight(
         plan,
@@ -1182,6 +1207,7 @@ async def maybe_fragment_repair_plan(
         replacements = await call_fragment_repair_llm(
             plan_text=plan.plan_text or "",
             targets=targets,
+            generator=generator,
         )
     except FragmentRepairCallFailure as exc:
         return FragmentRepairResult(

@@ -185,4 +185,7 @@
 .ym .manifest-row.lodging-unmatched{color:var(--danger)}
 .ym .manifest-row.lodging-unmatched svg{color:var(--danger)}
 .ym .manifest-row.lodging-unmatched span{color:var(--danger)}
-.ym .lodging-pending{margin-left:6px;font-style:normal;font-size:11px;color:var(--danger);border:1px solid var(--line);border-radius:999px;padding:1px 6px}
+
+/* v0.15.1：当天概述与各站说明保留换行 */
+.ym .result-summary{white-space:pre-line}
+.ym .day-stop p{white-space:pre-line}

@@ -85,5 +85,3 @@ export function PlanSummaryCard({ plan, image, recommended, index = 0, onClick }
     </button>
   );
 }
-
-

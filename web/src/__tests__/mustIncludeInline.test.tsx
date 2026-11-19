@@ -1,4 +1,5 @@
 import { describe, test, expect, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, act } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { MustIncludeNotice } from "@/components/detail/MustIncludeNotice";
@@ -104,13 +105,18 @@ describe("v0.9.4 P6 Acceptance - MustInclude Notice & Inline Badge Tests", () =>
       useTripStore.getState().setResult("801", "", mockPageResult as unknown as TripResult);
     });
 
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
     await act(async () => {
       render(
-        <MemoryRouter initialEntries={["/plan/801/plan_v094_1"]}>
-        <Routes>
-          <Route path="/plan/:resultId/:planId" element={<PlanDetailPage />} />
-        </Routes>
-      </MemoryRouter>,
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/plan/801/plan_v094_1"]}>
+            <Routes>
+              <Route path="/plan/:resultId/:planId" element={<PlanDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
       );
     });
 

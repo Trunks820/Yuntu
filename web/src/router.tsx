@@ -1,22 +1,29 @@
 /* eslint-disable react-refresh/only-export-components */
-import { createBrowserRouter } from "react-router-dom";
+import { createBrowserRouter, Navigate } from "react-router-dom";
 import { lazy, Suspense } from "react";
 import App from "./App";
 import { useIsMobileViewport } from "./hooks/useIsMobileViewport";
 
-const CinematicHomepagePage = lazy(() => import("./pages/demo/CinematicHomepagePage"));
+const SpreadStartPage = lazy(() => import("./pages/start/SpreadStartPage"));
+const SpreadHistoryPage = lazy(() => import("./pages/history/SpreadHistoryPage"));
+const PlanningPage = lazy(() => import("./pages/PlanningPage"));
+const SpreadPlanningPage = lazy(() => import("./pages/planning/SpreadPlanningPage"));
+const ResultPage = lazy(() => import("./pages/ResultPage"));
+const PlanDetailPage = lazy(() => import("./pages/PlanDetailPage"));
+const SpreadBookPage = lazy(() => import("./pages/book/SpreadBookPage"));
 const MobileHomePage = lazy(() => import("./pages/mobile/MobileHomePage"));
 const MobileExplorePage = lazy(() => import("./pages/mobile/MobileExplorePage"));
 const MobileInspirationPage = lazy(() => import("./pages/mobile/MobileInspirationPage"));
-const PlanningPage = lazy(() => import("./pages/PlanningPage"));
-const ResultPage = lazy(() => import("./pages/ResultPage"));
-const PlanDetailPage = lazy(() => import("./pages/PlanDetailPage"));
+const MobileTripsPage = lazy(() => import("./pages/mobile/MobileTripsPage"));
 const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
 
-/** 手机视口用手机首页，宽屏继续用现有沉浸首页。 */
+/** 手机视口用手机页面，宽屏用桌面页面 */
+function Responsive({ mobile, desktop }: { mobile: React.ReactNode; desktop: React.ReactNode }) {
+  return <>{useIsMobileViewport() ? mobile : desktop}</>;
+}
+
 function ResponsiveHomePage() {
-  const mobile = useIsMobileViewport();
-  return mobile ? <MobileHomePage /> : <CinematicHomepagePage />;
+  return <Responsive mobile={<MobileHomePage />} desktop={<SpreadStartPage />} />;
 }
 
 function LazyPage({ children }: { children: React.ReactNode }) {
@@ -64,10 +71,34 @@ export const router = createBrowserRouter([
         ),
       },
       {
+        path: "classic",
+        element: <Navigate to="/" replace />,
+      },
+      {
+        path: "login",
+        element: <Navigate to="/" replace />,
+      },
+      {
+        path: "auth/callback",
+        element: <Navigate to="/" replace />,
+      },
+      {
+        path: "history",
+        element: (
+          <LazyPage>
+            <Responsive mobile={<MobileTripsPage />} desktop={<SpreadHistoryPage />} />
+          </LazyPage>
+        ),
+      },
+      {
+        path: "profile",
+        element: <Navigate to="/history" replace />,
+      },
+      {
         path: "planning/:jobId",
         element: (
           <LazyPage>
-            <PlanningPage />
+            <Responsive mobile={<PlanningPage />} desktop={<SpreadPlanningPage />} />
           </LazyPage>
         ),
       },
@@ -83,9 +114,13 @@ export const router = createBrowserRouter([
         path: "plan/:resultId/:planId",
         element: (
           <LazyPage>
-            <PlanDetailPage />
+            <Responsive mobile={<PlanDetailPage />} desktop={<SpreadBookPage />} />
           </LazyPage>
         ),
+      },
+      {
+        path: "demo/*",
+        element: <Navigate to="/" replace />,
       },
       {
         path: "*",

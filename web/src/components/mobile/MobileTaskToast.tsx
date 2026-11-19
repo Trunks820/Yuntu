@@ -101,5 +101,3 @@ export const MobileTaskToast: React.FC = () => {
 };
 
 export default MobileTaskToast;
-
-

@@ -101,19 +101,21 @@ export function AccommodationTimelineNode({
             </div>
           </div>
 
-          {/* 详情与说明描述 */}
-          <div className="mt-3 border-t border-gray-100/80 pt-3 text-sm leading-relaxed font-medium text-gray-700">
-            <p>
-              {isUserSpecified
-                ? `本行程路线已围绕你的入住点【${name}】进行交通与路线最优化排布。`
-                : `大本营设在【${name}】附近，地理位置优越，步行或公共交通可便捷直达绝大多数核心景点。`}
-            </p>
-            {reason && (
-              <p className="mt-1 text-xs text-gray-500 font-normal">
-                💡 推荐理由：{reason}
-              </p>
-            )}
-          </div>
+          {/* 详情与说明描述：推荐住处只保留理由；无理由时整块不渲染 */}
+          {(isUserSpecified || reason) && (
+            <div className="mt-3 border-t border-gray-100/80 pt-3 text-sm leading-relaxed font-medium text-gray-700">
+              {isUserSpecified && (
+                <p>
+                  本行程路线已围绕你的入住点【{name}】进行交通与路线最优化排布。
+                </p>
+              )}
+              {reason && (
+                <p className="mt-1 text-xs text-gray-500 font-normal">
+                  💡 推荐理由：{reason}
+                </p>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );

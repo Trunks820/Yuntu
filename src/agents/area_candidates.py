@@ -507,5 +507,3 @@ async def fetch_tea_houses(session, *, city: str) -> list[AreaCandidate]:
     )
     rows = [candidate_from_row(dict(row)) for row in result.mappings().all()]
     return rank_by_rating(rows)
-
-

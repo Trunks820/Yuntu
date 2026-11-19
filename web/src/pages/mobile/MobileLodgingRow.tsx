@@ -82,9 +82,6 @@ export function MobileLodgingRow({
         <Icon name="info" />
         <span>
           <b>住宿</b>：{formatUserLodgingText(display)}
-          {display.price_status === "待核实" ? (
-            <em className="lodging-pending">待核实</em>
-          ) : null}
         </span>
       </div>
     );
@@ -98,9 +95,8 @@ export function MobileLodgingRow({
   const hasGroups = groups.length > 0;
   const detailsVisible = !hasGroups || expanded;
   const hasDetailBody = Boolean(caption) || hasGroups || holiday.length > 0;
-  const pricePending = display.price_status === "待核实";
   const showPriceNote =
-    detailsVisible && hasGroups && groups.some(hasNightlyPrice) && !pricePending;
+    detailsVisible && hasGroups && groups.some(hasNightlyPrice);
 
   return (
     <>
@@ -114,7 +110,6 @@ export function MobileLodgingRow({
         <Icon name="info" />
         <span>
           <b>住宿参考</b>：{display.area_label}
-          {pricePending ? <em className="lodging-pending">待核实</em> : null}
           {accommodation.reason ? `（${accommodation.reason}）` : ""}
           {hasGroups && (
             <button
@@ -154,5 +149,3 @@ export function MobileLodgingRow({
     </>
   );
 }
-
-

@@ -23,8 +23,10 @@ from src.cost_sources.intercity import IntercitySourceBundle, observe_intercity_
 from src.cost_sources.local_transport import resolve_local_transport_source
 from src.cost_sources.meals import resolve_meal_source
 from src.cost_sources.admission import resolve_admission_source
-from src.cost_sources.models import CostSourceResult
+from src.cost_sources.common import cny_range
+from src.cost_sources.models import CostSourceResult, SourceObservation
 from src.config import get_settings
+from src.agents.lodging_section import parse_price_observed_at
 
 from .models import CostEstimateSnapshotV1
 from .resolver import (
@@ -64,6 +66,48 @@ class IntercityCostPrefetch:
     deadline_monotonic: float
     timeout_seconds: float
     outbound_task: asyncio.Task[TransportSuggestion | None] | None = None
+
+
+def _lodging_section_v2_enabled() -> bool:
+    return bool(getattr(get_settings(), "lodging_section_v2_enabled", False))
+
+
+def _rollinggo_accommodation_source(result, *, captured_at: datetime) -> CostSourceResult | None:
+    """Nightly mid band, then economy, then high. Empty means the caller stays missing."""
+
+    if result is None:
+        return None
+    checkin = getattr(result, "checkin_date", None)
+    checkin_text = checkin.isoformat() if hasattr(checkin, "isoformat") else "unknown"
+    for tier_name in ("mid", "economy", "high"):
+        tier = getattr(result, tier_name, None)
+        if tier is None:
+            continue
+        hotels = getattr(tier, "hotels", ()) or ()
+        low = getattr(tier, "nightly_low", None)
+        high = getattr(tier, "nightly_high", None)
+        if not hotels or low is None or high is None:
+            continue
+        range_fen = cny_range(int(low), int(high))
+        if range_fen is None:
+            continue
+        return CostSourceResult(
+            adapter_status="success",
+            resolution="sourced",
+            selected=SourceObservation(
+                source_id="rollinggo",
+                source_type="rollinggo",
+                price_basis="sourced",
+                item_identity=f"rollinggo:lodging:checkin:{checkin_text}",
+                captured_at=captured_at,
+                observed_at=parse_price_observed_at(
+                    str(getattr(tier, "queried_at", "") or ""),
+                    captured_at,
+                ),
+                range_fen=range_fen,
+            ),
+        )
+    return None
 
 
 def _missing_source(reason: str) -> CostSourceResult:
@@ -265,7 +309,20 @@ async def _plan_inputs(
     accommodation_source = _missing_source(
         "stable accommodation area identity is unavailable"
     )
-    if plan.accommodation is not None:
+    use_rollinggo_lodging = (
+        _lodging_section_v2_enabled()
+        and plan.accommodation is not None
+        and plan.accommodation.source != "user_specified"
+    )
+    if use_rollinggo_lodging:
+        priced = _rollinggo_accommodation_source(
+            getattr(result, "lodging_price_result", None),
+            captured_at=estimated_at,
+        )
+        accommodation_source = priced or _missing_source(
+            "rollinggo lodging price is unavailable"
+        )
+    elif plan.accommodation is not None:
         area_identity = _area_identity_for_plan(
             catalog,
             city=city,

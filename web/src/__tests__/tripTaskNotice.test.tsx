@@ -74,7 +74,7 @@ describe("Trip Generation Persistent Task Notification Tests (P1)", () => {
     expect(screen.getByText("旅行攻略已生成")).toBeInTheDocument();
     expect(screen.getByText("为你准备好了 东京 的行程攻略")).toBeInTheDocument();
 
-    const btn = screen.getByText("查看攻略");
+    const btn = screen.getByText("查看结果");
     fireEvent.click(btn);
 
     expect(currentPath).toBe("/result/2254?job_id=job_100");

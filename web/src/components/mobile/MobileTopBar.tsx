@@ -9,11 +9,11 @@ interface MobileTopBarProps {
   onHome?: () => void;
   /** 首页：左侧显示品牌而不是返回键 */
   brand?: boolean;
-  /** 账号页的顶栏样式保留，游客模式不进入登录 */
+  /** 书架/信息页顶栏：标题用宋体「云途」并带下边线（原型 .u-topbar） */
   account?: boolean;
 }
 
-/** 游客顶栏：没有登录、历史或个人资料入口。 */
+/** 手机端顶栏（开源免登录直连模式：右侧直达本地「我的行程」） */
 export const MobileTopBar: React.FC<MobileTopBarProps> = ({
   title,
   onBack,
@@ -42,10 +42,10 @@ export const MobileTopBar: React.FC<MobileTopBarProps> = ({
         </button>
       )}
       <span className="top-caption">{account ? "云途" : title || ""}</span>
-      <span className="u-login-trigger" aria-label="游客模式">
-        <Icon name="person" />
-        <span>游客</span>
-      </span>
+      <Link to="/history" className="u-login-trigger" aria-label="我的行程">
+        <Icon name="book" />
+        <span>我的行程</span>
+      </Link>
     </header>
   );
 };

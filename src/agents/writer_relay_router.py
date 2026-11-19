@@ -17,6 +17,10 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
+from openai import APIConnectionError, APITimeoutError
+
+from src.agents.model_failure_policy import confirmed_long_failure
+from src.model_routes import WRITER_OPUS_MODEL
 
 from src.agents.writer_relay_store import (
     ALLOWED_ENDPOINTS,
@@ -27,7 +31,7 @@ from src.agents.writer_relay_store import (
 
 logger = logging.getLogger(__name__)
 
-WRITER_MODEL = "claude-opus-4-6"
+WRITER_MODEL = WRITER_OPUS_MODEL
 CAPACITY_WAIT_SECONDS = 15.0
 ATTEMPT_TIMEOUT_SECONDS = 45.0
 STREAM_ATTEMPT_TIMEOUT_SECONDS = 60.0
@@ -171,24 +175,26 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 def classify_failure(exc: BaseException) -> FailureClassification:
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
+    response = getattr(exc, "response", None)
+    if isinstance(response, httpx.Response):
+        status = response.status_code
         status_class = f"{status // 100}xx"
+        long_failure = confirmed_long_failure(response)
+        if long_failure is not None:
+            return FailureClassification(long_failure, True, status_class)
         signature = None
-        if 400 <= status < 500 and status not in {401, 403, 429}:
+        if 400 <= status < 500 and status != 429:
             # Hash only; provider bodies can contain sensitive request excerpts.
             signature = hashlib.sha256(
-                str(status).encode("ascii") + b":" + exc.response.content
+                str(status).encode("ascii") + b":" + response.content
             ).hexdigest()
-        if status in {401, 403}:
-            return FailureClassification("AUTH", True, status_class, signature)
         if status == 429:
             return FailureClassification(
                 "RATE_LIMIT",
                 True,
                 status_class,
                 signature,
-                _retry_after_seconds(exc.response),
+                _retry_after_seconds(response),
             )
         if status >= 500:
             return FailureClassification("HTTP_5XX", True, status_class, signature)
@@ -196,7 +202,7 @@ def classify_failure(exc: BaseException) -> FailureClassification:
             return FailureClassification(
                 "POLICY_REJECTION", True, status_class, signature
             )
-    if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
+    if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException, APITimeoutError)):
         return FailureClassification("TIMEOUT", True)
     if isinstance(
         exc,
@@ -205,6 +211,7 @@ def classify_failure(exc: BaseException) -> FailureClassification:
             httpx.ReadError,
             httpx.RemoteProtocolError,
             httpx.WriteError,
+            APIConnectionError,
         ),
     ):
         return FailureClassification("TRANSPORT", True)
@@ -377,6 +384,8 @@ class WriterRelayRouter:
         first_token_deadline_seconds: float,
         stall_deadline_seconds: float,
         budget_cancel_event: asyncio.Event | None = None,
+        standby_cancel_event: asyncio.Event | None = None,
+        record_standby_cancel: Callable[[bool], Awaitable[None]] | None = None,
         speculative_observer: object | None = None,
     ) -> tuple[str, int, int]:
         started = self._monotonic()
@@ -443,10 +452,17 @@ class WriterRelayRouter:
         except WriterStreamTimeout:
             raise
         except asyncio.CancelledError:
+            standby_cancelled = standby_cancel_event is not None and standby_cancel_event.is_set()
+            if standby_cancelled and record_standby_cancel is not None:
+                # Record intent before a possibly slow socket close. A restart
+                # must not reinterpret this deliberate cancellation as a fault.
+                await record_standby_cancel(False)
             connection_closed = False
             if not close_attempted:
                 connection_closed = await self._close_stream(stream)
                 close_attempted = True
+            if standby_cancelled and record_standby_cancel is not None:
+                await record_standby_cancel(connection_closed)
             if budget_cancel_event is not None and budget_cancel_event.is_set():
                 raise WriterBudgetCutoff(
                     connection_closed_confirmed=connection_closed,
@@ -481,6 +497,7 @@ class WriterRelayRouter:
         | None = None,
         first_token_deadline_seconds: float = 15.0,
         stall_deadline_seconds: float = 10.0,
+        on_wire_invalid: Callable[[Any, int], None] | None = None,
     ) -> tuple[str, int, int, Any, int, str | None]:
         if stream_probe_enabled and stream_request is None:
             raise ValueError("stream_request is required when Writer probes are enabled")
@@ -500,6 +517,12 @@ class WriterRelayRouter:
         budget_cancel_event = (
             budget_cancel_event_value
             if isinstance(budget_cancel_event_value, asyncio.Event)
+            else None
+        )
+        standby_cancel_event_value = call_context.get("writer_standby_ready_cancel_event")
+        standby_cancel_event = (
+            standby_cancel_event_value
+            if isinstance(standby_cancel_event_value, asyncio.Event)
             else None
         )
         speculative_observer = call_context.get("writer_speculative_observer")
@@ -526,6 +549,22 @@ class WriterRelayRouter:
         previous_endpoint: str | None = None
         last_exc: BaseException | None = None
         deferred_policy_dispatches: list[uuid.UUID] = []
+
+        async def watch_standby_cancellation() -> None:
+            assert standby_cancel_event is not None
+            await standby_cancel_event.wait()
+            try:
+                # This also covers non-streaming clients whose request-finally
+                # stalls before CancelledError can reach the router.
+                await self.store.cancel_for_standby(claim.dispatch_id)
+            except Exception as cancel_error:
+                logger.warning("writer_standby_cancel_intent_failed error_type=%s",
+                               type(cancel_error).__name__)
+
+        standby_cancel_watcher = (
+            asyncio.create_task(watch_standby_cancellation())
+            if standby_cancel_event is not None else None
+        )
         try:
             for ordinal in (0, 1):
                 if ordinal == 1:
@@ -574,6 +613,16 @@ class WriterRelayRouter:
                 )
                 await self.store.mark_dispatched(claim.dispatch_id)
                 attempt_started = self._monotonic()
+
+                async def record_standby_cancel(release_capacity: bool) -> None:
+                    try:
+                        await self.store.cancel_for_standby(
+                            claim.dispatch_id, release_capacity=release_capacity,
+                        )
+                    except Exception as cancel_error:
+                        logger.warning("writer_standby_cancel_settlement_failed error_type=%s",
+                                       type(cancel_error).__name__)
+
                 try:
                     if stream_probe_enabled:
                         assert stream_request is not None
@@ -593,6 +642,8 @@ class WriterRelayRouter:
                                 ),
                                 stall_deadline_seconds=stall_deadline_seconds,
                                 budget_cancel_event=budget_cancel_event,
+                                standby_cancel_event=standby_cancel_event,
+                                record_standby_cancel=record_standby_cancel,
                                 speculative_observer=speculative_observer,
                             )
                         )
@@ -610,7 +661,12 @@ class WriterRelayRouter:
                         )
                 except BaseException as exc:
                     if isinstance(exc, asyncio.CancelledError):
-                        if budget_cancel_event is not None and budget_cancel_event.is_set():
+                        if standby_cancel_event is not None and standby_cancel_event.is_set():
+                            if not stream_probe_enabled:
+                                await record_standby_cancel(True)
+                            await self._finalize_policy_rejections(deferred_policy_dispatches)
+                            raise
+                        elif budget_cancel_event is not None and budget_cancel_event.is_set():
                             exc = WriterBudgetCutoff(
                                 connection_closed_confirmed=False,
                             )
@@ -700,6 +756,13 @@ class WriterRelayRouter:
                             failure_class="WIRE_INVALID",
                             transport_succeeded=True,
                         )
+                        # The transport finished cleanly, so no stream/transport
+                        # observer saw this attempt; report it without affecting dispatch.
+                        if on_wire_invalid is not None:
+                            try:
+                                on_wire_invalid(selected_config, latency_ms)
+                            except Exception:
+                                logger.warning("writer wire-invalid observation unavailable")
                         wire_error = RuntimeError(
                             "writer relay returned wire-invalid JSON"
                         )
@@ -735,4 +798,8 @@ class WriterRelayRouter:
             assert last_exc is not None
             raise last_exc
         finally:
+            if standby_cancel_watcher is not None:
+                if standby_cancel_event is not None and not standby_cancel_event.is_set():
+                    standby_cancel_watcher.cancel()
+                await asyncio.gather(standby_cancel_watcher, return_exceptions=True)
             await self._finalize_policy_rejections(deferred_policy_dispatches)

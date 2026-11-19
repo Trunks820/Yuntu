@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import time
+import unicodedata
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -34,13 +36,23 @@ from src.agents.evidence_strength import (
     build_structured_evidence_payload,
     missing_action_contract_keys,
 )
+from src.agents.explicit_preference_fulfillment import (
+    PreferenceFulfillmentReport,
+    evaluate_explicit_preference_fulfillment,
+    sync_day_opening_for_locked_arrangement,
+    build_body_review_context, body_review_matches, route_preference_decisions,
+)
 from src.agents.fragment_repair import (
     FragmentRepairResult,
     deterministic_unsupported_fact_fragment_repair,
     maybe_fragment_repair_plan,
     qualify_review_fragment_issues,
 )
-from src.agents.food_review import FOOD_SPAN_RE
+from src.agents.generation_model_routing import (
+    GenerationModelCallError,
+    SharedCallBudget,
+    project_execution_observation,
+)
 from src.agents.generation_metrics import GenerationMetrics
 from src.agents.keyed_fragment_repair import (
     KEYED_FRAGMENT_REPAIR_MIN_TIMEOUT_SECONDS,
@@ -55,7 +67,10 @@ from src.agents.keyed_fragment_repair import (
 from src.agents.llm import LLMTransportError
 from src.agents.plan_repair import PlanRepairResult, repair_single_plan
 from src.agents.preflight import collect_phrase_preflight, run_predispatch_handlers
-from src.agents.poi_fragments import remap_fragment_registry, replace_fragment_text
+from src.agents.poi_fragments import (
+    fragment_food_hint, fragment_for_span, normalize_body_food_boundary,
+    remap_fragment_registry, replace_fragment_body,
+)
 from src.agents.repair_policy import (
     RepairBudgetExceeded,
     RepairBudgetTracker,
@@ -71,7 +86,7 @@ from src.agents.schema import (
     TransportSuggestion,
     TripRequest,
 )
-from src.agents.speculative_writer import AdoptedGenerator
+from src.agents.speculative_writer import AdoptedGenerator, retry_budget_admitted
 from src.agents.safe_plan_renderer import (
     LockedSafeInput,
     SafePlanRenderResult,
@@ -90,6 +105,23 @@ from src.config import get_settings
 logger = logging.getLogger(__name__)
 
 SPECULATIVE_SAFE_TRIGGER = "speculative_no_publishable_draft"
+V012_INITIAL_REVIEW_SECONDS = 40.0
+V012_REPAIR_RECHECK_SECONDS = 45.0
+V012_RECHECK_RESERVE_SECONDS = 15.0
+V012_FINALIZATION_RESERVE_SECONDS = 10.0
+
+
+def _technical_review_failure(exc: Exception) -> bool:
+    if isinstance(exc, GenerationModelCallError):
+        nontechnical = {"WIRE_INVALID", "SCHEMA_INVALID", "TRUNCATED", "CANCELLED"}
+        if exc.code in nontechnical or (exc.code == "UNKNOWN" and exc.status == 200):
+            return False
+        def invalid_tree(value):
+            if isinstance(value, dict):
+                return value.get("error_code") in nontechnical or any(invalid_tree(v) for v in value.values())
+            return isinstance(value, list) and any(invalid_tree(v) for v in value)
+        return not invalid_tree(exc.diagnostic)
+    return _review_transport_error_type(exc) is not None
 KEYED_SOFT_REPAIR_REASONS = frozenset({
     "unsupported_fact_expansion",
     "activity_content_missing",
@@ -104,6 +136,10 @@ class ReviewLaunchBudgetUnavailable(asyncio.TimeoutError):
 
 class DSMandatoryReviewUnavailable(RuntimeError):
     """A DS-authored body cannot ship because full Review was unavailable."""
+
+class _UnanchoredPreReviewHardFact(publish_gate.PublishGateError):
+    """A known hard claim has no station owner for deterministic replacement."""
+
 
 WriterOutputCallback = Callable[[list[PlanOutput]], Awaitable[None]]
 
@@ -354,6 +390,7 @@ def _review_shadow_flag_for_issue(
         if pattern_reason:
             if pattern_reason in {
                 "booking_claim",
+                "booking_detail_claim",
                 "history_culture_claim",
                 "opening_hours_claim",
                 "popularity_best_claim",
@@ -385,6 +422,12 @@ def _is_review_risk_shadow_only_issue(
             and metadata.get("fact_policy") == "soft_prose_shadow"
         )
     )
+
+
+# Same Writer-safe fields as the failed-draft table (src/jobs/trip_failed_draft.py).
+_FAILED_DRAFT_FIELDS = frozenset({
+    "plan_name", "summary", "plan_text", "used_place_names", "day_place_names",
+})
 
 
 def _review_shadow_high_risk_flags(flags: list[str]) -> set[str]:
@@ -742,19 +785,48 @@ _BACKEND_OWNED_LLM_REVIEW_REASONS = frozenset({
 })
 
 
+def _quotes_only_code_lodging_block(
+    issue: generation_issues.GenerationIssue,
+    plans: list[PlanOutput],
+) -> bool:
+    """True when the quoted text exists only inside the code-written lodging block."""
+    snippet = "".join((issue.snippet or "").split())
+    if not snippet:
+        return False
+    candidates = (
+        plans if issue.plan_index is None
+        else plans[issue.plan_index - 1:issue.plan_index]
+    )
+    for plan in candidates:
+        span = yuntu_review.code_lodging_block_span(plan)
+        if span is None:
+            continue
+        block = "".join((plan.plan_text or "")[span[0]:span[1]].split())
+        # The same words in writer prose remain Review's to judge.
+        visible = "".join(yuntu_review._without_code_lodging_section(plan).split())
+        if snippet in block and snippet not in visible:
+            return True
+    return False
+
+
 def _filter_backend_owned_llm_review_issues(
     issues: list[generation_issues.GenerationIssue],
+    plans: list[PlanOutput] | None = None,
 ) -> tuple[
     list[generation_issues.GenerationIssue],
     list[generation_issues.GenerationIssue],
 ]:
-    """Drop LLM opinions about contracts owned by deterministic backend checks."""
+    """Drop LLM opinions about contracts owned by deterministic backend checks.
+
+    The code-written lodging block (hotel names, tiers, prices) is one of them:
+    Review never sees it, so a finding that quotes only that block is dropped.
+    """
     retained: list[generation_issues.GenerationIssue] = []
     dropped: list[generation_issues.GenerationIssue] = []
     for issue in issues:
-        if (
-            issue.source == "llm_review"
-            and issue.reason in _BACKEND_OWNED_LLM_REVIEW_REASONS
+        if issue.source == "llm_review" and (
+            issue.reason in _BACKEND_OWNED_LLM_REVIEW_REASONS
+            or _quotes_only_code_lodging_block(issue, plans or [])
         ):
             dropped.append(issue)
             continue
@@ -777,11 +849,24 @@ async def run_taxonomy_review(
     accommodation: AccommodationSuggestion | None = None,
     review_timeout_seconds: float = yuntu_review.ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS,
     generator: str | None = None,
+    generation_policy_version: str = "legacy",
+    review_call_budget: SharedCallBudget | None = None,
+    allow_failure_backup: bool = True,
+    previous_review_issues: list[generation_issues.GenerationIssue] | None = None,
 ) -> tuple[generation_issues.IssueTaxonomyResult, dict[str, Any], dict[str, Any]]:
     """Collect deterministic and semantic generation issues."""
     step_metadata: dict[str, Any] = {}
     review_metrics: dict[str, Any] = {}
     _review_timeout_seconds = review_timeout_seconds
+    body_context = None
+    if generation_policy_version == "v0.12":
+        try:
+            body_context = build_body_review_context(trip_request=trip_request,
+                route_plans=route_plans or [], plans=plans,
+                structured_evidence_payload=structured_evidence_payload,
+                previous_issues=previous_review_issues or [])
+        except (ValueError, TypeError) as exc:
+            raise yuntu_review.ReviewSafetyError(str(exc), invalid_output_type="body_context_invalid") from exc
     deterministic = generation_issues.collect_deterministic_generation_issues(
         plans,
         trip_request=trip_request,
@@ -792,6 +877,7 @@ async def run_taxonomy_review(
         weather_advisory_payload=weather_advisory_payload,
         attachment_auth_map=attachment_auth_map,
         accommodation=accommodation,
+        body_semantics_by_review=generation_policy_version == "v0.12",
     )
     shadow_metadata = _build_review_shadow_metadata(
         deterministic,
@@ -812,6 +898,9 @@ async def run_taxonomy_review(
                 attachment_auth_map=attachment_auth_map,
                 timeout_seconds=_review_timeout_seconds,
                 generator=generator,
+                generation_policy_version=generation_policy_version,
+                review_call_budget=review_call_budget,
+                allow_failure_backup=allow_failure_backup,
             )
         )
         step_metadata.update({
@@ -839,9 +928,14 @@ async def run_taxonomy_review(
             attachment_auth_map=attachment_auth_map,
             timeout_seconds=_review_timeout_seconds,
             generator=generator,
+            generation_policy_version=generation_policy_version,
+            review_call_budget=review_call_budget,
+            allow_failure_backup=allow_failure_backup,
+            body_review_context=body_context,
         )
+    body_receipt = getattr(semantic, "body_review", None)
     semantic, dropped_backend_owned = _filter_backend_owned_llm_review_issues(
-        semantic
+        semantic, plans
     )
     dropped_backend_owned_metadata = {
         "review_dropped_backend_owned_count": len(dropped_backend_owned),
@@ -872,6 +966,7 @@ async def run_taxonomy_review(
     result = generation_issues.resolve_generation_issues(
         [*deterministic, *semantic]
     )
+    result.body_review = body_receipt
     step_metadata.update(_taxonomy_step_metadata(result))
     return result, step_metadata, review_metrics
 
@@ -926,6 +1021,8 @@ class WriteReviewPublishPipeline:
         residual_reserve_seconds: float = 20.0,
         speculative_initial_generation: bool = True,
         require_selected_route_lock: bool = False,
+        generation_policy_version: str = "legacy",
+        review_call_budget: SharedCallBudget | None = None,
     ) -> None:
         settings = get_settings()
         self.trip_request = trip_request
@@ -1004,8 +1101,51 @@ class WriteReviewPublishPipeline:
         self.workflow_deadline_monotonic = workflow_deadline_monotonic
         self.residual_reserve_seconds = float(residual_reserve_seconds)
         self.speculative_initial_generation = bool(speculative_initial_generation)
+        self._writer_plan_retry_remaining = 1
         self.require_selected_route_lock = bool(require_selected_route_lock)
+        self.generation_policy_version = generation_policy_version
+        self._body_review = None
+        self._body_review_prior = []
+        self._next_review_issues = []
+        self._approved_original = None
+        if generation_policy_version == "v0.12":
+            overall_deadline = (
+                float(workflow_deadline_monotonic)
+                if workflow_deadline_monotonic is not None
+                else time.monotonic() + 180.0
+            )
+            self.review_call_budget = review_call_budget or SharedCallBudget(
+                deadline_monotonic=overall_deadline,
+                max_calls=5,
+                reserve_seconds=V012_FINALIZATION_RESERVE_SECONDS,
+            )
+        else:
+            self.review_call_budget = review_call_budget
+        self._v012_repair_phase_deadline: float | None = None
+        self._v012_repair_round_active = False
+        self._v012_repair_remote_started = False
         self._speculative_adopted_archive_records: list[Any] = []
+
+    def _v012_review_phase_budget(self, stage: str) -> SharedCallBudget | None:
+        if self.generation_policy_version != "v0.12":
+            return None
+        assert self.review_call_budget is not None
+        now = time.monotonic()
+        if stage == "REVIEW_TAXONOMY_AFTER_REPAIR":
+            phase_deadline = self._v012_repair_phase_deadline or (
+                now + V012_REPAIR_RECHECK_SECONDS
+            )
+        else:
+            phase_deadline = now + V012_INITIAL_REVIEW_SECONDS
+        phase_deadline = min(
+            phase_deadline,
+            self.review_call_budget.deadline_monotonic
+            - self.review_call_budget.reserve_seconds,
+        )
+        return self.review_call_budget.for_phase(
+            deadline_monotonic=phase_deadline,
+            reserve_seconds=0.0,
+        )
 
     def _check_publish_gate(
         self,
@@ -1018,6 +1158,7 @@ class WriteReviewPublishPipeline:
             route_plans=self.route_plans,
             attachment_auth_map=self.attachment_auth_map,
             accommodation=self.accommodation,
+            body_semantics_by_review=self.generation_policy_version == "v0.12",
         )
 
     def _residual_seconds(self) -> float | None:
@@ -1041,26 +1182,109 @@ class WriteReviewPublishPipeline:
             and self._draft_generator() == AdoptedGenerator.DS_FLASH.value
         )
 
+    def _review_tail_reserve_seconds(self) -> float:
+        return (
+            V012_FINALIZATION_RESERVE_SECONDS
+            if self.generation_policy_version == "v0.12"
+            else self.residual_reserve_seconds
+        )
+
     def _speculative_review_timeout_seconds(self) -> float | None:
         """Return the §8.2 whole-Review cap, or None when launch is forbidden."""
         remaining = self._residual_seconds()
-        if remaining is None:
-            return yuntu_review.ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS
-        if remaining <= self.residual_reserve_seconds:
+        reserve_seconds = self._review_tail_reserve_seconds()
+        # The tail reserve belongs to the whole job. The repair phase already
+        # has its own absolute deadline; subtracting the tail again from that
+        # phase silently turns a 45s phase into about 25s.
+        if remaining is not None and remaining <= reserve_seconds:
             return None
-        available = max(0.0, remaining - self.residual_reserve_seconds)
+        available = (
+            remaining - reserve_seconds
+            if remaining is not None
+            else yuntu_review.ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS
+        )
+        if (
+            self.generation_policy_version == "v0.12"
+            and self._v012_repair_phase_deadline is not None
+        ):
+            phase_remaining = self._v012_repair_phase_deadline - time.monotonic()
+            available = min(available, phase_remaining)
         # Quantize downward so float representation cannot allocate a timeout
         # a few picoseconds beyond the workflow budget.
         available = int(available * 1000) / 1000
         if available <= 0:
             return None
-        return min(90.0, available)
+        cap = (
+            yuntu_review.ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS
+            if self.generation_policy_version == "v0.12" else 90.0
+        )
+        return min(cap, available)
 
     def _residual_admits(self, *, min_seconds: float) -> bool:
         remaining = self._residual_seconds()
         if remaining is None:
             return True
         return remaining >= (min_seconds + self.residual_reserve_seconds)
+
+    def _repair_round_used(self) -> bool:
+        return bool(self.fragment_repair_call_count
+                    or self.metrics.writer_keyed_fragment_repair_attempted)
+
+    def _reserve_v012_repair_round(self) -> bool:
+        if self._repair_round_used():
+            return False
+        self._v012_repair_round_active = True
+        self.fragment_repair_call_count += 1
+        self.metrics.fragment_repair_call_count = self.fragment_repair_call_count
+        return True
+
+    def _start_v012_repair_phase(self, *, min_writer_seconds: float) -> bool:
+        """Admit once after preparing targets; actual calls use the same deadline."""
+        now = time.monotonic()
+        if self._v012_repair_phase_deadline is None:
+            span = min(V012_REPAIR_RECHECK_SECONDS, max(0.0,
+                (self.workflow_deadline_monotonic or float("inf"))
+                - V012_FINALIZATION_RESERVE_SECONDS - now))
+        else:
+            span = self._v012_repair_phase_deadline - now
+        if span < min_writer_seconds + V012_RECHECK_RESERVE_SECONDS:
+            return False
+        if self._v012_repair_phase_deadline is None:
+            self._v012_repair_phase_deadline = now + span
+        return True
+
+    def _v012_repair_writer_timeout(self, cap: float) -> float:
+        assert self._v012_repair_phase_deadline is not None
+        return min(cap, max(0.0, self._v012_repair_phase_deadline
+            - time.monotonic() - V012_RECHECK_RESERVE_SECONDS))
+
+    async def _await_v012_repair(self, call: Awaitable[Any], *, cap: float) -> Any:
+        """Cancel at the original absolute cutoff, including setup overhead."""
+        assert self._v012_repair_phase_deadline is not None
+        deadline = min(time.monotonic() + cap,
+                       self._v012_repair_phase_deadline - V012_RECHECK_RESERVE_SECONDS)
+        task = asyncio.create_task(call)
+        expired = False
+        def expire() -> None:
+            nonlocal expired
+            expired = True
+            task.cancel()
+        timer = asyncio.get_running_loop().call_at(deadline, expire)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if expired:
+                raise asyncio.TimeoutError("repair absolute deadline exhausted")
+            raise
+        finally:
+            timer.cancel()
+
+    def _claim_v012_repair_remote(self) -> bool:
+        if (not self._v012_repair_round_active or self._v012_repair_remote_started
+                or self.metrics.writer_keyed_fragment_repair_attempted):
+            return False
+        self._v012_repair_remote_started = True
+        return True
 
     def _dispatch_budgets(
         self,
@@ -1079,9 +1303,12 @@ class WriteReviewPublishPipeline:
             fragment_repair_remaining=(
                 1
                 if (
-                    self.fragment_repair_call_count <= 0
+                    (self.fragment_repair_call_count <= 0
+                     and (self.generation_policy_version != "v0.12"
+                          or not self.metrics.writer_keyed_fragment_repair_attempted))
                     or (
                         allow_deterministic_fact_followup
+                        and self.generation_policy_version != "v0.12"
                         and self.fragment_repair_call_count < 2
                     )
                 )
@@ -1177,6 +1404,191 @@ class WriteReviewPublishPipeline:
                     )
                 )
 
+    def _sentence_pruning_issues(self, semantic=(), *, deterministic_issues=None):
+        """Collect code and Review findings without treating a reason as an owner."""
+        from src.agents.generation_issues import review_issue_id
+        if deterministic_issues is None:
+            deterministic = generation_issues.collect_deterministic_generation_issues(
+                self.plans, trip_request=self.trip_request, retrieval=self.retrieval,
+                route_plans=self.route_plans or [], budget_results=self.budget_results,
+                composition_blueprints=self.composition_blueprints,
+                weather_advisory_payload=self.weather_advisory_payload,
+                attachment_auth_map=self.attachment_auth_map, accommodation=self.accommodation,
+                body_semantics_by_review=self.generation_policy_version == "v0.12",
+            )
+        else:
+            deterministic = deterministic_issues
+        gate_issues = generation_issues.map_publish_findings_to_issues(
+            self._check_publish_gate().findings)
+        return list({review_issue_id(issue): issue for issue in [
+            *semantic, *deterministic, *gate_issues,
+        ]}.values())
+
+    def _record_sentence_pruning(self, result, *, phase, accepted, failure=""):
+        records = list(self.metrics.extra.get("sentence_pruning_records", []))
+        records.append({
+            "phase": phase, "accepted": accepted, "failure": failure,
+            "actions": result.actions if accepted else [],
+            "attempted_actions": [] if accepted else result.actions,
+            "resolved_issue_ids": result.resolved_issue_ids if accepted else [],
+            "unresolved_issue_ids": (result.unresolved_issue_ids if accepted else
+                                     list(dict.fromkeys([*result.resolved_issue_ids, *result.unresolved_issue_ids]))),
+            "unresolved_details": list(getattr(result, "unresolved_details", []) or []),
+        })
+        self.metrics.merge_known_metrics({
+            "sentence_pruning_records": records,
+            "sentence_pruning_applied_count": sum(len(row["actions"]) for row in records if row["accepted"]),
+            "sentence_pruning_fallback_count": len({
+                tuple(action["fragment_key"][name] for name in ("plan_index", "day", "place_id"))
+                for row in records if row["accepted"] for action in row["actions"]
+                if action.get("replacement_text") and action.get("fragment_key")}),
+        })
+
+    def _prune_before_review(self, *, deterministic_issues=None) -> None:
+        if self.generation_policy_version != "v0.12":
+            return
+        from src.agents.sentence_pruning import is_pruning_candidate, prune_problem_sentences
+        observed_issues = self._sentence_pruning_issues(deterministic_issues=deterministic_issues)
+        preflight_issues = [item.to_issue() for item in collect_phrase_preflight(
+            self.plans, route_plans=self.route_plans)]
+        # Preserve the existing shared fact/copy repair when a second defect
+        # needs it. Deleting just the fact would strand the remaining defect
+        # on a different repair path and lose the original joint-work budget.
+        if any(issue.publish_action in {"REPAIR_PLAN", "FAIL_CLOSED"}
+               and not is_pruning_candidate(issue)
+               for issue in [*observed_issues, *preflight_issues]):
+            return
+        issues = [issue for issue in observed_issues if is_pruning_candidate(issue)]
+        if not issues:
+            return
+        from src.agents.review_availability import pruning_change_matches
+        result = prune_problem_sentences(
+            self.plans, issues=issues, route_plans=self.route_plans or [],
+            structured_evidence_payload=self.structured_evidence_payload, fill_empty=True)
+        if (result.unresolved_issue_ids or not result.changed
+                or not pruning_change_matches(self.plans, result.plans, result.actions)):
+            self._record_sentence_pruning(result, phase="before_review", accepted=False,
+                                          failure="problem_sentence_not_uniquely_owned")
+            # Keep the original hard-fact check in charge: it can replace a
+            # known station locally, or block an unowned claim before Review.
+            return
+        self.plans = result.plans
+        self._record_sentence_pruning(result, phase="before_review", accepted=True)
+        # The caller now reruns structural/preflight gates and normal Review on
+        # this actual body. No old model receipt is used for the edited text.
+
+    async def _publish_after_sentence_pruning(self, taxonomy):
+        from src.agents.generation_issues import review_issue_id
+        from src.agents.poi_fragments import fragment_registry_is_intact
+        from src.agents.review_availability import (
+            code_only_body_fingerprint, pruning_review_closures, has_current_pruning_receipt,
+            pruning_change_matches,
+        )
+        from src.agents.sentence_pruning import is_pruning_candidate, prune_problem_sentences
+
+        active_prior = [issue for issue in self._body_review_prior
+                        if self._body_review.issue_resolutions.get(review_issue_id(issue), {}).get("status") == "still_present"]
+        issues = self._sentence_pruning_issues([*taxonomy.issues, *active_prior])
+        candidates = [issue for issue in issues if is_pruning_candidate(issue)]
+        if not candidates:
+            return None
+        from copy import deepcopy
+        original_state = deepcopy((self.plans, self._body_review,
+                                   self._body_review_prior, self._next_review_issues))
+        original_metrics = deepcopy(self.metrics.__dict__)
+        adopted = False
+        try:
+            original = self.plans
+            source_review = self._body_review.model_dump(mode="json")
+            source_issues = [issue.model_dump(mode="json") for issue in issues]
+            source_hash = code_only_body_fingerprint(original)
+            result = prune_problem_sentences(
+                original, issues=candidates, route_plans=self.route_plans or [],
+                structured_evidence_payload=self.structured_evidence_payload, fill_empty=True)
+            failure = "problem_sentence_not_uniquely_owned"
+            if (result.changed and not result.unresolved_issue_ids
+                    and pruning_change_matches(original, result.plans, result.actions)):
+                closures = pruning_review_closures(source_review, source_issues, result.actions, result.plans)
+                failure = "prior_findings_remaining"
+                if closures is not None:
+                    self.plans = result.plans
+                    evidence = self._code_delivery_evidence()
+                    checks = dict(evidence["gate_checks"])
+                    preferences = self._explicit_preference_report()
+                    self._record_preference_report(preferences, phase="after_repair")
+                    checks.update({
+                        "explicit_preference_gate_passed": not (
+                            preferences.blocking_route_findings() or preferences.admission_block_findings()),
+                        "writer_template_ratio_passed": self._template_ratio_ok(),
+                        "pruning_boundaries_passed": True,
+                        "fragment_registry_passed": all(fragment_registry_is_intact(p) for p in self.plans),
+                        "known_findings_closed": True,
+                        "workflow_deadline_remaining": self._residual_seconds() is None or self._residual_seconds() > 0,
+                    })
+                    failure = "post_pruning_code_gate_failed"
+                    if all(checks.values()):
+                        try:
+                            expected_delivery = [p.model_copy(deep=True) for p in self._plans_without_food_markers()]
+                            publish_result = await self._run_publish_gate()
+                            plans = self._plans_without_food_markers()
+                        except publish_gate.PublishGateError:
+                            publish_result = None
+                        if publish_result is not None:
+                            # Re-evaluate after final deterministic cleanup, and bind
+                            # the receipt to the marker-free body actually delivered.
+                            checks.update(self._code_delivery_evidence()["gate_checks"])
+                            final_preferences = self._explicit_preference_report()
+                            checks.update({
+                                "explicit_preference_gate_passed": not (
+                                    final_preferences.blocking_route_findings() or final_preferences.admission_block_findings()),
+                                "writer_template_ratio_passed": self._template_ratio_ok(),
+                                "fragment_registry_passed": all(fragment_registry_is_intact(p) for p in plans),
+                                # The gate may only remove its existing food markers.
+                                # Any other edit would need its own ledger/recheck.
+                                "pruning_boundaries_passed": plans == expected_delivery,
+                            })
+                            checks["final_publish_gate_passed"] = publish_result.passed
+                            checks["workflow_deadline_remaining"] = self._residual_seconds() is None or self._residual_seconds() > 0
+                            closures = pruning_review_closures(source_review, source_issues, result.actions, plans)
+                            checks["known_findings_closed"] = closures is not None
+                            receipt = {
+                                "version": 1, "cause": "deterministic_sentence_prune",
+                                "source_body_sha256": source_hash,
+                                "body_sha256": code_only_body_fingerprint(plans),
+                                "source_review_receipt": source_review,
+                                "source_issues": source_issues, "actions": result.actions,
+                                "closures": closures, "code_gates": checks,
+                                "prior_findings_remaining": False,
+                            }
+                            accepted_metrics = {
+                                "v012_review_state": "CODE_ONLY", "review_status": "code_rechecked",
+                                "review_taxonomy_status": "deterministic_sentence_prune",
+                                "published_variant": "normal", "delivery_status": "NORMAL",
+                                "safe_trigger": None, "v012_basic_reason": None,
+                                "v015_pruning_receipt": receipt,
+                            }
+                            if has_current_pruning_receipt(plans, accepted_metrics):
+                                self._record_sentence_pruning(result, phase="after_review", accepted=True)
+                                self.metrics.merge_known_metrics(accepted_metrics)
+                                adopted = True
+                                return {"kind": "sentence_pruned", "result": (
+                                    plans, "", publish_result, self.metrics.to_dict())}
+            self.plans = original
+            self._record_sentence_pruning(result, phase="after_review", accepted=False, failure=failure)
+            return None
+        finally:
+            if not adopted:
+                attempted_records = self.metrics.extra.get("sentence_pruning_records")
+                (self.plans, self._body_review, self._body_review_prior,
+                 self._next_review_issues) = original_state
+                self.metrics.__dict__.clear()
+                self.metrics.__dict__.update(original_metrics)
+                if attempted_records is not None:
+                    self.metrics.extra["sentence_pruning_records"] = attempted_records
+                # The original body/receipt/budget return to the existing local
+                # repair dispatcher. A rejected optimization is not a veto.
+
+
     async def _classify_pre_review_content(self) -> dict[str, Any]:
         if self._speculative_round():
             self._draft_generator()
@@ -1219,6 +1631,12 @@ class WriteReviewPublishPipeline:
 
         handler = run_predispatch_handlers(self.plans, self.route_plans)
         self.plans = handler.plans
+        if self.generation_policy_version == "v0.12":
+            # Opening correction, then program sentences, both before the Review
+            # snapshot. A later edit inside the publish gate would make that
+            # snapshot stale and replace the detailed draft with the basic plan.
+            self._sync_day_openings_after_preference_repair()
+            self._restore_preference_notices()
         if handler.notes:
             self.metrics.resolver_notes = list(dict.fromkeys(
                 [*self.metrics.resolver_notes, *handler.notes]
@@ -1234,7 +1652,27 @@ class WriteReviewPublishPipeline:
             weather_advisory_payload=self.weather_advisory_payload,
             attachment_auth_map=self.attachment_auth_map,
             accommodation=self.accommodation,
+            body_semantics_by_review=self.generation_policy_version == "v0.12",
         )
+        # Reuse the established structural scan. An extra speculative scan
+        # must not shift a discovered problem into a phase that ignores it.
+        # A changed body alone requires another scan before structural gates.
+        before_pruning = self.plans
+        self._prune_before_review(
+            deterministic_issues=[*structural_issues, *handler.residual_findings])
+        if self.plans is not before_pruning:
+            structural_issues = generation_issues.collect_deterministic_generation_issues(
+                self.plans,
+                trip_request=self.trip_request,
+                retrieval=self.retrieval,
+                route_plans=self.route_plans or [],
+                budget_results=self.budget_results,
+                composition_blueprints=self.composition_blueprints,
+                weather_advisory_payload=self.weather_advisory_payload,
+                attachment_auth_map=self.attachment_auth_map,
+                accommodation=self.accommodation,
+                body_semantics_by_review=self.generation_policy_version == "v0.12",
+            )
         structural_issues.extend(handler.residual_findings)
         invariants, incomplete, order_membership = classify_structural_reasons(
             structural_issues
@@ -1290,6 +1728,7 @@ class WriteReviewPublishPipeline:
             weather_advisory_payload=self.weather_advisory_payload,
             attachment_auth_map=self.attachment_auth_map,
             accommodation=self.accommodation,
+            body_semantics_by_review=self.generation_policy_version == "v0.12",
         )
         hard_fact_issues = [
             issue
@@ -1327,7 +1766,12 @@ class WriteReviewPublishPipeline:
                     "pre-review hard fact has no unique stable action key",
                 ],
             )
-            self._validate_dispatch_decision(decision, unanchored_hard_facts)
+            try:
+                self._validate_dispatch_decision(decision, unanchored_hard_facts)
+            except publish_gate.PublishGateError as exc:
+                if self.generation_policy_version == "v0.12":
+                    raise _UnanchoredPreReviewHardFact(exc.result) from exc
+                raise
 
         if anchored_hard_facts:
             decision = resolve_dispatch(
@@ -1390,6 +1834,34 @@ class WriteReviewPublishPipeline:
         order_membership: list[generation_issues.GenerationIssue],
         preflight_issues: list[generation_issues.GenerationIssue],
     ) -> dict[str, Any]:
+        conflict_hints = {}
+        qualified_review_issues = None
+        if self.generation_policy_version == "v0.12":
+            self._body_review = taxonomy.body_review
+            if not self._body_review_current():
+                return {"kind": "safe", "safe_trigger": "review_no_anchor",
+                        "reason_code": "REVIEW_UNAVAILABLE"}
+            self._next_review_issues = list(taxonomy.issues)
+            qualified_review_issues = qualify_review_fragment_issues(
+                self.plans, list(taxonomy.issues), route_plans=self.route_plans)
+            # The existing qualifier may turn an unanchored hard claim into a
+            # blocking action. Eligibility follows that final action while the
+            # original model taxonomy/receipt and issue cache remain intact.
+            pruned = await self._publish_after_sentence_pruning(
+                taxonomy.model_copy(update={"issues": qualified_review_issues}))
+            if pruned is not None:
+                return pruned
+            # v0.13 closeout: only an evidenced contradiction (both passages
+            # quoted) can block or open a repair; "unknown" is recorded only.
+            states = [row["status"] for key, row in self._body_review.assessments.items()
+                      if key.startswith("consistency:") and row["status"] != "supported"]
+            if states:
+                self.metrics.extra["body_review_consistency_states"] = states
+            if "missing" in states:
+                conflict_hints = self._body_conflict_repair_hints()
+                if not conflict_hints:
+                    return {"kind": "safe", "safe_trigger": "fragment_repair_failed",
+                            "reason_code": "REVIEW_ISSUES_UNRESOLVED"}
         self._record_pre_repair_metrics(taxonomy)
         review_skipped = bool(self.metrics.initial_review_skipped)
         self.metrics.review_ran = not review_skipped
@@ -1400,11 +1872,9 @@ class WriteReviewPublishPipeline:
             or not _review_risk_skip_enabled(get_settings())
         )
 
-        qualified_review_issues = qualify_review_fragment_issues(
-            self.plans,
-            list(taxonomy.issues),
-            route_plans=self.route_plans,
-        )
+        if qualified_review_issues is None:
+            qualified_review_issues = qualify_review_fragment_issues(
+                self.plans, list(taxonomy.issues), route_plans=self.route_plans)
         high_risk_review_issues = [
             issue
             for issue in qualified_review_issues
@@ -1437,6 +1907,7 @@ class WriteReviewPublishPipeline:
         # Writer to invent another fragment and a Reviewer to approve it.  The
         # latter adds two remote failure points and can fail closed before the
         # deterministic operator is ever reached.
+        keyed_review_issues = qualified_review_issues
         anchored_unsupported_facts = [
             issue
             for issue in qualified_review_issues
@@ -1453,33 +1924,130 @@ class WriteReviewPublishPipeline:
                 ),
             )
             self._validate_dispatch_decision(decision, qualified_review_issues)
-            return {
-                "kind": "dispatch",
-                "decision": decision,
-                "qualified_review_issues": qualified_review_issues,
-            }
+            if decision.action != "RECORD_ONLY":
+                return {
+                    "kind": "dispatch",
+                    "decision": decision,
+                    "qualified_review_issues": qualified_review_issues,
+                }
+            # Recording a soft fact warning does not close the independent
+            # explicit-preference gate. Continue with the same issues/budget.
+            # Preserve the resolved RECORD_ONLY treatment: these warnings
+            # cannot independently create a new remote fragment repair.
+            keyed_review_issues = [
+                issue for issue in qualified_review_issues
+                if issue not in anchored_unsupported_facts
+            ]
+
+        preference_report = self._explicit_preference_report()
+        self._record_preference_report(preference_report, phase=(
+            "after_repair" if self.fragment_repair_call_count > 0 else "before_repair"
+        ))
+        route_failures = [
+            *preference_report.blocking_route_findings(),
+            *preference_report.admission_block_findings(),
+        ]
+        if route_failures:
+            return self._preference_fail_closed(preference_report, route_failures)
 
         keyed_soft_targets, keyed_soft_issue_codes = (
-            self._review_keyed_soft_repair_targets(qualified_review_issues)
+            self._review_keyed_soft_repair_targets(keyed_review_issues)
         )
+        for key in conflict_hints:
+            keyed_soft_issue_codes.setdefault(key, set()).add("body_review_conflict")
+        keyed_soft_targets = list(dict.fromkeys([*keyed_soft_targets, *conflict_hints]))
+        preference_codes = preference_report.issue_codes_by_key()
+        preference_keys = list(preference_codes)
+        if preference_keys:
+            self.metrics.explicit_preference_repair_keys = [
+                {
+                    "plan_index": key[0],
+                    "day": key[1],
+                    "place_id": key[2],
+                }
+                for key in preference_keys
+            ]
+            if (
+                self.metrics.explicit_preference_repair_attempted
+                or self.metrics.review_keyed_fragment_repair_attempted
+                or self.metrics.writer_keyed_fragment_repair_attempted
+            ):
+                self._record_preference_report(preference_report, phase="after_repair")
+                self.metrics.explicit_preference_repair_failure_reason = (
+                    "explicit_preference_still_missing"
+                )
+            for key, codes in preference_codes.items():
+                keyed_soft_issue_codes.setdefault(key, set()).update(codes)
+            keyed_soft_targets = list(dict.fromkeys(
+                [*preference_keys, *keyed_soft_targets]
+            ))
+        copy_keys: set[FragmentKey] = set()
+        if keyed_soft_targets:
+            for issue in preflight_issues:
+                if issue.reason != "placeholder_wording" or issue.plan_index is None:
+                    continue
+                zero = issue.plan_index - 1
+                metadata = issue.metadata or {}
+                if not 0 <= zero < len(self.plans):
+                    continue
+                start, end = metadata.get("start"), metadata.get("end")
+                fragment = (fragment_for_span(self.plans[zero], start=start, end=end)
+                            if isinstance(start, int) and isinstance(end, int) else None)
+                if fragment is None:
+                    if preference_keys:
+                        return self._preference_fail_closed(
+                            preference_report, preference_report.unresolved_body_findings(),
+                            extra_reason="explicit_preference_no_fragment",
+                        )
+                    decision = resolve_dispatch(
+                        structural_order_membership=order_membership,
+                        preflight_findings=preflight_issues,
+                        review_issues=qualified_review_issues,
+                        budgets=self._dispatch_budgets(),
+                    )
+                    return {"kind": "dispatch", "decision": decision,
+                            "qualified_review_issues": qualified_review_issues}
+                key = (fragment.plan_index, fragment.day, fragment.place_id)
+                copy_keys.add(key)
+                keyed_soft_issue_codes.setdefault(key, set()).add(issue.reason)
+                keyed_soft_targets = list(dict.fromkeys([*keyed_soft_targets, key]))
         if keyed_soft_targets:
             required_fact_keys = {
                 key
                 for key in keyed_soft_targets
                 if "unsupported_fact_expansion"
                 in keyed_soft_issue_codes.get(key, set())
-            }
+            } | set(preference_keys) | copy_keys | set(conflict_hints)
             self.metrics.review_keyed_fragment_required_count = len(
                 required_fact_keys
             )
-            return {
-                "kind": "keyed_fragment_repair",
-                "qualified_review_issues": qualified_review_issues,
-                "keyed_soft_targets": keyed_soft_targets,
-                "keyed_soft_issue_codes": keyed_soft_issue_codes,
-                "required_fact_keys": required_fact_keys,
-            }
+            if preference_keys:
+                self.metrics.explicit_preference_repair_attempted = True
+            if (
+                self.generation_policy_version == "v0.12"
+                and self.fragment_repair_call_count > 0
+                and not required_fact_keys
+            ):
+                # Ordinary RECORD_ONLY warnings may request best-effort repair,
+                # but cannot veto a reviewed draft after its only round is used.
+                # Continue through Dispatch and the final gate; required facts,
+                # preferences and preflight copy repairs retain their old path.
+                self.metrics.review_keyed_fragment_repair_failure_policy = (
+                    "record_only_original"
+                )
+            else:
+                if self.generation_policy_version == "v0.12" and not required_fact_keys:
+                    self._remember_qualified_original(taxonomy)
+                return {
+                    "kind": "keyed_fragment_repair",
+                    "qualified_review_issues": qualified_review_issues,
+                    "keyed_soft_targets": keyed_soft_targets,
+                    "keyed_soft_issue_codes": keyed_soft_issue_codes,
+                    "required_fact_keys": required_fact_keys,
+                }
 
+        if self.generation_policy_version != "v0.12":
+            self._sync_day_openings_after_preference_repair()
         decision = resolve_dispatch(
             structural_order_membership=order_membership,
             preflight_findings=preflight_issues,
@@ -1503,6 +2071,26 @@ class WriteReviewPublishPipeline:
         order_membership: list[generation_issues.GenerationIssue],
         preflight_issues: list[generation_issues.GenerationIssue],
     ) -> dict[str, Any]:
+        after_report = self._explicit_preference_report()
+        self._record_preference_report(after_report, phase="after_repair")
+        preference_unresolved = [
+            *after_report.blocking_route_findings(),
+            *after_report.admission_block_findings(),
+            *after_report.unresolved_body_findings(),
+        ]
+        if preference_unresolved:
+            self.metrics.explicit_preference_repair_failure_reason = (
+                self.metrics.review_keyed_fragment_repair_failure_reason
+                or preference_unresolved[0].reason_code
+            )
+            return self._preference_fail_closed(
+                after_report,
+                preference_unresolved,
+                extra_reason=(
+                    self.metrics.review_keyed_fragment_repair_failure_reason
+                    or "explicit_preference_still_missing"
+                ),
+            )
         if not repaired and required_fact_keys:
             self.metrics.review_keyed_fragment_repair_failure_policy = (
                 "fail_closed_required_fact"
@@ -1536,6 +2124,47 @@ class WriteReviewPublishPipeline:
             "taxonomy": taxonomy,
         }
 
+    async def _retry_empty_pre_review_draft(self) -> None:
+        """One full Writer retry when the pre-Review draft is empty.
+
+        Admission is Writer + Review + publish reserve, the same predicate as
+        the inner Opus retry; a closed Review reserves nothing. A quota already
+        spent by that inner retry is not granted again. A successful retry
+        falls through into Review.
+        """
+        if self.plans or self.generation_policy_version != "v0.12":
+            return
+        if not self._speculative_round():
+            return
+        if self.metrics.writer_plan_retry_used or self._writer_plan_retry_remaining <= 0:
+            self.metrics.merge_known_metrics({
+                "writer_plan_retry_denied_reason": "retry_quota_consumed",
+            })
+            return
+        settings = get_settings()
+        writer_cost = (
+            final_writer.STREAM_ATTEMPT_TIMEOUT_SECONDS
+            if getattr(settings, "writer_stream_probe_enabled", False)
+            else final_writer.ATTEMPT_TIMEOUT_SECONDS
+        )
+        if not retry_budget_admitted(
+            self._residual_seconds(),
+            writer_cost,
+            yuntu_review.review_reserve_seconds(
+                v012_policy=self.generation_policy_version == "v0.12"),
+            self.residual_reserve_seconds,
+        ):
+            self.metrics.merge_known_metrics({
+                "writer_plan_retry_denied_reason": "writer_review_reserve_insufficient",
+            })
+            return
+        self._writer_plan_retry_remaining = 0
+        await self._run_writer()
+        self.metrics.writer_plan_retry_used = True
+        self.metrics.writer_plan_retry_count = max(
+            1, int(self.metrics.writer_plan_retry_count or 0)
+        )
+
     async def run(
         self,
     ) -> tuple[list[PlanOutput], str, publish_gate.PublishGateResult, dict[str, Any]]:
@@ -1545,32 +2174,65 @@ class WriteReviewPublishPipeline:
         use outer Publish Retry; locked-order and content failures fail closed.
         Keyed copy whitelist issues use Fragment Repair.
         """
+        if self.generation_policy_version == "v0.12":
+            # v0.13 closeout (Q11): a preference the route has not arranged is
+            # recorded, not a reason to skip the Writer. Arranging it is Route's
+            # job (v0.14); a body claiming otherwise is a Review contradiction.
+            self.metrics.extra["pre_writer_preference_decisions"] = route_preference_decisions(
+                self.trip_request, self.route_plans or [])
         try:
             await self._run_writer()
+            await self._retry_empty_pre_review_draft()
         except Exception as exc:
             logger.exception("writer_terminal_failure type=%s", type(exc).__name__)
             if self._safe_policy_enabled("writer_failure"):
                 self.metrics.merge_known_metrics({
                     "writer_terminal_failure_type": type(exc).__name__,
                 })
-                return await self._render_safe("writer_failure")
+                return await self._render_v012_basic_or_legacy(
+                    "writer_failure", "WRITER_UNAVAILABLE"
+                )
             raise
-        pre_review_state = await self._observe_content_validation(
-            self._classify_pre_review_content,
-            boundary="pre_review_classification",
-            metadata={
-                "plan_count": len(self.plans),
-                "route_plan_count": len(self.route_plans or []),
-            },
-        )
+        try:
+            pre_review_state = await self._observe_content_validation(
+                self._classify_pre_review_content,
+                boundary="pre_review_classification",
+                metadata={
+                    "plan_count": len(self.plans),
+                    "route_plan_count": len(self.route_plans or []),
+                },
+            )
+        except _UnanchoredPreReviewHardFact:
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        except publish_gate.PublishGateError:
+            if self.generation_policy_version != "v0.12":
+                raise
+            return await self._render_v012_basic_or_legacy(
+                "writer_failure", "WRITER_UNAVAILABLE"
+            )
         if pre_review_state["kind"] == "safe":
-            return await self._render_safe(pre_review_state["safe_trigger"])
+            trigger = pre_review_state["safe_trigger"]
+            # This branch has no publishable Writer draft, so Review did not run.
+            # The same trigger string later means mandatory Review was unavailable.
+            reason_code = (
+                "WRITER_UNAVAILABLE"
+                if trigger in {"writer_failure", SPECULATIVE_SAFE_TRIGGER}
+                else "REVIEW_UNAVAILABLE"
+            )
+            return await self._render_v012_basic_or_legacy(trigger, reason_code)
         if pre_review_state["kind"] == "dispatch":
             return await self._finish_from_dispatch(
                 pre_review_state["decision"],
                 taxonomy_issues=pre_review_state["taxonomy_issues"],
             )
         if pre_review_state["kind"] == "pre_review_fragment_repair":
+            if self.generation_policy_version == "v0.12":
+                return await self._run_v012_fragment_repair_and_recheck(
+                    pre_review_state["decision"],
+                    pre_review_state["taxonomy_issues"],
+                )
             await self._run_fragment_repair(
                 pre_review_state["decision"],
                 pre_review_state["taxonomy_issues"],
@@ -1590,6 +2252,8 @@ class WriteReviewPublishPipeline:
 
         order_membership = pre_review_state["order_membership"]
         preflight_issues = pre_review_state["preflight_issues"]
+        if self._llm_review_closed():
+            return await self._finish_with_review_closed()
         try:
             taxonomy = await self._review_taxonomy(
                 "REVIEW_TAXONOMY",
@@ -1612,7 +2276,33 @@ class WriteReviewPublishPipeline:
                 },
             )
         except DSMandatoryReviewUnavailable:
-            return await self._render_safe(SPECULATIVE_SAFE_TRIGGER)
+            return await self._render_v012_basic_or_legacy(
+                SPECULATIVE_SAFE_TRIGGER, "REVIEW_UNAVAILABLE"
+            )
+        except GenerationModelCallError as exc:
+            if self.generation_policy_version != "v0.12":
+                raise
+            detailed = await self._publish_technically_unreviewed(exc)
+            if detailed is not None:
+                return detailed
+            return await self._render_v012_basic_or_legacy(
+                "review_no_anchor", "REVIEW_UNAVAILABLE"
+            )
+        except (yuntu_review.ReviewSafetyError, ReviewLaunchBudgetUnavailable, asyncio.TimeoutError) as exc:
+            if self.generation_policy_version != "v0.12":
+                raise
+            detailed = await self._publish_technically_unreviewed(exc)
+            if detailed is not None:
+                return detailed
+            return await self._render_v012_basic_or_legacy(
+                "review_no_anchor", "REVIEW_UNAVAILABLE"
+            )
+        except publish_gate.PublishGateError:
+            if self.generation_policy_version != "v0.12":
+                raise
+            return await self._render_v012_basic_or_legacy(
+                "review_no_anchor", "REVIEW_UNAVAILABLE"
+            )
         # Review is a remote call and can consume a material share of the hard
         # workflow deadline. Dispatch must decide from the budget that remains
         # *after* Review, never from the pre-Review snapshot above.
@@ -1623,19 +2313,45 @@ class WriteReviewPublishPipeline:
                 preflight_issues=preflight_issues,
             )
 
-        post_review_state = await self._observe_content_validation(
-            classify_post_review,
-            boundary="post_review_qualification_dispatch",
-            metadata={"review_issue_count": len(taxonomy.issues)},
-        )
+        try:
+            post_review_state = await self._observe_content_validation(
+                classify_post_review,
+                boundary="post_review_qualification_dispatch",
+                metadata={"review_issue_count": len(taxonomy.issues)},
+            )
+        except publish_gate.PublishGateError:
+            if self.generation_policy_version != "v0.12":
+                raise
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        if post_review_state["kind"] == "sentence_pruned":
+            return post_review_state["result"]
         if post_review_state["kind"] == "safe":
-            return await self._render_safe(post_review_state["safe_trigger"])
+            return await self._render_v012_basic_or_legacy(
+                post_review_state["safe_trigger"],
+                post_review_state.get("reason_code", "REVIEW_ISSUES_UNRESOLVED"),
+            )
         if post_review_state["kind"] == "keyed_fragment_repair":
+            if self.generation_policy_version == "v0.12":
+                if self.fragment_repair_call_count > 0:
+                    return await self._render_v012_basic_or_legacy(
+                        "fragment_repair_failed",
+                        "REVIEW_ISSUES_UNRESOLVED",
+                    )
             repaired = await self._run_review_keyed_fragment_repair(
                 keys=post_review_state["keyed_soft_targets"],
                 issue_codes_by_key=post_review_state["keyed_soft_issue_codes"],
                 required_keys=post_review_state["required_fact_keys"],
             )
+
+            if self.generation_policy_version == "v0.12":
+                if not repaired:
+                    return await self._render_v012_basic_or_legacy(
+                        "fragment_repair_failed",
+                        "REVIEW_ISSUES_UNRESOLVED",
+                    )
+                return await self._v012_recheck_repaired_body()
 
             async def classify_after_keyed_repair() -> dict[str, Any]:
                 return await self._classify_after_keyed_fragment_repair(
@@ -1663,6 +2379,8 @@ class WriteReviewPublishPipeline:
     def _safe_policy_enabled(self, trigger: str) -> bool:
         if self.locked_safe_input is None:
             return False
+        if self.generation_policy_version == "v0.12":
+            return True
         if trigger == SPECULATIVE_SAFE_TRIGGER:
             return True
         settings = get_settings()
@@ -1670,15 +2388,77 @@ class WriteReviewPublishPipeline:
             return bool(settings.safe_plan_writer_fallback_enabled)
         return bool(settings.safe_plan_review_fallback_enabled)
 
+    async def _render_v012_basic_or_legacy(
+        self,
+        trigger: str,
+        reason_code: str,
+    ) -> tuple[list[PlanOutput], str, publish_gate.PublishGateResult, dict[str, Any]]:
+        if self.generation_policy_version == "v0.12" and self._approved_original is not None:
+            original = self._approved_original
+            self._approved_original = None
+            remaining = self._residual_seconds()
+            if remaining is None or remaining > 0:
+                old_plans, old_receipt, old_prior, old_taxonomy = original
+                candidate_plans = self.plans
+                self.plans, self._body_review, self._body_review_prior = old_plans, old_receipt, old_prior
+                if self._body_review_current() and self._body_review_complete() and self._template_ratio_ok():
+                    try:
+                        gate = await self._run_publish_gate()
+                    except publish_gate.PublishGateError:
+                        gate = None
+                    if gate is not None and self._body_review_current():
+                        self.metrics.extra["optional_polish_failure_reason"] = reason_code
+                        self.metrics.merge_known_metrics({"v012_review_state": "MODEL_PASSED",
+                            "v012_basic_reason": None, "published_variant": "normal"})
+                        self.metrics.review_keyed_fragment_repair_failure_policy = "record_only_original"
+                        return self._plans_without_food_markers(), self._format_review_notes(old_taxonomy), gate, self.metrics.to_dict()
+                self.plans = candidate_plans
+        if self.generation_policy_version == "v0.12":
+            self.metrics.merge_known_metrics({
+                "v012_review_state": (
+                    "NOT_RUN" if reason_code in {"WRITER_UNAVAILABLE", "PREFERENCE_UNVERIFIED"}
+                    else "UNAVAILABLE" if reason_code == "REVIEW_UNAVAILABLE"
+                    else "ISSUES_UNRESOLVED"
+                ),
+                "v012_basic_reason": reason_code,
+            })
+        return await self._render_safe(trigger)
+
     def _refresh_locked_safe_input(self) -> None:
         try:
             self.locked_safe_input = lock_safe_input(
                 route_plans=self.route_plans,
                 action_contracts=self.structured_evidence_payload.action_plan,
                 food_authorizations=self.attachment_auth_map.values(),
+                trip_request=self.trip_request,
             )
         except SafeRenderError:
             self.locked_safe_input = None
+
+    def _restore_preference_notices(self) -> None:
+        """Insert program sentences before a Review snapshot is taken.
+
+        Repair that rewrites a day still comes back through pre-review
+        classification, which calls this again before the next snapshot.
+        The publish gate must not call it: that check runs after the snapshot.
+        """
+        from src.agents.preference_notices import apply_preference_notices, plan_uses_program_hints
+
+        if not self.plans or not self.route_plans or self.trip_request is None:
+            return
+        restored: list[PlanOutput] = []
+        for index, plan in enumerate(self.plans):
+            route = self.route_plans[index] if index < len(self.route_plans) else None
+            if route is None:
+                restored.append(plan)
+                continue
+            restored.append(apply_preference_notices(
+                plan,
+                route,
+                self.trip_request,
+                program_hints=plan_uses_program_hints(plan),
+            ))
+        self.plans = restored
 
     async def _render_safe(
         self,
@@ -1801,6 +2581,317 @@ class WriteReviewPublishPipeline:
             }))
         return attached
 
+    def _llm_review_closed(self) -> bool:
+        """W32: the switch governs the v0.12 flow, the one orders run on."""
+        return (self.generation_policy_version == "v0.12"
+                and not getattr(get_settings(), "llm_review_enabled", True))
+
+    async def _finish_with_review_closed(self, *, stage="REVIEW_TAXONOMY"):
+        """W32: no Review call. The code gates alone decide detailed or basic.
+
+        Same gates as W9, but recorded as a closed Review, not an outage.
+        A draft that fails them goes to the basic plan as a content
+        problem; there is no Review finding to repair or recheck.
+        """
+        evidence = self._code_delivery_evidence()
+        checks = dict(evidence["gate_checks"])
+        preferences = self._explicit_preference_report()
+        checks["explicit_preference_gate_passed"] = not (
+            preferences.blocking_route_findings() or preferences.admission_block_findings())
+        checks["writer_template_ratio_passed"] = self._template_ratio_ok()
+        publish_result = None
+        if all(checks.values()):
+            try:
+                publish_result = await self._run_publish_gate()
+                plans = self._plans_without_food_markers()
+            except publish_gate.PublishGateError:
+                publish_result = None
+            checks["final_publish_gate_passed"] = bool(publish_result and publish_result.passed)
+        self.metrics.review_ran = False
+        self.metrics.publish_preflight_passed = evidence["publish_preflight"].passed
+        self.metrics.blueprint_integrity_passed = not evidence["blueprint_violations"]
+        self.metrics.merge_known_metrics({
+            "llm_review_enabled": False,
+            "review_taxonomy_status": "disabled",
+            "review_disabled_stage": stage,
+            "review_disabled_failed_checks": sorted(
+                name for name, passed in checks.items() if not passed),
+            "review_disabled_hard_risk_flags": evidence["hard_risk_flags"],
+        })
+        if not all(checks.values()):
+            # Keep what the gates saw so a basic delivery can be explained
+            # later (W15 had three whose only failed check was a risk flag).
+            # Internal metrics; the result projection never reads these keys.
+            self.metrics.merge_known_metrics({
+                "review_disabled_risk_flags": evidence["shadow_metadata"].get("risk_flags") or [],
+                "review_disabled_preflight_failure_reasons": evidence["publish_preflight"].failure_reasons,
+                "review_disabled_issue_details": _taxonomy_step_metadata(evidence["taxonomy"])["issue_details"],
+                "review_disabled_failed_draft": [
+                    p.model_dump(mode="json", include=_FAILED_DRAFT_FIELDS) for p in self.plans],
+            })
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        # The worker checks this receipt against the exact delivered prose.
+        from src.agents.review_availability import code_only_body_fingerprint
+        self.metrics.merge_known_metrics({
+            "v012_review_state": "CODE_ONLY", "review_status": "unreviewed",
+            "published_variant": "normal", "delivery_status": "NORMAL", "safe_trigger": None,
+            "v015_unreviewed_receipt": {
+                "version": 1, "cause": "review_disabled",
+                "body_sha256": code_only_body_fingerprint(plans),
+                "code_gates": checks,
+                "prior_findings_remaining": False,
+                "stage": stage,
+            },
+        })
+        return plans, "", publish_result, self.metrics.to_dict()
+
+    async def _publish_technically_unreviewed(self, exc: Exception, *, stage="REVIEW_TAXONOMY"):
+        """W9: publish the current draft only after every code gate passes."""
+        if self.generation_policy_version != "v0.12" or not _technical_review_failure(exc):
+            return None
+        if self._approved_original is not None:
+            # Optional polishing already has a fully reviewed fallback. Let the
+            # existing path restore and revalidate that exact approved draft.
+            return None
+        # A previous valid finding is still a finding. Recheck unavailability
+        # cannot erase it; require an actual edit removing each offending span.
+        prior = list(self._body_review_prior or self._next_review_issues)
+        current_text = "\n".join(p.plan_text + "\n" + p.summary for p in self.plans)
+        def substantive_text(text):
+            return "".join(c for c in unicodedata.normalize("NFKC", text).casefold()
+                           if not unicodedata.category(c).startswith(("P", "Z", "C")))
+        current_substance = substantive_text(current_text)
+        for issue in prior:
+            if issue.category in {"BLOCKER", "REPAIR"} or issue.publish_action != "RECORD_ONLY":
+                snippet = substantive_text(issue.snippet)
+                if not snippet or snippet in current_substance:
+                    return None
+        if self._body_review is not None:
+            for key, row in self._body_review.assessments.items():
+                if key.startswith("consistency:") and row["status"] == "missing":
+                    quotes = [item.get("quote", "") for item in row.get("evidence", [])]
+                    if not quotes or all(substantive_text(quote) and substantive_text(quote) in current_substance for quote in quotes):
+                        return None
+        _, metadata, _ = self._review_transport_fallback(exc, "transport", type(exc).__name__)
+        checks = dict(metadata["review_transport_gate_checks"])
+        preferences = self._explicit_preference_report()
+        checks["explicit_preference_gate_passed"] = not (
+            preferences.blocking_route_findings() or preferences.admission_block_findings())
+        checks["writer_template_ratio_passed"] = self._template_ratio_ok()
+        if not all(checks.values()):
+            return None
+        try:
+            publish_result = await self._run_publish_gate()
+            plans = self._plans_without_food_markers()
+        except publish_gate.PublishGateError:
+            return None
+        # The worker checks this receipt against the exact delivered prose.
+        from src.agents.review_availability import code_only_body_fingerprint
+        self.metrics.merge_known_metrics({
+            "v012_review_state": "CODE_ONLY", "review_status": "unreviewed",
+            "published_variant": "normal", "delivery_status": "NORMAL", "safe_trigger": None,
+            "review_transport_fail_closed": False,
+            "review_transport_fail_open_allowed": True,
+            "review_transport_fail_open_reason": "deterministic_gates_passed",
+            "review_taxonomy_status": "unreviewed",
+            "v015_unreviewed_receipt": {
+                "version": 1, "cause": "technical_unavailable",
+                "body_sha256": code_only_body_fingerprint(plans),
+                "code_gates": {**checks, "final_publish_gate_passed": publish_result.passed},
+                "prior_findings_remaining": False,
+                "stage": stage,
+            },
+        })
+        return plans, "", publish_result, self.metrics.to_dict()
+
+    async def _v012_recheck_repaired_body(
+        self,
+    ) -> tuple[list[PlanOutput], str, publish_gate.PublishGateResult, dict[str, Any]]:
+        """Hard-check a changed body, then run its own primary/backup review."""
+        try:
+            pre_review = await self._observe_content_validation(
+                self._classify_pre_review_content,
+                boundary="v012_post_repair_hard_validation",
+                metadata={"fragment_repair_call_count": self.fragment_repair_call_count},
+            )
+        except publish_gate.PublishGateError:
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        if pre_review.get("kind") != "review":
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        if self._llm_review_closed():
+            return await self._finish_with_review_closed(stage="REVIEW_TAXONOMY_AFTER_REPAIR")
+        try:
+            taxonomy = await self._review_taxonomy(
+                "REVIEW_TAXONOMY_AFTER_REPAIR"
+            )
+        except (GenerationModelCallError, yuntu_review.ReviewSafetyError,
+                ReviewLaunchBudgetUnavailable, asyncio.TimeoutError,
+                publish_gate.PublishGateError) as exc:
+            detailed = await self._publish_technically_unreviewed(exc, stage="REVIEW_TAXONOMY_AFTER_REPAIR")
+            if detailed is not None:
+                return detailed
+            return await self._render_v012_basic_or_legacy(
+                "review_no_anchor", "REVIEW_UNAVAILABLE"
+            )
+        try:
+            post_review = await self._observe_content_validation(
+                lambda: self._classify_post_review_content(
+                    taxonomy=taxonomy,
+                    order_membership=pre_review["order_membership"],
+                    preflight_issues=pre_review["preflight_issues"],
+                ),
+                boundary="v012_post_repair_model_recheck",
+                metadata={"review_issue_count": len(taxonomy.issues)},
+            )
+        except publish_gate.PublishGateError:
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        if post_review.get("kind") == "sentence_pruned":
+            return post_review["result"]
+        if post_review.get("kind") != "dispatch":
+            return await self._render_v012_basic_or_legacy(
+                post_review.get("safe_trigger", "fragment_repair_failed"),
+                post_review.get("reason_code", "REVIEW_ISSUES_UNRESOLVED")
+            )
+        decision = post_review["decision"]
+        if decision.action in {"FRAGMENT_REPAIR", "PUBLISH_RETRY"}:
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        try:
+            return await self._finish_from_dispatch(
+                decision,
+                taxonomy_issues=post_review["qualified_review_issues"],
+                taxonomy=taxonomy,
+            )
+        except publish_gate.PublishGateError:
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+
+    async def _run_v012_fragment_repair_and_recheck(
+        self,
+        decision: DispatchDecision,
+        taxonomy_issues: list[generation_issues.GenerationIssue],
+    ) -> tuple[list[PlanOutput], str, publish_gate.PublishGateResult, dict[str, Any]]:
+        if not self._reserve_v012_repair_round():
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        self.metrics.merge_known_metrics({"fragment_repair_attempted": True})
+        try:
+            initial_report = self._explicit_preference_report()
+            self._record_preference_report(initial_report, phase="before_repair")
+            admission_failures = [*initial_report.blocking_route_findings(),
+                                  *initial_report.admission_block_findings()]
+            if admission_failures:
+                self.metrics.explicit_preference_repair_failure_reason = admission_failures[0].reason_code
+                return await self._render_v012_basic_or_legacy(
+                    "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                )
+            # Save this admitted round's work before a deterministic edit makes
+            # the Review snapshot stale. Reviewed unknown is never reclassified
+            # as a pending writing requirement after that edit.
+            preference_codes = initial_report.issue_codes_by_key()
+            preference_hints = initial_report.repair_hints_by_key()
+            conflict_hints = self._body_conflict_repair_hints()
+            if self._body_review is None:
+                preference_codes, preference_hints = initial_report.early_writer_requirements(
+                    repair_triggered=True,
+                )
+            body_elements = {
+                key: ((preference_hints[key],) if key in preference_hints else ())
+                + tuple(conflict_hints.get(key, ()))
+                for key in set(preference_hints) | set(conflict_hints)
+            }
+            codes = set(decision.fragment_issue_codes)
+            deterministic = bool(codes & {
+                "unsupported_fact_expansion", "food_tier_exceeded", "food_source_attribution",
+            })
+            if deterministic:
+                # Existing zero-model operators prepare the same round. Their
+                # cost remains under the absolute job deadline; no second
+                # round or remote call is opened for their residuals.
+                await self._run_fragment_repair(
+                    decision, taxonomy_issues, _within_v012_round=True,
+                )
+                if self.metrics.pre_review_fragment_repair_attempted:
+                    self.metrics.pre_review_fragment_repair_applied = True
+            self._run_activity_local_completion()
+            report = self._explicit_preference_report()
+            if report.blocking_route_findings() or report.admission_block_findings():
+                self._record_preference_report(report, phase="before_repair")
+                return await self._render_v012_basic_or_legacy(
+                    "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                )
+            admitted_keys = {
+                item.key for item in report.findings
+                if item.layer == "body" and item.fragment_registered
+                and item.arrangement_supported and item.action_authorized
+            }
+            if set(preference_codes) - admitted_keys:
+                return await self._render_v012_basic_or_legacy(
+                    "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                )
+            combined = {key: set(value) for key, value in preference_codes.items()}
+            for key in conflict_hints:
+                combined.setdefault(key, set()).add("body_review_conflict")
+            # Recompute deterministic copy residuals on the edited registry.
+            # Copy-only legacy calls keep their original operator below.
+            if deterministic or combined:
+                copy_codes = {"placeholder_wording", "database_tone"} if deterministic else codes
+                for finding in collect_phrase_preflight(self.plans, route_plans=self.route_plans):
+                    if finding.reason not in copy_codes:
+                        continue
+                    plan = self.plans[finding.plan_index - 1]
+                    fragment = fragment_for_span(plan, start=finding.start, end=finding.end)
+                    if fragment is None:
+                        return await self._render_v012_basic_or_legacy(
+                            "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                        )
+                    key = (fragment.plan_index, fragment.day, fragment.place_id)
+                    combined.setdefault(key, set()).add(finding.reason)
+            if combined:
+                self._record_preference_report(report, phase="before_repair")
+                if preference_codes:
+                    self.metrics.explicit_preference_repair_attempted = True
+                    self.metrics.explicit_preference_repair_keys = [
+                        {"plan_index": key[0], "day": key[1], "place_id": key[2]}
+                        for key in preference_codes
+                    ]
+                if not await self._run_review_keyed_fragment_repair(
+                    keys=list(combined), issue_codes_by_key=combined,
+                    required_keys=set(combined),
+                    required_body_elements_by_key=body_elements,
+                ):
+                    return await self._render_v012_basic_or_legacy(
+                        "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                    )
+            else:
+                if not self._start_v012_repair_phase(min_writer_seconds=0.0 if deterministic else 30.0):
+                    return await self._render_v012_basic_or_legacy(
+                        "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                    )
+                if not deterministic:
+                    await self._await_v012_repair(
+                        self._run_fragment_repair(decision, taxonomy_issues, _within_v012_round=True),
+                        cap=30.0,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return await self._render_v012_basic_or_legacy(
+                "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+            )
+        return await self._v012_recheck_repaired_body()
+
     async def _finish_from_dispatch(
         self,
         decision: DispatchDecision,
@@ -1814,7 +2905,24 @@ class WriteReviewPublishPipeline:
         self.metrics.dispatch_notes = list(decision.notes)
         self.metrics.fragment_repair_call_count = self.fragment_repair_call_count
 
+        if decision.action == "FAIL_CLOSED":
+            if self.generation_policy_version == "v0.12":
+                return await self._render_v012_basic_or_legacy(
+                    "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                )
+            findings = _taxonomy_findings(
+                taxonomy_issues[:20],
+                prefix="dispatch fail-closed",
+            )
+            raise publish_gate.PublishGateError(
+                publish_gate.PublishGateResult(passed=False, findings=findings)
+            )
+
         if decision.action == "PUBLISH_RETRY":
+            if self.generation_policy_version == "v0.12":
+                return await self._render_v012_basic_or_legacy(
+                    "writer_failure", "WRITER_UNAVAILABLE"
+                )
             raise ContentDispatchSignal(
                 decision,
                 metrics=self.metrics.to_dict(),
@@ -1825,40 +2933,57 @@ class WriteReviewPublishPipeline:
             )
 
         if decision.action == "FRAGMENT_REPAIR":
+            if self.generation_policy_version == "v0.12":
+                return await self._run_v012_fragment_repair_and_recheck(
+                    decision, taxonomy_issues
+                )
             self.metrics.merge_known_metrics({"fragment_repair_attempted": True})
             try:
                 await self._run_fragment_repair(decision, taxonomy_issues)
             except Exception:
                 if self._safe_policy_enabled("fragment_repair_failed"):
-                    return await self._render_safe("fragment_repair_failed")
+                    return await self._render_v012_basic_or_legacy(
+                        "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                    )
                 raise
             # FR owns only a narrow copy fragment and may remove an otherwise
             # valid action sentence. Re-close keyed gaps deterministically;
             # never escalate an Activity residual into another LLM call.
             self._run_activity_local_completion()
-            # After FR: final publish gate only (no Review re-run).
+            # Legacy policy keeps its historical final-gate-only behavior.
             try:
                 publish_result = await self._run_publish_gate()
             except publish_gate.PublishGateError:
                 if self._safe_policy_enabled("fragment_repair_failed"):
-                    return await self._render_safe("fragment_repair_failed")
+                    return await self._render_v012_basic_or_legacy(
+                        "fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED"
+                    )
                 raise
             notes = self._format_review_notes(
                 taxonomy or generation_issues.resolve_generation_issues(taxonomy_issues)
             )
             return self.plans, notes, publish_result, self.metrics.to_dict()
 
-        # RECORD_ONLY or clean path → final publish gate.
+        # RECORD_ONLY or clean path → final publish gate and exact reviewed version.
+        if self.generation_policy_version == "v0.12":
+            if not self._body_review_current():
+                return await self._render_v012_basic_or_legacy("review_no_anchor", "REVIEW_UNAVAILABLE")
+            if not self._body_review_complete() or not self._template_ratio_ok():
+                return await self._render_v012_basic_or_legacy("fragment_repair_failed", "REVIEW_ISSUES_UNRESOLVED")
         publish_result = await self._run_publish_gate()
+        if self.generation_policy_version == "v0.12" and not self._body_review_current():
+            return await self._render_v012_basic_or_legacy("review_no_anchor", "REVIEW_UNAVAILABLE")
         notes = self._format_review_notes(
             taxonomy or generation_issues.resolve_generation_issues(taxonomy_issues)
         )
-        return self.plans, notes, publish_result, self.metrics.to_dict()
+        return self._plans_without_food_markers(), notes, publish_result, self.metrics.to_dict()
 
     async def _run_fragment_repair(
         self,
         decision: DispatchDecision,
         taxonomy_issues: list[generation_issues.GenerationIssue],
+        *,
+        _within_v012_round: bool = False,
     ) -> None:
         issue_codes = set(
             decision.fragment_issue_codes
@@ -1867,8 +2992,15 @@ class WriteReviewPublishPipeline:
         deterministic_unsupported_fact = (
             "unsupported_fact_expansion" in issue_codes
         )
-        max_repair_passes = 2 if deterministic_unsupported_fact else 1
-        if self.fragment_repair_call_count >= max_repair_passes:
+        max_repair_passes = (
+            1 if self.generation_policy_version == "v0.12"
+            else 2 if deterministic_unsupported_fact else 1
+        )
+        owns_round = (_within_v012_round and self.generation_policy_version == "v0.12"
+                      and self._v012_repair_round_active and self.fragment_repair_call_count == 1)
+        if (not owns_round and (self.fragment_repair_call_count >= max_repair_passes
+                or (self.generation_policy_version == "v0.12"
+                    and self.metrics.writer_keyed_fragment_repair_attempted))):
             raise ContentDispatchSignal(
                 DispatchDecision(
                     action="FAIL_CLOSED",
@@ -1926,6 +3058,8 @@ class WriteReviewPublishPipeline:
                 structured_evidence_payload=self.structured_evidence_payload,
             )
         else:
+            if owns_round and not self._claim_v012_repair_remote():
+                raise RuntimeError("repair_round_exhausted")
             from src.agents.llm import llm_call_context
             generation_index = int(self.publish_retry_round or 0)
             with llm_call_context(
@@ -1934,13 +3068,19 @@ class WriteReviewPublishPipeline:
                 publish_retry_round=self.publish_retry_round,
                 attempt=self.attempt,
             ):
+                repair_kwargs = {
+                    "route_plan": self.route_plans[zero],
+                    "plan_index": plan_index,
+                    "issue_codes": issue_codes,
+                }
+                if self.generation_policy_version == "v0.12":
+                    repair_kwargs["generator"] = self._draft_generator()
                 result = await maybe_fragment_repair_plan(
                     self.plans[zero],
-                    route_plan=self.route_plans[zero],
-                    plan_index=plan_index,
-                    issue_codes=issue_codes,
+                    **repair_kwargs,
                 )
-        self.fragment_repair_call_count += 1
+        if not owns_round:
+            self.fragment_repair_call_count += 1
         self.metrics.fragment_repair_call_count = self.fragment_repair_call_count
         self.metrics.fragment_repair_failure_reason = result.failure_reason
         self.metrics.fragment_repair_target_ids = list(dict.fromkeys([
@@ -1974,6 +3114,194 @@ class WriteReviewPublishPipeline:
         self.repaired_plan_indexes = list(dict.fromkeys(
             [*self.repaired_plan_indexes, plan_index]
         ))
+
+    def _body_context(self, plans=None):
+        return build_body_review_context(trip_request=self.trip_request,
+            route_plans=self.route_plans or [], plans=self.plans if plans is None else plans,
+            structured_evidence_payload=self.structured_evidence_payload,
+            previous_issues=self._body_review_prior)
+
+    def _body_review_current(self, plans=None):
+        if self._body_review is None:
+            return False
+        try:
+            return body_review_matches(self._body_review, self._body_context(plans))
+        except (ValueError, TypeError):
+            return False
+
+    def _body_conflict_repair_hints(self):
+        """Locate explicit paired evidence, without reinterpreting its meaning.
+
+        Only already registered POI paragraphs are repairable here. An unknown
+        result opens no repair; an unlocatable contradiction cannot open a
+        guessed repair.
+        """
+        if not self._body_review_current():
+            return {}
+        hints = {}
+        for requirement_id, row in self._body_review.assessments.items():
+            if not requirement_id.startswith("consistency:") or row["status"] != "missing":
+                continue
+            index = int(requirement_id.split(":")[1])
+            plan = self.plans[index - 1]
+            keys = set()
+            for ref in row["evidence"]:
+                if ref["source"] == f"summary:{index}":
+                    return {}  # Summary has no registered POI repair owner.
+                if ref["source"] != f"plan:{index}":
+                    continue  # Locked arrangements remain immutable.
+                owners = [f for f in plan.poi_fragments if ref["quote"] in f.text]
+                if len(owners) != 1:
+                    return {}
+                fragment = owners[0]
+                keys.add((fragment.plan_index, fragment.day, fragment.place_id))
+            if not keys:
+                return {}
+            instruction = "解决审核定位的正文矛盾；保留原路线、合理妥协和事实授权，不添加外部事实。" + json.dumps(
+                {"reason": row["reason"], "evidence": row["evidence"]}, ensure_ascii=False)
+            for key in keys:
+                hints.setdefault(key, []).append(instruction)
+        return hints
+
+    def _body_review_complete(self):
+        """A current receipt without an evidenced contradiction, on a qualified route."""
+        if not self._body_review_current():
+            return False
+        if any(row["status"] == "missing" for key, row in self._body_review.assessments.items()
+               if key.startswith("consistency:")):
+            return False
+        report = self._explicit_preference_report()
+        return not (report.blocking_route_findings() or report.admission_block_findings())
+
+    def _template_ratio_ok(self):
+        """Recheck Writer-owned missing keys, using the original per-plan denominator.
+
+        deterministic_completion is shared by fact correction and is not a
+        Writer missing-fragment ledger. Never infer fallback ownership from it.
+        """
+        writer_keys = [(item["plan_index"], item["day"], item["place_id"])
+                       for item in self.metrics.writer_keyed_fragment_fallback_keys]
+        for index, plan in enumerate(self.plans, 1):
+            fallbacks = [key for key in writer_keys if key[0] == index]
+            if fallback_ratio_exceeded(fallbacks, total_fragment_count=len(plan.poi_fragments)):
+                return False
+        return True
+
+    def _remember_qualified_original(self, taxonomy):
+        if (self._body_review_complete() and self._template_ratio_ok()
+                and self._check_publish_gate().passed
+                and not any(i.category in {"REPAIR", "BLOCKER"} or i.publish_action != "RECORD_ONLY"
+                            for i in taxonomy.issues)):
+            self._approved_original = ([p.model_copy(deep=True) for p in self.plans],
+                self._body_review.model_copy(deep=True), list(self._body_review_prior),
+                taxonomy.model_copy(deep=True))
+
+    def _explicit_preference_report(
+        self,
+        plans: list[PlanOutput] | None = None,
+    ) -> PreferenceFulfillmentReport:
+        return evaluate_explicit_preference_fulfillment(
+            trip_request=self.trip_request,
+            route_plans=self.route_plans or [],
+            plans=plans if plans is not None else self.plans,
+            structured_evidence_payload=self.structured_evidence_payload,
+            retrieval=self.retrieval,
+            body_review_required=self.generation_policy_version == "v0.12",
+        )
+
+    def _record_preference_report(
+        self,
+        report: PreferenceFulfillmentReport,
+        *,
+        phase: str,
+    ) -> None:
+        reasons = [item.reason_code for item in report.findings]
+        keys = [
+            {"plan_index": item.plan_index, "day": item.day, "place_id": item.place_id}
+            for item in report.repairable_body_findings()
+        ]
+        payload = {
+            "explicit_preference_evaluated": True,
+            "explicit_preference_dimensions": list(report.dimensions),
+            "explicit_preference_findings": [item.to_dict() for item in report.findings][:40],
+            "explicit_preference_arrangement_failures": [
+                item.to_dict() for item in report.route_gap_findings()
+            ][:20],
+            "explicit_preference_body_missing_keys": keys[:20],
+        }
+        if phase == "before_repair":
+            payload["explicit_preference_before_reasons"] = reasons[:40]
+        else:
+            payload["explicit_preference_after_reasons"] = reasons[:40]
+        self.metrics.merge_known_metrics(payload)
+
+    def _preference_fail_closed(
+        self,
+        report: PreferenceFulfillmentReport,
+        findings: list,
+        *,
+        extra_reason: str = "",
+    ) -> dict[str, Any]:
+        issues = report.to_generation_issues(findings)
+        reasons = [item.reason_code for item in findings]
+        if extra_reason:
+            reasons.append(extra_reason)
+        decision = DispatchDecision(
+            action="FAIL_CLOSED",
+            reasons=list(dict.fromkeys(reasons or ["explicit_preference_unresolved"])),
+            notes=[
+                extra_reason or "explicit preference fulfillment failed",
+                *self.metrics.explicit_preference_before_reasons[:8],
+            ],
+            plan_indexes=sorted({
+                item.plan_index for item in findings if item.plan_index
+            }),
+        )
+        self._validate_dispatch_decision(decision, issues)
+        return {
+            "kind": "dispatch",
+            "decision": decision,
+            "qualified_review_issues": issues,
+        }
+
+    def _sync_day_openings_after_preference_repair(self) -> None:
+        if not self.plans or not self.route_plans:
+            return
+        report = self._explicit_preference_report()
+        night_days = {
+            (item.plan_index, item.day)
+            for item in report.findings
+            if item.dimension == "night_view"
+            and item.layer == "arrangement"
+            and item.arrangement_supported
+        }
+        updated: list[PlanOutput] = []
+        for index, plan in enumerate(self.plans, 1):
+            text = plan.plan_text
+            route = self.route_plans[index - 1] if index - 1 < len(self.route_plans) else None
+            if route is None:
+                updated.append(plan)
+                continue
+            for day_group in route.day_groups:
+                supported = (index, int(day_group.day)) in night_days or any(
+                    item.dimension == "night_view"
+                    and item.plan_index == index
+                    and item.day == int(day_group.day)
+                    and item.arrangement_supported
+                    for item in report.findings
+                )
+                text = sync_day_opening_for_locked_arrangement(
+                    text,
+                    day=int(day_group.day),
+                    night_supported=supported,
+                    place_names=[place.name for place in day_group.places],
+                )
+            if text != plan.plan_text:
+                remapped = remap_fragment_registry(plan, updated_text=text)
+                updated.append(plan if remapped is None else remapped)
+            else:
+                updated.append(plan)
+        self.plans = updated
 
     def _review_keyed_soft_repair_targets(
         self,
@@ -2017,34 +3345,54 @@ class WriteReviewPublishPipeline:
         keys: list[FragmentKey],
         issue_codes_by_key: dict[FragmentKey, set[str]],
         required_keys: set[FragmentKey] | None = None,
+        required_body_elements_by_key: dict[FragmentKey, tuple[str, ...]] | None = None,
     ) -> bool:
         required_keys = set(required_keys or ())
         self.metrics.review_keyed_fragment_repair_attempted = True
         self.metrics.review_keyed_fragment_repair_target_count = len(keys)
-        if self.metrics.writer_keyed_fragment_repair_attempted:
+        if (self.metrics.writer_keyed_fragment_repair_attempted
+                or (self.generation_policy_version == "v0.12" and (
+                    self._v012_repair_remote_started
+                    or (self.fragment_repair_call_count > 0 and not self._v012_repair_round_active)))):
             self.metrics.review_keyed_fragment_repair_failure_reason = (
                 "repair_round_exhausted"
             )
             self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
             return False
         remaining = self._residual_seconds()
+        if (
+            self.generation_policy_version == "v0.12"
+            and self._v012_repair_phase_deadline is not None
+        ):
+            phase_remaining = self._v012_repair_phase_deadline - time.monotonic()
+            remaining = (
+                phase_remaining if remaining is None
+                else min(remaining, phase_remaining)
+            )
         desired_timeout = keyed_fragment_repair_timeout_seconds(len(keys))
         repair_timeout = desired_timeout
         if remaining is not None:
-            repair_timeout = min(
-                desired_timeout,
-                max(
-                    0.0,
-                    remaining
-                    - KEYED_FRAGMENT_REVIEW_TIMEOUT_SECONDS
-                    - self.residual_reserve_seconds,
-                ),
-            )
+            if self.generation_policy_version == "v0.12":
+                repair_timeout = min(
+                    desired_timeout,
+                    max(0.0, remaining - V012_RECHECK_RESERVE_SECONDS),
+                )
+            else:
+                repair_timeout = min(
+                    desired_timeout,
+                    max(
+                        0.0,
+                        remaining
+                        - KEYED_FRAGMENT_REVIEW_TIMEOUT_SECONDS
+                        - self.residual_reserve_seconds,
+                    ),
+                )
         self.metrics.review_keyed_fragment_repair_timeout_seconds = round(
             repair_timeout,
             3,
         )
-        if repair_timeout < KEYED_FRAGMENT_REPAIR_MIN_TIMEOUT_SECONDS:
+        if (self.generation_policy_version != "v0.12"
+                and repair_timeout < KEYED_FRAGMENT_REPAIR_MIN_TIMEOUT_SECONDS):
             self.metrics.review_keyed_fragment_repair_failure_reason = "budget_denied"
             self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
             return False
@@ -2061,11 +3409,59 @@ class WriteReviewPublishPipeline:
             )
             self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
             return False
-        repair = await call_keyed_fragment_repair(
+        if required_body_elements_by_key is None:
+            preference_hints = self._explicit_preference_report().repair_hints_by_key()
+            conflict_hints = self._body_conflict_repair_hints()
+            body_elements = {
+                target.key: ((preference_hints[target.key],) if target.key in preference_hints else ())
+                + tuple(conflict_hints.get(target.key, ()))
+                for target in targets
+            }
+        else:
+            if (set(required_body_elements_by_key) - set(keys)
+                    or any(not isinstance(values, tuple)
+                           or any(not isinstance(value, str) or not value.strip() for value in values)
+                           for values in required_body_elements_by_key.values())):
+                self.metrics.review_keyed_fragment_repair_failure_reason = "target_contract_missing"
+                return False
+            body_elements = required_body_elements_by_key
+        targets = [replace(target, required_body_elements=body_elements.get(target.key, ()))
+                   for target in targets]
+        if self.generation_policy_version == "v0.12":
+            if not self._start_v012_repair_phase(
+                min_writer_seconds=KEYED_FRAGMENT_REPAIR_MIN_TIMEOUT_SECONDS,
+            ):
+                self.metrics.review_keyed_fragment_repair_failure_reason = "budget_denied"
+                self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
+                return False
+            if not self._v012_repair_round_active and not self._reserve_v012_repair_round():
+                self.metrics.review_keyed_fragment_repair_failure_reason = "repair_round_exhausted"
+                return False
+            if not self._claim_v012_repair_remote():
+                self.metrics.review_keyed_fragment_repair_failure_reason = "repair_round_exhausted"
+                return False
+            # Full-window admission above uses one clock reading. Subsequent
+            # bookkeeping is charged to that deadline, never rounded upward
+            # and never used to reopen the original minimum-window decision.
+            repair_timeout = self._v012_repair_writer_timeout(
+                min(desired_timeout, KEYED_FRAGMENT_REPAIR_MIN_TIMEOUT_SECONDS)
+            )
+            self.metrics.review_keyed_fragment_repair_timeout_seconds = round(repair_timeout, 3)
+            if repair_timeout <= 0:
+                self.metrics.review_keyed_fragment_repair_failure_reason = "budget_denied"
+                return False
+        repair_call = call_keyed_fragment_repair(
             generator=self._draft_generator(),
             targets=targets,
             timeout_seconds=repair_timeout,
         )
+        try:
+            repair = (await self._await_v012_repair(repair_call, cap=repair_timeout)
+                      if self.generation_policy_version == "v0.12" else await repair_call)
+        except asyncio.TimeoutError:
+            self.metrics.review_keyed_fragment_repair_failure_reason = "transport_timeout"
+            self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
+            return False
         self.metrics.review_keyed_fragment_repair_latency_ms = repair.latency_ms
         if not repair.replacements:
             self.metrics.review_keyed_fragment_repair_failure_reason = (
@@ -2073,39 +3469,44 @@ class WriteReviewPublishPipeline:
             )
             self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
             return False
-        review = await review_keyed_fragment_replacements(
-            targets=targets,
-            replacements=repair.replacements,
-        )
-        self.metrics.review_keyed_fragment_repair_review_latency_ms = (
-            review.latency_ms
-        )
-        if (
-            review.failure_reason.startswith("transport:")
-            and self._residual_admits(
-                min_seconds=KEYED_FRAGMENT_REVIEW_TIMEOUT_SECONDS
-            )
-        ):
-            self.metrics.review_keyed_fragment_repair_review_retry_count = 1
+        if self.generation_policy_version == "v0.12":
+            # The whole repaired draft is rechecked below through the routed
+            # v0.12 Review budget.  Do not open this legacy fragment reviewer.
+            accepted = dict(repair.replacements)
+        else:
             review = await review_keyed_fragment_replacements(
                 targets=targets,
                 replacements=repair.replacements,
             )
-            self.metrics.review_keyed_fragment_repair_review_latency_ms += (
+            self.metrics.review_keyed_fragment_repair_review_latency_ms = (
                 review.latency_ms
             )
-        if review.failure_reason:
-            self.metrics.review_keyed_fragment_repair_failure_reason = (
-                f"review:{review.failure_reason}"
-            )
-            self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
-            return False
+            if (
+                review.failure_reason.startswith("transport:")
+                and self._residual_admits(
+                    min_seconds=KEYED_FRAGMENT_REVIEW_TIMEOUT_SECONDS
+                )
+            ):
+                self.metrics.review_keyed_fragment_repair_review_retry_count = 1
+                review = await review_keyed_fragment_replacements(
+                    targets=targets,
+                    replacements=repair.replacements,
+                )
+                self.metrics.review_keyed_fragment_repair_review_latency_ms += (
+                    review.latency_ms
+                )
+            if review.failure_reason:
+                self.metrics.review_keyed_fragment_repair_failure_reason = (
+                    f"review:{review.failure_reason}"
+                )
+                self.metrics.review_keyed_fragment_repair_remaining_count = len(keys)
+                return False
 
-        accepted = {
-            key: text
-            for key, text in repair.replacements.items()
-            if key not in review.rejected_keys
-        }
+            accepted = {
+                key: text
+                for key, text in repair.replacements.items()
+                if key not in review.rejected_keys
+            }
         candidate_plans = list(self.plans)
         route_plans = self.route_plans or []
         applied_keys: set[FragmentKey] = set()
@@ -2155,26 +3556,40 @@ class WriteReviewPublishPipeline:
                 )
                 if prior.name
             }
+            original_fragment = candidate_plans[zero].poi_fragment(
+                plan_index=plan_index, day=day, place_id=place_id,
+            )
+            if original_fragment is None:
+                continue
+            food_hint = fragment_food_hint(candidate_plans[zero], original_fragment)
+            raw_text = normalize_body_food_boundary(
+                raw_text, key=key, attachment_text=original_fragment.text,
+                food_hint=food_hint, place_name=place.name,
+                route_place_names=tuple(
+                    p.name for group in route_plan.day_groups for p in group.places
+                ),
+            )
+            if raw_text is None:
+                continue
+            food_names = (
+                [str(food_hint["food_name"])]
+                if food_hint and food_hint.get("evidence_tier") in {"full", "structural"}
+                and food_hint.get("food_name") else []
+            )
             cleaned, _actions, rejection = final_writer._sanitize_keyed_fragment_text(
                 raw_text,
                 place_name=place.name,
                 route_plan=route_plan,
                 validation_candidate_names=validation_candidate_names,
                 weather_advisory_payload=self.weather_advisory_payload,
+                allowed_contextual_names=food_names,
+                fragment_key=key,
                 same_day_prior_place_names=prior_names,
             )
             if rejection:
                 continue
-            original = candidate_plans[zero].poi_fragment(
-                plan_index=plan_index,
-                day=day,
-                place_id=place_id,
-            )
-            if original is None:
-                continue
-            food_spans = [match.group(0) for match in FOOD_SPAN_RE.finditer(original.text)]
-            replacement = f"{place.name}：{cleaned}{''.join(food_spans)}"
-            replaced = replace_fragment_text(
+            replacement = f"{place.name}：{cleaned}"
+            replaced = replace_fragment_body(
                 candidate_plans[zero],
                 plan_index=plan_index,
                 day=day,
@@ -2213,9 +3628,22 @@ class WriteReviewPublishPipeline:
                 return False
         self.plans = candidate_plans
         self.metrics.review_keyed_fragment_repair_failure_reason = ""
+        if self.metrics.explicit_preference_repair_attempted:
+            self.metrics.explicit_preference_repair_applied_keys = [
+                {
+                    "plan_index": key[0],
+                    "day": key[1],
+                    "place_id": key[2],
+                }
+                for key in sorted(applied_keys)
+            ]
+            if self.generation_policy_version != "v0.12":
+                self._sync_day_openings_after_preference_repair()
         return True
 
     def _run_activity_local_completion(self) -> None:
+        if self.generation_policy_version == "v0.12":
+            return  # Do not turn a lexical miss into an automatic pass sentence.
         if not bool(
             getattr(
                 get_settings(),
@@ -2383,12 +3811,22 @@ class WriteReviewPublishPipeline:
                             speculative_initial_generation=(
                                 self.speculative_initial_generation
                             ),
+                            plan_retry_remaining=self._writer_plan_retry_remaining,
+                            body_semantics_by_review=self.generation_policy_version == "v0.12",
                             speculative_adopted_archive_sink=(
                                 self._speculative_adopted_archive_records
                             ),
                         )
                     )
+                    prior_retry_used = bool(self.metrics.writer_plan_retry_used)
+                    prior_retry_count = int(self.metrics.writer_plan_retry_count or 0)
                     self.metrics.merge_known_metrics(writer_metrics)
+                    if prior_retry_used:
+                        self.metrics.writer_plan_retry_used = True
+                    self.metrics.writer_plan_retry_count = max(
+                        prior_retry_count,
+                        int(self.metrics.writer_plan_retry_count or 0),
+                    )
                     successful_plan_indexes = writer_metrics.get(
                         "writer_plan_successful_plan_indexes",
                         [],
@@ -2435,11 +3873,11 @@ class WriteReviewPublishPipeline:
                         "single_plan_unwrapped_plan_indexes": writer_metrics.get(
                             "single_plan_unwrapped_plan_indexes", []
                         ),
-                        "writer_plan_retry_used": writer_metrics.get(
-                            "writer_plan_retry_used", False
+                        "writer_plan_retry_used": bool(
+                            self.metrics.writer_plan_retry_used
                         ),
-                        "writer_plan_retry_count": writer_metrics.get(
-                            "writer_plan_retry_count", 0
+                        "writer_plan_retry_count": int(
+                            self.metrics.writer_plan_retry_count or 0
                         ),
                         "writer_plan_attempt_count": writer_metrics.get(
                             "writer_plan_attempt_count", 0
@@ -2486,6 +3924,9 @@ class WriteReviewPublishPipeline:
                         "writer_keyed_fragment_repair_remaining_count",
                         "writer_keyed_fragment_repair_latency_ms",
                         "writer_keyed_fragment_repair_failure_reason",
+                        "writer_keyed_preference_repair_target_count",
+                        "writer_keyed_preference_repair_applied_count",
+                        "writer_keyed_preference_repair_remaining_count",
                     ):
                         writer_step_metadata[key] = writer_metrics.get(key)
                     for key in (
@@ -2503,6 +3944,8 @@ class WriteReviewPublishPipeline:
                         "contains_trailing_comma_like_pattern",
                         "contains_single_quote_json_like_pattern",
                         "retry_attempts_summary",
+                        "adjudication_reason", "opus_adjudication_state", "ds_adjudication_state",
+                        "ds_qualified_at_ms", "standby_grace_expires_at_ms", "adjudicated_at_ms",
                     ):
                         if key in writer_metrics:
                             writer_step_metadata[key] = writer_metrics[key]
@@ -2698,6 +4141,7 @@ class WriteReviewPublishPipeline:
             weather_advisory_payload=self.weather_advisory_payload,
             attachment_auth_map=self.attachment_auth_map,
             accommodation=self.accommodation,
+            body_semantics_by_review=self.generation_policy_version == "v0.12",
         )
         taxonomy = generation_issues.resolve_generation_issues(deterministic)
         shadow_metadata = _build_review_shadow_metadata(
@@ -2814,16 +4258,8 @@ class WriteReviewPublishPipeline:
             })
         return taxonomy, metadata
 
-    def _review_transport_fallback(
-        self,
-        exc: Exception,
-        unavailable_kind: str,
-        error_type: str,
-    ) -> tuple[
-        generation_issues.IssueTaxonomyResult,
-        dict[str, Any],
-        publish_gate.PublishGateError | None,
-    ]:
+    def _code_delivery_evidence(self) -> dict[str, Any]:
+        """Evaluate the existing code gates without inventing a Review outage."""
         deterministic = generation_issues.collect_deterministic_generation_issues(
             self.plans,
             trip_request=self.trip_request,
@@ -2834,6 +4270,7 @@ class WriteReviewPublishPipeline:
             weather_advisory_payload=self.weather_advisory_payload,
             attachment_auth_map=self.attachment_auth_map,
             accommodation=self.accommodation,
+            body_semantics_by_review=self.generation_policy_version == "v0.12",
         )
         taxonomy = generation_issues.resolve_generation_issues(deterministic)
         shadow_metadata = _build_review_shadow_metadata(
@@ -2885,8 +4322,44 @@ class WriteReviewPublishPipeline:
             "blueprint_integrity_passed": not blueprint_violations,
             "publish_preflight_passed": publish_preflight.passed,
             "deterministic_issue_gate_passed": deterministic_issue_gate_passed,
-            "no_hard_risk_flags": not hard_risk_flags,
+            # v0.15.1: the high-risk flags are recorded, not a gate. Six of the
+            # seven restate checks above; the seventh was a crowd/ranking regex
+            # over the whole body, which sent vivid drafts to the basic plan.
         }
+        return {
+            "taxonomy": taxonomy,
+            "shadow_metadata": shadow_metadata,
+            "blueprint_violations": blueprint_violations,
+            "publish_preflight": publish_preflight,
+            "hard_risk_flags": hard_risk_flags,
+            "writer_generated_plan_count": writer_generated_plan_count,
+            "writer_output_not_parseable": writer_output_not_parseable,
+            "plan_count": plan_count,
+            "route_plan_count": route_plan_count,
+            "gate_checks": gate_checks,
+        }
+
+    def _review_transport_fallback(
+        self,
+        exc: Exception,
+        unavailable_kind: str,
+        error_type: str,
+    ) -> tuple[
+        generation_issues.IssueTaxonomyResult,
+        dict[str, Any],
+        publish_gate.PublishGateError | None,
+    ]:
+        evidence = self._code_delivery_evidence()
+        taxonomy = evidence["taxonomy"]
+        shadow_metadata = evidence["shadow_metadata"]
+        blueprint_violations = evidence["blueprint_violations"]
+        publish_preflight = evidence["publish_preflight"]
+        hard_risk_flags = evidence["hard_risk_flags"]
+        writer_generated_plan_count = evidence["writer_generated_plan_count"]
+        writer_output_not_parseable = evidence["writer_output_not_parseable"]
+        plan_count = evidence["plan_count"]
+        route_plan_count = evidence["route_plan_count"]
+        gate_checks = evidence["gate_checks"]
         failed_checks = [
             key for key, passed in gate_checks.items() if not passed
         ]
@@ -3002,22 +4475,75 @@ class WriteReviewPublishPipeline:
         step_metadata: dict[str, Any] = {}
         taxonomy: generation_issues.IssueTaxonomyResult | None = None
         initial_skip_metadata: dict[str, Any] = {}
+        v012_call_start = (
+            len(self.review_call_budget.calls)
+            if self.generation_policy_version == "v0.12"
+            and self.review_call_budget is not None
+            else 0
+        )
+        execution_state = "FAILED"
+        execution_reason: str | None = "UNKNOWN"
+        adopted_sequence: int | None = None
         from src.agents.llm import current_llm_observation_summary, llm_call_context
+
+        def finish_step_metadata() -> dict[str, Any]:
+            if (
+                self.generation_policy_version == "v0.12"
+                and self.review_call_budget is not None
+            ):
+                calls = self.review_call_budget.calls[v012_call_start:]
+                observation = project_execution_observation(
+                    calls,
+                    role="review",
+                    purpose=(
+                        "REVIEW" if stage == "REVIEW_TAXONOMY"
+                        else "REVIEW_AFTER_REPAIR"
+                    ),
+                    state=execution_state,
+                    reason_code=execution_reason,
+                    adopted_call_sequence=adopted_sequence,
+                )
+                step_metadata["execution_observation"] = observation.model_dump(
+                    mode="json"
+                )
+                sequences = {
+                    int(item.get("sequence") or 0) for item in calls
+                }
+                step_metadata["review_path_diagnostics"] = [
+                    item
+                    for item in list(self.review_call_budget.path_diagnostics)
+                    if int(item.get("sequence") or 0) in sequences
+                ]
+                step_metadata["review_route_calls"] = list(calls)
+            return step_metadata
 
         async def action():
             nonlocal taxonomy, step_metadata, initial_skip_metadata
+            nonlocal execution_state, execution_reason, adopted_sequence
             settings = get_settings()
             skip_feature_enabled = _review_risk_skip_enabled(settings)
             ds_mandatory = self._ds_review_mandatory()
             generation_index = int(self.publish_retry_round or 0)
             with llm_call_context(
                 stage=stage,
+                review_round="recheck" if stage == "REVIEW_TAXONOMY_AFTER_REPAIR" else "initial",
                 generation_index=generation_index,
                 publish_retry_round=self.publish_retry_round,
                 attempt=self.attempt,
             ):
                 if stage == "REVIEW_TAXONOMY":
-                    if ds_mandatory:
+                    if self.generation_policy_version == "v0.12":
+                        # Current production Writer output is free prose.  No
+                        # workflow source can yet prove that its complete body
+                        # came only from approved templates/structured fields.
+                        initial_skip_metadata = {
+                            "initial_review_skipped": False,
+                            "initial_review_skip_reason": (
+                                "v012_free_writer_body_requires_review"
+                            ),
+                            "review_risk_skip_enabled": False,
+                        }
+                    elif ds_mandatory:
                         initial_skip_metadata = {
                             "initial_review_skipped": False,
                             "initial_review_skip_reason": (
@@ -3057,6 +4583,7 @@ class WriteReviewPublishPipeline:
                     _allocated_review_timeout = (
                         self._speculative_review_timeout_seconds()
                     )
+                    self._body_review_prior = list(self._next_review_issues)
                     review_call = run_taxonomy_review(
                         self.plans,
                         trip_request=self.trip_request,
@@ -3065,7 +4592,8 @@ class WriteReviewPublishPipeline:
                         budget_results=self.budget_results,
                         composition_blueprints=self.composition_blueprints,
                         review_plan_concurrency_enabled=(
-                            _review_plan_concurrency_enabled(settings)
+                            self.generation_policy_version != "v0.12"
+                            and _review_plan_concurrency_enabled(settings)
                             and _is_original_yuntu_review_collect()
                         ),
                         structured_evidence_payload=self.structured_evidence_payload,
@@ -3077,6 +4605,10 @@ class WriteReviewPublishPipeline:
                             or yuntu_review.ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS
                         ),
                         generator=self.metrics.extra.get("generator"),
+                        generation_policy_version=self.generation_policy_version,
+                        review_call_budget=self._v012_review_phase_budget(stage),
+                        previous_review_issues=self._body_review_prior,
+                        allow_failure_backup=True,
                     )
                     if self._speculative_round():
                         remaining_at_launch = self._residual_seconds()
@@ -3094,7 +4626,7 @@ class WriteReviewPublishPipeline:
                                     remaining_at_launch
                                 ),
                                 "review_residual_reserve_seconds": (
-                                    self.residual_reserve_seconds
+                                    self._review_tail_reserve_seconds()
                                 ),
                                 "review_launch_guard_passed": False,
                                 "review_transport_error_type": None,
@@ -3116,7 +4648,7 @@ class WriteReviewPublishPipeline:
                                 remaining_at_launch
                             ),
                             "review_residual_reserve_seconds": (
-                                self.residual_reserve_seconds
+                                self._review_tail_reserve_seconds()
                             ),
                             "review_launch_guard_passed": True,
                             "review_transport_error_type": None,
@@ -3150,6 +4682,27 @@ class WriteReviewPublishPipeline:
                     taxonomy, step_metadata, review_metrics = review_result
                     step_metadata.update(review_budget_metadata)
                 except Exception as exc:
+                    # Retain the allocated cap/elapsed receipt on recheck
+                    # failure as well; it must not disappear with the result.
+                    step_metadata.update(review_budget_metadata)
+                    if review_budget_metadata:
+                        step_metadata["review_transport_error_type"] = (
+                            _review_transport_error_type(exc)
+                        )
+                    if self.generation_policy_version == "v0.12":
+                        calls = self.review_call_budget.calls[v012_call_start:]
+                        execution_state = "FAILED" if calls else "CALL_REJECTED"
+                        execution_reason = (
+                            exc.code
+                            if isinstance(exc, GenerationModelCallError)
+                            else (
+                                calls[-1].get("error_code")
+                                if calls else "CONFIG_UNAVAILABLE"
+                            )
+                        )
+                        # W9 owns a separate, body-bound deterministic delivery
+                        # path. Do not fabricate an empty semantic review here.
+                        raise
                     unavailable = _review_unavailable_type(exc)
                     if stage != "REVIEW_TAXONOMY" or unavailable is None:
                         raise
@@ -3199,6 +4752,46 @@ class WriteReviewPublishPipeline:
                         raise fallback_error
                     return taxonomy
                 self.metrics.merge_known_metrics(review_metrics)
+                if self.generation_policy_version == "v0.12":
+                    stage_calls = self.review_call_budget.calls[v012_call_start:]
+                    routed_adopted_sequence = (
+                        self.review_call_budget.adopted_call_sequence
+                    )
+                    adopted = next(
+                        (
+                            call for call in stage_calls
+                            if call.get("status") == "SUCCESS"
+                            and int(call.get("sequence") or 0)
+                            == routed_adopted_sequence
+                        ),
+                        None,
+                    )
+                    if adopted is not None:
+                        adopted_sequence = int(adopted["sequence"])
+                        execution_state = (
+                            "FALLBACK_USED"
+                            if any(
+                                call.get("status") != "SUCCESS"
+                                for call in stage_calls
+                                if int(call.get("sequence") or 0) < adopted_sequence
+                            )
+                            else "MODEL_SUCCEEDED"
+                        )
+                        execution_reason = None
+                    else:
+                        execution_state = "FAILED"
+                        execution_reason = "UNKNOWN"
+                    self.metrics.merge_known_metrics({
+                        "v012_review_state": "MODEL_PASSED",
+                        "v012_review_call_count": (
+                            self.review_call_budget.calls_started
+                            if self.review_call_budget is not None else 0
+                        ),
+                        "v012_review_backup_used": (
+                            self.review_call_budget.backup_claimed
+                            if self.review_call_budget is not None else False
+                        ),
+                    })
                 if stage == "REVIEW_TAXONOMY":
                     llm_counts = step_metadata.get("review_shadow_llm_issue_counts") or {}
                     step_metadata.update({
@@ -3259,7 +4852,7 @@ class WriteReviewPublishPipeline:
                 "route_plan_count": len(self.route_plans or []),
                 **(metadata or {}),
             },
-            finish_metadata=lambda: step_metadata,
+            finish_metadata=finish_step_metadata,
         )
         return result
 
@@ -3723,6 +5316,21 @@ class WriteReviewPublishPipeline:
         self._record_post_repair_metrics(result)
         return result
 
+    def _plans_without_food_markers(self) -> list[PlanOutput]:
+        """Project delivery text without mutating the reviewed ownership registry."""
+        projected = []
+        for plan in self.plans:
+            text = publish_gate.strip_food_span_markers(plan.plan_text)
+            remapped = remap_fragment_registry(plan, updated_text=text)
+            if remapped is None:
+                raise publish_gate.PublishGateError(publish_gate.PublishGateResult(
+                    passed=False, findings=[publish_gate.PublishFinding(
+                        reason="fragment_registry_invalidated",
+                        message="food marker cleanup crossed a stable POI fragment boundary",
+                    )]))
+            projected.append(remapped)
+        return projected
+
     async def _run_publish_gate(self) -> publish_gate.PublishGateResult:
         publish_result: publish_gate.PublishGateResult | None = None
         findings_before_final_replacement: list[publish_gate.PublishFinding] = []
@@ -3791,24 +5399,16 @@ class WriteReviewPublishPipeline:
                     )
             if not publish_result.passed:
                 raise publish_gate.PublishGateError(publish_result)
-            marker_free_plans: list[PlanOutput] = []
-            for plan in self.plans:
-                updated_text = publish_gate.strip_food_span_markers(plan.plan_text)
-                remapped = remap_fragment_registry(plan, updated_text=updated_text)
-                if remapped is None:
-                    publish_result = publish_gate.PublishGateResult(
-                        passed=False,
-                        findings=[publish_gate.PublishFinding(
-                            reason="fragment_registry_invalidated",
-                            message=(
-                                "food marker cleanup crossed a stable "
-                                "POI fragment boundary"
-                            ),
-                        )],
-                    )
-                    raise publish_gate.PublishGateError(publish_result)
-                marker_free_plans.append(remapped)
-            self.plans = marker_free_plans
+            # Keep the reviewed internal representation (including food ownership)
+            # intact. Public prose is an exact marker-only projection returned by
+            # the delivery paths; substantive edits still invalidate the receipt.
+            try:
+                marker_free_plans = self._plans_without_food_markers()
+            except publish_gate.PublishGateError as exc:
+                publish_result = exc.result  # Preserve the existing failed-stage diagnostics.
+                raise
+            if not (self.generation_policy_version == "v0.12" and self._body_review_current()):
+                self.plans = marker_free_plans
             return publish_result
 
         result = await _run_observed_step(

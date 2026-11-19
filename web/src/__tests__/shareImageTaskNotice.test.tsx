@@ -750,7 +750,7 @@ describe("AI Share Image Persistent Notification & Acceptance Tests", () => {
     const viewBtn = screen.getByText("查看长图");
     fireEvent.click(viewBtn);
 
-    expect(currentPath).toBe("/");
+    expect(currentPath).toBe("/history");
     expect(currentPath).not.toContain("/result/2254");
   });
 

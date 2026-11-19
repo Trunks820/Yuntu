@@ -208,5 +208,3 @@ export const MobileBookStep: React.FC<MobileBookStepProps> = ({
     </>
   );
 };
-
-

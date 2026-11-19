@@ -287,5 +287,3 @@ def _protected_ids(places: list[CandidatePlace], rules: PlannerRules) -> set[int
         if rules.tea and candidate_is_tea_place(place):
             protected.add(place.place_id)
     return protected
-
-

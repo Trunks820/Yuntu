@@ -1,4 +1,14 @@
-import { resolveCityAssetVariant, withCityAssetBase } from "@/config/cityAssets";
+import {
+  BUNDLED_CITY_IMAGES,
+  BUNDLED_FALLBACK_IMAGE,
+  bundledCityImages,
+  resolveCityAssetVariant,
+  usesBundledCityAssets,
+  withCityAssetBase,
+} from "@/config/cityAssets";
+import { CITY_PHOTO_CREDITS } from "@/utils/cityPhotoCredits.generated";
+
+export { CITY_PHOTO_CREDITS };
 
 export const CITY_IMAGES: Record<string, string[]> = {
   beijing: [
@@ -276,6 +286,11 @@ export function getCityPostcardCover(city: string, seedKey = "default"): string 
   const cleanCity = city.trim().replace(/市$/, "");
   const folder = CITY_NAME_TO_FOLDER[cleanCity] || CITY_NAME_TO_FOLDER[city];
 
+  if (usesBundledCityAssets()) {
+    const localImages = folder ? bundledCityImages(folder) : [BUNDLED_FALLBACK_IMAGE];
+    return localImages[0] ?? BUNDLED_FALLBACK_IMAGE;
+  }
+
   if (folder && CITY_IMAGES[folder]?.length) {
     const images = CITY_IMAGES[folder];
     // 简单的字符串哈希，让不同 trip_id 分配到同一城市不同的真实风光图
@@ -296,6 +311,10 @@ export function getCityPostcardCover(city: string, seedKey = "default"): string 
 export function getCityAllCovers(city: string): string[] {
   const cleanCity = city.trim().replace(/市$/, "");
   const folder = CITY_NAME_TO_FOLDER[cleanCity] || CITY_NAME_TO_FOLDER[city];
+
+  if (usesBundledCityAssets()) {
+    return folder ? bundledCityImages(folder) : [BUNDLED_FALLBACK_IMAGE];
+  }
 
   if (folder && CITY_IMAGES[folder]?.length) {
     return CITY_IMAGES[folder].map((img) =>
@@ -484,5 +503,126 @@ export function getCityDayRoutes(city: string, days = 3): { day: number; route: 
     route: routes[i % routes.length],
   }));
 }
+
+
+const FOLDER_TO_CITY_NAME: Record<string, string> = Object.fromEntries(
+  Object.entries(CITY_NAME_TO_FOLDER).map(([name, folder]) => [folder, name]),
+);
+
+const CITY_GALLERY_STEM_SET: ReadonlySet<string> = new Set(
+  Object.entries(CITY_IMAGES).flatMap(([folder, files]) =>
+    files.map((file) => `${folder.toLowerCase()}/${file.replace(/\.[^.]+$/, "")}`),
+  ),
+);
+
+/**
+ * 将已登记 R2 城市图库的高清图（city-opt/*.webp 或 /city/*.jpg）转为列表缩略小图（*.mobile.webp）。
+ * 仅对 manifest 已发布的 128 张图库原图转换，poi-opt/ 及其他未登记路径原样返回。
+ */
+export function getCityMobilePhotoUrl(url: string): string {
+  if (!url) return url;
+  if (url === BUNDLED_FALLBACK_IMAGE || url.startsWith("/bundled/")) {
+    return url;
+  }
+
+  const optMatch = url.match(
+    /^(.*\/city-opt\/([a-z]+)\/([^/?#]+?))\.webp((?:[?#].*)?)$/i,
+  );
+  if (optMatch) {
+    const [, prefix, folder, rawStem, suffix] = optMatch;
+    if (/\.mobile$/i.test(rawStem)) {
+      return url;
+    }
+    const key = `${folder.toLowerCase()}/${rawStem}`;
+    return CITY_GALLERY_STEM_SET.has(key)
+      ? `${prefix}.mobile.webp${suffix}`
+      : url;
+  }
+
+  const legacyMatch = url.match(
+    /^(?:https?:\/\/[^/?#]+)?(\/city\/([a-z]+)\/([^/?#]+?))\.jpg((?:[?#].*)?)$/i,
+  );
+  if (legacyMatch) {
+    const [, , folder, stem, suffix] = legacyMatch;
+    const key = `${folder.toLowerCase()}/${stem}`;
+    if (CITY_GALLERY_STEM_SET.has(key)) {
+      const resolved = resolveCityAssetVariant(`/city/${folder}/${stem}.jpg`, {
+        mobile: true,
+        format: "webp",
+      });
+      return suffix ? `${resolved}${suffix}` : resolved;
+    }
+  }
+
+  return url;
+}
+
+/**
+ * 根据图片 URL 或路径查询城市图库署名；地点实拍图（poi-opt/）标地点名。
+ */
+export function getCityPhotoCredit(
+  urlOrPath: string | null | undefined,
+  options?: { city?: string; placeName?: string },
+): string {
+  if (!urlOrPath) {
+    return options?.placeName || options?.city || "";
+  }
+  if (urlOrPath === BUNDLED_FALLBACK_IMAGE || urlOrPath.startsWith("/bundled/")) {
+    return options?.placeName || (options?.city ? `${options.city} · 内置实景图` : "重庆 · 内置实景图");
+  }
+  if (urlOrPath.includes("/poi-opt/") && options?.placeName) {
+    return options.placeName;
+  }
+  const match = urlOrPath.match(
+    /\/city(?:-opt)?\/([a-z]+)\/([^/?#]+?)(?:\.mobile)?\.(?:webp|jpe?g|png)$/i,
+  );
+  if (match) {
+    const [, folder, stem] = match;
+    const key = `${folder.toLowerCase()}/${stem}`;
+    if (CITY_PHOTO_CREDITS[key]) {
+      return CITY_PHOTO_CREDITS[key];
+    }
+    const cityName = options?.city || FOLDER_TO_CITY_NAME[folder.toLowerCase()] || folder;
+    return `${cityName} · 实景图库`;
+  }
+  if (options?.placeName) {
+    return options.placeName;
+  }
+  if (options?.city) {
+    return `${options.city} · 实景图库`;
+  }
+  return "";
+}
+
+/**
+ * 获取某城市的 8 张高清实景图及完整署名
+ */
+export function getCityGalleryItems(
+  city: string,
+): Array<{ url: string; credit: string }> {
+  const cleanCity = city.trim().replace(/市$/, "");
+  const folder = CITY_NAME_TO_FOLDER[cleanCity] || CITY_NAME_TO_FOLDER[city];
+  if (usesBundledCityAssets()) {
+    const bundled = folder ? BUNDLED_CITY_IMAGES[folder] : undefined;
+    if (bundled?.length) {
+      return bundled.map((url) => ({
+        url,
+        credit: getCityPhotoCredit(url, { city: cleanCity }),
+      }));
+    }
+    return [];
+  }
+  if (folder && CITY_IMAGES[folder]?.length) {
+    return CITY_IMAGES[folder].map((img) => {
+      const url = resolveCityAssetVariant(`/city/${folder}/${img}`, {
+        format: "webp",
+      });
+      const credit = getCityPhotoCredit(url, { city: cleanCity });
+      return { url, credit };
+    });
+  }
+  return [];
+}
+
 
 

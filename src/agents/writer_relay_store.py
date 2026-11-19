@@ -24,40 +24,41 @@ from typing import Any, Literal
 from sqlalchemy import text
 
 from src.pipeline.db import get_session_factory
+from src.agents.model_failure_policy import LONG_FAILURE_CLASSES, cooldown_seconds
 
 logger = logging.getLogger(__name__)
 
+# v0.15: shuai is the only writer relay (src/model_routes.py). centos and
+# gateai are retired; their rows stay in the table as history.
 PARTICIPATING_ENDPOINTS = (
-    "centos",
     "shuai",
-    "gateai",
 )
 # Optional entries never become required configuration or auto-qualified traffic.
 OPTIONAL_ENDPOINT_POLICY: dict[str, tuple[str, int, int]] = {
     "zerocat": ("CANARY", 1, 1),
 }
 ALLOWED_ENDPOINTS = frozenset(PARTICIPATING_ENDPOINTS) | frozenset(OPTIONAL_ENDPOINT_POLICY)
-ACTIVE_ENDPOINTS = frozenset({"centos", "shuai"})
-CANARY_ENDPOINTS = frozenset({"gateai"})
-RETIRED_ENDPOINTS = frozenset({"venlacy", "aixoras"})
+ACTIVE_ENDPOINTS = frozenset({"shuai"})
+CANARY_ENDPOINTS: frozenset[str] = frozenset()
+RETIRED_ENDPOINTS = frozenset({"venlacy", "aixoras", "centos", "gateai"})
 OWNER_OVERRIDE_PROMOTION_ENDPOINTS = frozenset({"shuai"})
 FROZEN_ENDPOINT_POLICY: dict[str, tuple[str, int, int]] = {
     "aixoras": ("CANARY", 2, 2),
-    "centos": ("ACTIVE", 3, 3),
+    "centos": ("DISABLED", 0, 0),
     "shuai": ("ACTIVE", 3, 3),
     "kuaipao": ("DISABLED", 0, 0),
-    "gateai": ("CANARY", 2, 2),
+    "gateai": ("DISABLED", 0, 0),
     "venlacy": ("DISABLED", 0, 0),
     "keungliang": ("DISABLED", 0, 0),
     "4router": ("DISABLED", 0, 0),
 }
 TERMINAL_DISPATCH_STATES = frozenset({"SUCCEEDED", "FAILED", "OUTCOME_UNKNOWN"})
-COOLDOWN_SECONDS = (60, 120, 300)
+COOLDOWN_SECONDS = (120, 120, 120)
 TRANSIENT_FAILURE_THRESHOLD = 2
 TRANSIENT_FAILURE_CLASSES = frozenset(
     {"TRANSPORT", "TIMEOUT", "HTTP_5XX", "WIRE_INVALID"}
 )
-IMMEDIATE_OPEN_FAILURE_CLASSES = frozenset({"RATE_LIMIT"})
+IMMEDIATE_OPEN_FAILURE_CLASSES = frozenset({"RATE_LIMIT", "TRANSPORT", "TIMEOUT", "HTTP_5XX", "UNKNOWN", "POLICY_REJECTION"}) | LONG_FAILURE_CLASSES
 PENDING_POLICY_COMPENSATION_SECONDS = 180
 
 
@@ -292,17 +293,14 @@ class PostgresWriterRelayStore:
                             observation_count = endpoint.observation_count + counts.failure_count,
                             auth_policy_rejection_count =
                                 endpoint.auth_policy_rejection_count + counts.failure_count,
-                            circuit_state = 'QUARANTINED',
-                            qualification_state = 'UNQUALIFIED',
-                            probe_kind = NULL,
-                            probe_owner = NULL,
-                            probe_lease_expires_at = NULL,
-                            recovery_origin_circuit_state = NULL,
-                            active_operation_id = NULL,
-                            state_generation = CASE
-                                WHEN endpoint.circuit_state = 'HALF_OPEN'
-                                    THEN endpoint.state_generation + 1
-                                ELSE endpoint.state_generation
+                            circuit_state = CASE
+                                WHEN endpoint.circuit_state IN ('CLOSED', 'OPEN') THEN 'OPEN'
+                                ELSE endpoint.circuit_state
+                            END,
+                            cooldown_until = CASE
+                                WHEN endpoint.circuit_state IN ('CLOSED', 'OPEN')
+                                    THEN GREATEST(endpoint.cooldown_until, NOW() + INTERVAL '120 seconds')
+                                ELSE endpoint.cooldown_until
                             END,
                             updated_at = NOW()
                         FROM counts
@@ -316,38 +314,12 @@ class PostgresWriterRelayStore:
             .mappings()
             .all()
         )
-        compensated = [str(row["endpoint_name"]) for row in rows]
         for row in rows:
             logger.warning(
                 "writer_relay_pending_policy_compensated endpoint=%s count=%s",
                 row["endpoint_name"],
                 row["failure_count"],
             )
-        if compensated:
-            pending_ops = list(
-                (
-                    await session.execute(
-                        text(
-                            """
-                            SELECT operation_id
-                            FROM travel_llm_endpoint_recovery_operation
-                            WHERE role = 'writer'
-                              AND endpoint_name = ANY(:names)
-                              AND lifecycle = 'PENDING'
-                            FOR UPDATE
-                            """
-                        ),
-                        {"names": compensated},
-                    )
-                ).mappings()
-            )
-            for item in pending_ops:
-                await self._complete_recovery_operation(
-                    session,
-                    uuid.UUID(str(item["operation_id"])),
-                    lifecycle="FAILED",
-                    error_code="LLM_ENDPOINT_NOT_RECOVERABLE",
-                )
 
     async def _reap_expired(self, session) -> None:
         expired = list(
@@ -361,6 +333,7 @@ class PostgresWriterRelayStore:
                                 ELSE 'FAILED'
                             END,
                             safe_failure_class = CASE
+                                WHEN safe_failure_class = 'STANDBY_READY' THEN 'STANDBY_READY'
                                 WHEN state = 'DISPATCHED' THEN COALESCE(
                                     safe_failure_class, 'PROCESS_LOSS'
                                 )
@@ -369,7 +342,7 @@ class PostgresWriterRelayStore:
                             finished_at = NOW(), updated_at = NOW()
                         WHERE state IN ('CLAIMED', 'DISPATCHED')
                           AND lease_expires_at <= NOW()
-                        RETURNING endpoint_name, half_open_trial
+                        RETURNING endpoint_name, half_open_trial, safe_failure_class
                         """
                     )
                 )
@@ -380,6 +353,7 @@ class PostgresWriterRelayStore:
                 str(row["endpoint_name"])
                 for row in expired
                 if bool(row["half_open_trial"])
+                and row["safe_failure_class"] != "STANDBY_READY"
             }
         )
         if half_open_endpoints:
@@ -405,9 +379,9 @@ class PostgresWriterRelayStore:
                                 THEN cooldown_until
                             ELSE NOW() + make_interval(
                                 secs => CASE cooldown_level
-                                    WHEN 0 THEN 60
+                                    WHEN 0 THEN 120
                                     WHEN 1 THEN 120
-                                    ELSE 300
+                                    ELSE 120
                                 END
                             )
                         END,
@@ -439,6 +413,36 @@ class PostgresWriterRelayStore:
                 "writer_relay_half_open_lease_expired endpoints=%s",
                 ",".join(half_open_endpoints),
             )
+        # Older versions could finish a policy-rejected dispatch before
+        # releasing its automatic probe. Recover only an expired orphan;
+        # a new lease or any live dispatch remains authoritative.
+        await session.execute(
+            text("""
+                UPDATE travel_relay_endpoint_state AS endpoint
+                SET circuit_state = 'OPEN',
+                    cooldown_until = GREATEST(cooldown_until, NOW() + INTERVAL '120 seconds'),
+                    consecutive_transient_failures = GREATEST(consecutive_transient_failures, :threshold),
+                    cooldown_level = LEAST(2, cooldown_level + 1),
+                    probe_kind = NULL, probe_owner = NULL,
+                    probe_lease_expires_at = NULL,
+                    recovery_origin_circuit_state = NULL,
+                    state_generation = state_generation + 1,
+                    updated_at = NOW()
+                WHERE circuit_state = 'HALF_OPEN' AND probe_kind = 'automatic'
+                  AND probe_lease_expires_at <= NOW()
+                  AND recovery_origin_circuit_state = 'OPEN'
+                  AND participation IN ('ACTIVE', 'CANARY')
+                  AND configuration_fingerprint <> ''
+                  AND active_operation_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM travel_writer_dispatch AS dispatch
+                      WHERE dispatch.endpoint_name = endpoint.endpoint_name
+                        AND dispatch.state IN ('CLAIMED', 'DISPATCHED')
+                        AND dispatch.lease_expires_at > NOW()
+                  )
+            """),
+            {"threshold": TRANSIENT_FAILURE_THRESHOLD},
+        )
         stale_manual_probes = list(
             (
                 await session.execute(
@@ -467,9 +471,9 @@ class PostgresWriterRelayStore:
                                 ),
                                 cooldown_until = NOW() + make_interval(
                                     secs => CASE cooldown_level
-                                        WHEN 0 THEN 60
+                                        WHEN 0 THEN 120
                                         WHEN 1 THEN 120
-                                        ELSE 300
+                                        ELSE 120
                                     END
                                 ),
                                 cooldown_level = LEAST(2, cooldown_level + 1),
@@ -477,9 +481,9 @@ class PostgresWriterRelayStore:
                                     WHEN probe_kind = 'manual'
                                         THEN NOW() + make_interval(
                                             secs => CASE manual_retry_level
-                                                WHEN 0 THEN 60
+                                                WHEN 0 THEN 120
                                                 WHEN 1 THEN 120
-                                                ELSE 300
+                                                ELSE 120
                                             END
                                         )
                                     ELSE manual_retry_not_before
@@ -654,7 +658,7 @@ class PostgresWriterRelayStore:
                     return False
                 if participation not in admitted_participation:
                     return False
-                if str(row["qualification_state"]) != "QUALIFIED":
+                if str(row["qualification_state"]) != "QUALIFIED" and str(row["circuit_state"]) != "OPEN":
                     return False
                 if int(row["pending_policy_count"]) > 0:
                     return False
@@ -686,6 +690,7 @@ class PostgresWriterRelayStore:
                     and inflight.get(str(row["endpoint_name"]), 0) == 0
                 ]
 
+            dispatch_id = uuid.uuid4()
             half_open_trial = bool(recovery_candidates)
             if half_open_trial:
                 minimum_time = datetime.min.replace(tzinfo=timezone.utc)
@@ -702,7 +707,7 @@ class PostgresWriterRelayStore:
 
                 selected = sorted(recovery_candidates, key=recovery_order)[0]
                 selected_name = str(selected["endpoint_name"])
-                probe_owner = str(uuid.uuid4())
+                probe_owner = str(dispatch_id)
                 await session.execute(
                     text(
                         """
@@ -790,7 +795,6 @@ class PostgresWriterRelayStore:
                             ),
                         },
                     )
-            dispatch_id = uuid.uuid4()
             await session.execute(
                 text(
                     """
@@ -867,6 +871,7 @@ class PostgresWriterRelayStore:
                         SET state = 'SUCCEEDED', finished_at = NOW(),
                             latency_ms = :latency_ms, updated_at = NOW()
                         WHERE dispatch_id = :dispatch_id AND state = 'DISPATCHED'
+                          AND safe_failure_class IS DISTINCT FROM 'STANDBY_READY'
                         RETURNING endpoint_name, half_open_trial
                         """
                         ),
@@ -891,6 +896,10 @@ class PostgresWriterRelayStore:
                                      AND circuit_state = 'HALF_OPEN'
                                     THEN 'CLOSED'
                                 ELSE circuit_state
+                            END,
+                            qualification_state = CASE
+                                WHEN :half_open_trial AND circuit_state = 'HALF_OPEN' THEN 'QUALIFIED'
+                                ELSE qualification_state
                             END,
                             cooldown_level = CASE
                                 WHEN :half_open_trial THEN 0
@@ -936,6 +945,39 @@ class PostgresWriterRelayStore:
                         "writer_relay_half_open_succeeded endpoint=%s",
                         row["endpoint_name"],
                     )
+
+    async def cancel_for_standby(
+        self, dispatch_id: uuid.UUID, *, release_capacity: bool = False,
+    ) -> None:
+        """Record intentional cancellation before slow connection/store cleanup.
+
+        An unconfirmed close keeps capacity leased. It is never a health failure;
+        the original automatic probe is returned without extending its cooldown.
+        The unique probe owner fences later generations and manual recoveries.
+        """
+        async with self._session_factory() as session, session.begin():
+            row = (await session.execute(text("""
+                UPDATE travel_writer_dispatch
+                SET state = CASE WHEN :release_capacity THEN 'OUTCOME_UNKNOWN' ELSE state END,
+                    safe_failure_class = 'STANDBY_READY',
+                    finished_at = CASE WHEN :release_capacity THEN NOW() ELSE finished_at END,
+                    updated_at = NOW()
+                WHERE dispatch_id = :dispatch_id
+                  AND state IN ('CLAIMED', 'DISPATCHED')
+                  AND (safe_failure_class IS NULL OR safe_failure_class = 'STANDBY_READY')
+                RETURNING endpoint_name, half_open_trial
+                """), {"dispatch_id": dispatch_id, "release_capacity": release_capacity})).mappings().first()
+            if row is not None and bool(row["half_open_trial"]):
+                await session.execute(text("""
+                    UPDATE travel_relay_endpoint_state
+                    SET circuit_state = COALESCE(recovery_origin_circuit_state, 'OPEN'),
+                        probe_kind = NULL, probe_owner = NULL, probe_lease_expires_at = NULL,
+                        recovery_origin_circuit_state = NULL, active_operation_id = NULL,
+                        state_generation = state_generation + 1, updated_at = NOW()
+                    WHERE endpoint_name = :name AND circuit_state = 'HALF_OPEN'
+                      AND probe_kind = 'automatic' AND probe_owner = :owner
+                      AND active_operation_id IS NULL
+                    """), {"name": row["endpoint_name"], "owner": str(dispatch_id)})
 
     async def complete_failure(
         self,
@@ -983,6 +1025,7 @@ class PostgresWriterRelayStore:
                             updated_at = NOW()
                         WHERE dispatch_id = :dispatch_id
                           AND state IN ('CLAIMED', 'DISPATCHED')
+                          AND safe_failure_class IS DISTINCT FROM 'STANDBY_READY'
                           AND (
                               :release_capacity
                               OR (
@@ -1010,6 +1053,25 @@ class PostgresWriterRelayStore:
                 return False
             name = str(row["endpoint_name"])
             if failure_class == "POLICY_REJECTION" and failure_signature:
+                if bool(row["half_open_trial"]):
+                    # End this automatic trial now. Deferred policy accounting
+                    # must not strand a finished dispatch in HALF_OPEN.
+                    await session.execute(
+                        text("""
+                            UPDATE travel_relay_endpoint_state
+                            SET circuit_state = 'OPEN',
+                                cooldown_until = GREATEST(cooldown_until, NOW() + INTERVAL '120 seconds'),
+                                probe_kind = NULL, probe_owner = NULL,
+                                probe_lease_expires_at = NULL,
+                                recovery_origin_circuit_state = NULL,
+                                active_operation_id = NULL,
+                                state_generation = state_generation + 1,
+                                updated_at = NOW()
+                            WHERE endpoint_name = :name AND circuit_state = 'HALF_OPEN'
+                              AND probe_kind = 'automatic' AND probe_owner = :owner
+                        """),
+                        {"name": name, "owner": str(dispatch_id)},
+                    )
                 await session.execute(
                     text(
                         """
@@ -1071,7 +1133,7 @@ class PostgresWriterRelayStore:
                             END,
                             cooldown_until = CASE
                                 WHEN circuit_state = 'HALF_OPEN'
-                                    THEN NOW() + INTERVAL '60 seconds'
+                                    THEN NOW() + INTERVAL '120 seconds'
                                 ELSE cooldown_until
                             END,
                             probe_kind = CASE
@@ -1131,7 +1193,7 @@ class PostgresWriterRelayStore:
             half_open_trial = bool(row["half_open_trial"])
             counted_transient = failure_class in TRANSIENT_FAILURE_CLASSES
             immediate_open = failure_class in IMMEDIATE_OPEN_FAILURE_CLASSES
-            quarantine = failure_class in {"AUTH", "POLICY_REJECTION"}
+            quarantine = False  # W6 runtime failures expire; config/qualification quarantines remain separate.
             if counted_transient or immediate_open:
                 transient_count += 1
             else:
@@ -1149,9 +1211,7 @@ class PostgresWriterRelayStore:
                 )
                 or (failure_class == "OUTPUT_CONTRACT" and invalid_count >= 3)
             )
-            cooldown_seconds = COOLDOWN_SECONDS[min(cooldown_level, 2)]
-            if retry_after_seconds is not None:
-                cooldown_seconds = max(cooldown_seconds, int(retry_after_seconds))
+            failure_cooldown = cooldown_seconds(failure_class, retry_after_seconds)
             await session.execute(
                 text(
                     """
@@ -1174,7 +1234,7 @@ class PostgresWriterRelayStore:
                         END,
                         cooldown_until = CASE
                             WHEN :open_circuit
-                                THEN NOW() + make_interval(secs => :cooldown_seconds)
+                                THEN GREATEST(cooldown_until, NOW() + make_interval(secs => :cooldown_seconds))
                             ELSE cooldown_until
                         END,
                         cooldown_level = CASE
@@ -1211,12 +1271,12 @@ class PostgresWriterRelayStore:
                     "name": name,
                     "transport_success_inc": 1 if transport_succeeded else 0,
                     "timeout_inc": 1 if failure_class == "TIMEOUT" else 0,
-                    "auth_inc": 1 if quarantine else 0,
+                    "auth_inc": 1 if failure_class in LONG_FAILURE_CLASSES else 0,
                     "invalid_count": invalid_count,
                     "transient_count": transient_count,
                     "quarantine": quarantine,
                     "open_circuit": open_circuit,
-                    "cooldown_seconds": cooldown_seconds,
+                    "cooldown_seconds": failure_cooldown,
                     "half_open_trial": half_open_trial,
                 },
             )
@@ -1234,14 +1294,14 @@ class PostgresWriterRelayStore:
                     prior_circuit,
                     next_circuit,
                     failure_class,
-                    cooldown_seconds if open_circuit else 0,
+                    failure_cooldown if open_circuit else 0,
                 )
             if half_open_trial:
                 logger.warning(
                     "writer_relay_half_open_failed endpoint=%s class=%s cooldown_seconds=%s",
                     name,
                     failure_class,
-                    cooldown_seconds,
+                    failure_cooldown,
                 )
             return False
 
@@ -1277,8 +1337,9 @@ class PostgresWriterRelayStore:
                     SET observation_count = observation_count + 1,
                         auth_policy_rejection_count = auth_policy_rejection_count + 1,
                         pending_policy_count = GREATEST(0, pending_policy_count - 1),
-                        circuit_state = 'QUARANTINED',
-                        qualification_state = 'UNQUALIFIED',
+                        circuit_state = CASE WHEN circuit_state IN ('CLOSED', 'OPEN') THEN 'OPEN' ELSE circuit_state END,
+                        cooldown_until = CASE WHEN circuit_state IN ('CLOSED', 'OPEN')
+                            THEN GREATEST(cooldown_until, NOW() + INTERVAL '120 seconds') ELSE cooldown_until END,
                         updated_at = NOW()
                     WHERE endpoint_name = :name
                     """
@@ -1286,7 +1347,7 @@ class PostgresWriterRelayStore:
                 {"name": name},
             )
             logger.warning(
-                "writer_relay_circuit_transition endpoint=%s to=QUARANTINED class=POLICY_REJECTION",
+                "writer_relay_circuit_transition endpoint=%s to=OPEN class=POLICY_REJECTION",
                 name,
             )
 
@@ -1508,9 +1569,9 @@ class PostgresWriterRelayStore:
                             WHEN :success THEN NULL
                             ELSE NOW() + make_interval(
                                 secs => CASE cooldown_level
-                                    WHEN 0 THEN 60
+                                    WHEN 0 THEN 120
                                     WHEN 1 THEN 120
-                                    ELSE 300
+                                    ELSE 120
                                 END
                             )
                         END,
@@ -2101,13 +2162,13 @@ class PostgresWriterRelayStore:
                 )
                 result = RecoverSuccess(finished)
             else:
-                quarantine = str(failure_class or "") in {"AUTH", "POLICY_REJECTION"}
+                quarantine = False
                 timeout = str(failure_class or "") == "TIMEOUT"
                 origin = str(row["recovery_origin_circuit_state"] or "OPEN")
                 target = (
                     "QUARANTINED"
-                    if quarantine or origin == "QUARANTINED"
-                    else origin
+                    if (quarantine or origin == "QUARANTINED") and failure_class not in LONG_FAILURE_CLASSES
+                    else "OPEN"
                 )
                 await session.execute(
                     text(
@@ -2123,19 +2184,11 @@ class PostgresWriterRelayStore:
                                 consecutive_transient_failures, :threshold
                             ),
                             cooldown_until = NOW() + make_interval(
-                                secs => CASE cooldown_level
-                                    WHEN 0 THEN 60
-                                    WHEN 1 THEN 120
-                                    ELSE 300
-                                END
+                                secs => :failure_cooldown
                             ),
                             cooldown_level = LEAST(2, cooldown_level + 1),
                             manual_retry_not_before = NOW() + make_interval(
-                                secs => CASE manual_retry_level
-                                    WHEN 0 THEN 60
-                                    WHEN 1 THEN 120
-                                    ELSE 300
-                                END
+                                secs => :failure_cooldown
                             ),
                             manual_retry_level = LEAST(2, manual_retry_level + 1),
                             probe_kind = NULL,
@@ -2153,6 +2206,7 @@ class PostgresWriterRelayStore:
                         "name": name,
                         "target": target,
                         "threshold": TRANSIENT_FAILURE_THRESHOLD,
+                        "failure_cooldown": cooldown_seconds(failure_class),
                         "generation": generation,
                     },
                 )
@@ -2273,6 +2327,7 @@ class _MemoryDispatch:
     failure_signature: str | None = None
     failure_class: str | None = None
     half_open_trial: bool = False
+    pending_policy_at: datetime | None = None
 
 
 class InMemoryWriterRelayStore:
@@ -2332,6 +2387,19 @@ class InMemoryWriterRelayStore:
     def _reap(self, now: datetime) -> None:
         for dispatch in self.dispatches.values():
             if (
+                dispatch.failure_class == 'POLICY_REJECTION'
+                and dispatch.pending_policy_at is not None
+                and dispatch.pending_policy_at <= now - timedelta(seconds=PENDING_POLICY_COMPENSATION_SECONDS)
+            ):
+                dispatch.failure_class = 'POLICY_REJECTION_APPLIED'
+                endpoint = self.endpoints[dispatch.endpoint]
+                endpoint.pending_policy = max(0, endpoint.pending_policy - 1)
+                endpoint.observations += 1
+                endpoint.auth_policy += 1
+                if endpoint.circuit in {'CLOSED', 'OPEN'}:
+                    endpoint.circuit = 'OPEN'
+                    endpoint.cooldown_until = max(endpoint.cooldown_until or now, now + timedelta(seconds=120))
+            if (
                 dispatch.state in {"CLAIMED", "DISPATCHED"}
                 and dispatch.lease_expires_at <= now
             ):
@@ -2341,8 +2409,9 @@ class InMemoryWriterRelayStore:
                         dispatch.failure_class = "PROCESS_LOSS"
                 else:
                     dispatch.state = "FAILED"
-                    dispatch.failure_class = "CLAIM_EXPIRED"
-                if dispatch.half_open_trial:
+                    if dispatch.failure_class != "STANDBY_READY":
+                        dispatch.failure_class = "CLAIM_EXPIRED"
+                if dispatch.half_open_trial and dispatch.failure_class != "STANDBY_READY":
                     endpoint = self.endpoints[dispatch.endpoint]
                     if endpoint.circuit == "HALF_OPEN":
                         origin = endpoint.recovery_origin or "OPEN"
@@ -2365,12 +2434,20 @@ class InMemoryWriterRelayStore:
                         endpoint.recovery_origin = None
                         endpoint.active_operation_id = None
                         endpoint.generation += 1
-        for endpoint in self.endpoints.values():
+        for name, endpoint in self.endpoints.items():
             if (
                 endpoint.circuit == "HALF_OPEN"
                 and endpoint.probe_until is not None
                 and endpoint.probe_until <= now
             ):
+                if endpoint.probe_kind == "automatic" and (
+                    endpoint.participation not in {"ACTIVE", "CANARY"}
+                    or not endpoint.fingerprint
+                    or endpoint.recovery_origin != "OPEN"
+                    or endpoint.active_operation_id is not None
+                    or self._inflight(name, now) > 0
+                ):
+                    continue
                 origin = endpoint.recovery_origin or "OPEN"
                 is_manual = endpoint.probe_kind == "manual"
                 operation_id = endpoint.active_operation_id
@@ -2450,7 +2527,7 @@ class InMemoryWriterRelayStore:
                 if endpoint.participation not in admitted_participation:
                     return False
                 if (
-                    endpoint.qualification != "QUALIFIED"
+                    (endpoint.qualification != "QUALIFIED" and endpoint.circuit != "OPEN")
                     or endpoint.pending_policy > 0
                 ):
                     return False
@@ -2475,6 +2552,7 @@ class InMemoryWriterRelayStore:
                     )
                     and self._inflight(name, now) == 0
                 ]
+            dispatch_id = uuid.uuid4()
             half_open_trial = bool(recovery_candidates)
             if half_open_trial:
                 name, endpoint = sorted(
@@ -2492,7 +2570,7 @@ class InMemoryWriterRelayStore:
                 )[0]
                 endpoint.circuit = "HALF_OPEN"
                 endpoint.probe_kind = "automatic"
-                endpoint.probe_owner = str(uuid.uuid4())
+                endpoint.probe_owner = str(dispatch_id)
                 endpoint.probe_until = now + timedelta(
                     seconds=float(kwargs["lease_seconds"])
                 )
@@ -2531,7 +2609,6 @@ class InMemoryWriterRelayStore:
                     )
                     endpoint.current -= total
             endpoint.selected += 1
-            dispatch_id = uuid.uuid4()
             dispatch = _MemoryDispatch(
                 dispatch_id,
                 logical_call_id,
@@ -2565,7 +2642,7 @@ class InMemoryWriterRelayStore:
         del latency_ms
         async with self._lock:
             dispatch = self.dispatches[dispatch_id]
-            if dispatch.state == "DISPATCHED":
+            if dispatch.state == "DISPATCHED" and dispatch.failure_class != "STANDBY_READY":
                 dispatch.state = "SUCCEEDED"
                 endpoint = self.endpoints[dispatch.endpoint]
                 endpoint.observations += 1
@@ -2575,6 +2652,7 @@ class InMemoryWriterRelayStore:
                 endpoint.transient_failures = 0
                 if dispatch.half_open_trial and endpoint.circuit == "HALF_OPEN":
                     endpoint.circuit = "CLOSED"
+                    endpoint.qualification = "QUALIFIED"
                     endpoint.cooldown_level = 0
                     endpoint.cooldown_until = None
                     endpoint.probe_owner = None
@@ -2584,10 +2662,36 @@ class InMemoryWriterRelayStore:
                     endpoint.active_operation_id = None
                     endpoint.generation += 1
 
-    async def complete_failure(self, dispatch_id: uuid.UUID, **kwargs) -> bool:
+    async def cancel_for_standby(
+        self, dispatch_id: uuid.UUID, *, release_capacity: bool = False,
+    ) -> None:
         async with self._lock:
             dispatch = self.dispatches[dispatch_id]
             if dispatch.state not in {"CLAIMED", "DISPATCHED"}:
+                return
+            if dispatch.failure_class not in {None, "STANDBY_READY"}:
+                return
+            dispatch.failure_class = "STANDBY_READY"
+            if release_capacity:
+                dispatch.state = "OUTCOME_UNKNOWN"
+            endpoint = self.endpoints[dispatch.endpoint]
+            if (dispatch.half_open_trial and endpoint.circuit == "HALF_OPEN"
+                    and endpoint.probe_kind == "automatic"
+                    and endpoint.probe_owner == str(dispatch_id)
+                    and endpoint.active_operation_id is None):
+                endpoint.circuit = endpoint.recovery_origin or "OPEN"
+                endpoint.probe_owner = None
+                endpoint.probe_until = None
+                endpoint.probe_kind = None
+                endpoint.recovery_origin = None
+                endpoint.generation += 1
+                endpoint.updated_at = _utcnow()
+
+    async def complete_failure(self, dispatch_id: uuid.UUID, **kwargs) -> bool:
+        async with self._lock:
+            dispatch = self.dispatches[dispatch_id]
+            if (dispatch.state not in {"CLAIMED", "DISPATCHED"}
+                    or dispatch.failure_class == "STANDBY_READY"):
                 return False
             release_capacity = bool(kwargs.get("release_capacity", True))
             failure_class = kwargs["failure_class"]
@@ -2605,9 +2709,20 @@ class InMemoryWriterRelayStore:
                 dispatch.state = "FAILED"
             dispatch.failure_signature = kwargs.get("failure_signature")
             dispatch.failure_class = failure_class
+            if failure_class == "POLICY_REJECTION":
+                dispatch.pending_policy_at = _utcnow()
             signature = dispatch.failure_signature
             if failure_class == "POLICY_REJECTION" and signature:
                 endpoint = self.endpoints[dispatch.endpoint]
+                if dispatch.half_open_trial and endpoint.circuit == "HALF_OPEN" and endpoint.probe_kind == "automatic" and endpoint.probe_owner == str(dispatch_id):
+                    endpoint.circuit = "OPEN"
+                    endpoint.cooldown_until = max(endpoint.cooldown_until or _utcnow(), _utcnow() + timedelta(seconds=120))
+                    endpoint.probe_kind = None
+                    endpoint.probe_owner = None
+                    endpoint.probe_until = None
+                    endpoint.recovery_origin = None
+                    endpoint.active_operation_id = None
+                    endpoint.generation += 1
                 endpoint.pending_policy += 1
                 shared = {
                     item.endpoint
@@ -2644,10 +2759,8 @@ class InMemoryWriterRelayStore:
                 endpoint.invalid += 1
             else:
                 endpoint.invalid = 0
-            if failure_class in {"AUTH", "POLICY_REJECTION"}:
+            if failure_class in LONG_FAILURE_CLASSES:
                 endpoint.auth_policy += 1
-                endpoint.circuit = "QUARANTINED"
-                endpoint.qualification = "UNQUALIFIED"
             counted_transient = failure_class in TRANSIENT_FAILURE_CLASSES
             immediate_open = failure_class in IMMEDIATE_OPEN_FAILURE_CLASSES
             if counted_transient or immediate_open:
@@ -2670,12 +2783,9 @@ class InMemoryWriterRelayStore:
             if open_circuit and endpoint.circuit != "QUARANTINED":
                 origin = endpoint.recovery_origin or "OPEN"
                 endpoint.circuit = origin if origin == "QUARANTINED" else "OPEN"
-                endpoint.cooldown_until = _utcnow() + timedelta(
-                    seconds=max(
-                        COOLDOWN_SECONDS[min(endpoint.cooldown_level, 2)],
-                        int(kwargs.get("retry_after_seconds") or 0),
-                    )
-                )
+                endpoint.cooldown_until = max(endpoint.cooldown_until or _utcnow(), _utcnow() + timedelta(
+                    seconds=cooldown_seconds(failure_class, kwargs.get("retry_after_seconds"))
+                ))
                 endpoint.cooldown_level = min(2, endpoint.cooldown_level + 1)
             if dispatch.half_open_trial:
                 endpoint.probe_owner = None
@@ -2698,8 +2808,9 @@ class InMemoryWriterRelayStore:
             endpoint.pending_policy = max(0, endpoint.pending_policy - 1)
             endpoint.observations += 1
             endpoint.auth_policy += 1
-            endpoint.circuit = "QUARANTINED"
-            endpoint.qualification = "UNQUALIFIED"
+            if endpoint.circuit in {"CLOSED", "OPEN"}:
+                endpoint.circuit = "OPEN"
+                endpoint.cooldown_until = max(endpoint.cooldown_until or _utcnow(), _utcnow() + timedelta(seconds=120))
 
     async def claim_probe(
         self,
@@ -3013,21 +3124,21 @@ class InMemoryWriterRelayStore:
                 }
                 return RecoverSuccess(finished)
             origin = endpoint.recovery_origin or "OPEN"
-            quarantine = str(failure_class or "") in {"AUTH", "POLICY_REJECTION"}
-            if quarantine or origin == "QUARANTINED":
+            quarantine = False
+            if (quarantine or origin == "QUARANTINED") and failure_class not in LONG_FAILURE_CLASSES:
                 endpoint.circuit = "QUARANTINED"
                 endpoint.qualification = "UNQUALIFIED"
             else:
-                endpoint.circuit = origin
+                endpoint.circuit = "OPEN"
             endpoint.transient_failures = max(
                 endpoint.transient_failures, TRANSIENT_FAILURE_THRESHOLD
             )
             endpoint.cooldown_until = now + timedelta(
-                seconds=COOLDOWN_SECONDS[min(endpoint.cooldown_level, 2)]
+                seconds=cooldown_seconds(failure_class)
             )
             endpoint.cooldown_level = min(2, endpoint.cooldown_level + 1)
             endpoint.manual_retry_not_before = now + timedelta(
-                seconds=COOLDOWN_SECONDS[min(endpoint.manual_retry_level, 2)]
+                seconds=cooldown_seconds(failure_class)
             )
             endpoint.manual_retry_level = min(2, endpoint.manual_retry_level + 1)
             endpoint.probe_kind = None

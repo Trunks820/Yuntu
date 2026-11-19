@@ -101,7 +101,7 @@
   > **为什么首页目前只显示重庆？**
   > 本开源仓库的核心是展示**生产级 AI 旅行规划引擎的架构与全链路实现**（确定性排程 + 空间算法 + 真实 POI 事实约束）。为降低本地自建与部署门槛，本仓库种子数据库当前**仅内置了【重庆】全套 27+ 核心经过验证的地点与经纬度数据**。
   > 
-  > 为避免用户因缺少其他城市 POI 数据库而导致规划失败，**首页（山河地图与经典胶囊模式）默认聚焦并仅展示重庆**。如需扩展其他城市（如成都、西安、北京、上海等），只需向本地数据库 `travel_canonical_place` 导入对应城市的真实地点，并在 `src/api/destinations.py` 中启用对应城市即可。如需体验 16+ 热门名城完整在线服务，可访问官方线上体验站 [kakarot8.com](https://kakarot8.com)。
+  > 为避免用户因缺少其他城市 POI 数据库而导致规划失败，**前端首页（桌面旅行册 Spread 与移动端探索流）默认聚焦并仅展示重庆**。如需扩展其他城市（如成都、西安、北京、上海等），只需向本地数据库 `travel_canonical_place` 导入对应城市的真实地点，并在 `src/api/destinations.py` 中启用对应城市即可。如需体验 16+ 热门名城完整在线服务，可访问官方线上体验站 [kakarot8.com](https://kakarot8.com)。
 - **安全提醒**：`docker-compose.yml` 里的 `yuntu` / `yuntupassword` 是本地演示口令，生产环境请务必修改。
 
 ---
@@ -145,22 +145,19 @@ Yuntu 支持主流大模型（Google Gemini、DeepSeek、OpenAI 及任何 OpenAI
 # 数据库连接（本地演示账号，请改成你自己的）
 DATABASE_URL=postgresql+asyncpg://yuntu:yuntupassword@localhost:5432/yuntu_travel
 
-# 方式 A：使用 Google Gemini
-GEMINI_API_KEY=your_gemini_api_key
+# 方式 A：单 Key 快速启动（DeepSeek 官网或兼容网关）
+DEEPSEEK_API_KEY=your_deepseek_api_key
 
-# 方式 B：使用 DeepSeek（意图 / 分组 / 写作 / 审核都可共用一把 Key）
-# INTENT_PROVIDER=deepseek
-# INTENT_MODEL=deepseek-chat
-# INTENT_API_KEY=your_deepseek_key
-# GROUPING_PROVIDER=deepseek
-# GROUPING_MODEL=deepseek-chat
-# GROUPING_API_KEY=your_deepseek_key
+# 方式 B：使用 Google Gemini
+# GEMINI_API_KEY=your_gemini_api_key
+
+# 方式 C：按角色混用不同模型 / 网关（可选）
+# ROUTE_PLANNER_PROVIDER=gemini
+# ROUTE_PLANNER_MODEL=gemini-2.5-flash
+# ROUTE_PLANNER_API_KEY=your_gemini_key
 # WRITER_PROVIDER=deepseek
 # WRITER_MODEL=deepseek-chat
 # WRITER_API_KEY=your_deepseek_key
-# REVIEW_PROVIDER=deepseek
-# REVIEW_MODEL=deepseek-chat
-# REVIEW_API_KEY=your_deepseek_key
 
 # 地理与路线服务 (高德 Web 服务 Key)
 AMAP_API_KEY=your_amap_api_key
@@ -186,7 +183,7 @@ AMAP_ROUTE_ENABLED=true
 ```text
 Yuntu/
 ├── web/                     # 🎨 现代前端界面 (React 18 + TailwindCSS + Vite + Lucide)
-│   ├── src/                 # 胶囊表单、进度时间轴、折叠分日阅读流、行前准备、高德地图路线可视化、海报导出
+│   ├── src/                 # 桌面旅行册（Spread）四步启程 / 装订等待 / 双页路书 / 浏览器本地我的行程 + 经典胶囊与山河地图入口
 │   └── Dockerfile           # 前端 Nginx 容器化镜像
 ├── src/                     # ⚙️ 核心规划引擎与 API
 │   ├── agents/              # 意图理解、地点召回、排程与路线可行性、行前准备、文案生成、发布门禁

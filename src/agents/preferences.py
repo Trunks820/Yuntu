@@ -649,7 +649,10 @@ def route_preference_snapshot(route, request) -> str:
     import hashlib
     import json
     payload = {"request": request.model_dump(mode="json"),
-        "route": route.model_dump(mode="json", exclude={"preference_coverage", "membership_ledger"})}
+        "route": route.model_dump(mode="json", exclude={
+            "preference_coverage": True, "membership_ledger": True,
+            # v0.15.1 stored clock: derived from the route, not a new condition.
+            "day_groups": {"__all__": {"timeline"}}})}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
         separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -765,5 +768,3 @@ def route_preference_contributions(route, request, dimensions):
                     minutes = min(minutes, max(0, interval[1] - interval[0])) if interval else 0
                 totals[dim] += max(0, minutes)
     return totals
-
-

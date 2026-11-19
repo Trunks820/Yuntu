@@ -19,9 +19,11 @@ from typing import Protocol
 
 import httpx
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from src.config import get_settings
 from src.pipeline.db import get_session_factory
+from src.pipeline.place_merge import lock_identity, lock_places, merge_source_places, group_snapshot, planner_visible
 
 logger = logging.getLogger(__name__)
 # Amap requires the API key in the query string. Keep httpx request logging
@@ -42,6 +44,10 @@ class AmapTransientError(RuntimeError):
 
 class AmapDefinitiveNotFound(RuntimeError):
     """Raised when Amap definitively returns no result."""
+
+
+class AmapQuotaError(RuntimeError):
+    """Quota exhaustion stops dispatch without resolution persistence."""
 
 
 @dataclass(frozen=True)
@@ -279,6 +285,8 @@ class AmapClient:
             raise AmapTransientError(str(exc)) from exc
 
         payload = response.json()
+        if str(payload.get("infocode") or "") in {"10003", "10044"}:
+            raise AmapQuotaError(f"Amap quota exhausted ({payload['infocode']})")
         if payload.get("status") != "1":
             info = payload.get("info") or "Amap API failed"
             infocode = str(payload.get("infocode") or "")
@@ -607,6 +615,8 @@ async def fetch_place_resolution_targets(
             SELECT p.id, p.city, p.name, COALESCE(p.poi_resolution_attempts, 0) AS attempts
             FROM travel_place AS p
             WHERE p.city = :city
+              AND p.merged_into_place_id IS NULL
+              AND p.poi_resolution_status IS DISTINCT FROM 'resolved'
               {where_status}
             ORDER BY p.updated_time ASC, p.id ASC
             LIMIT :limit
@@ -649,6 +659,8 @@ async def fetch_summary_backfill_targets(
             FROM travel_place_summary AS s
             JOIN travel_place AS p ON p.id = s.place_id
             WHERE s.city = :city
+              AND p.merged_into_place_id IS NULL
+              AND p.poi_resolution_status IS DISTINCT FROM 'resolved'
               {where_status}
             ORDER BY s.recommend_score DESC, p.id ASC
             LIMIT :limit
@@ -667,83 +679,129 @@ async def fetch_summary_backfill_targets(
     ]
 
 
-async def save_place_resolution(
+async def _save_place_resolution(session,
     *,
     target: PlaceResolutionTarget,
     resolution: PoiResolution,
     attempts: int,
 ) -> None:
-    factory = get_session_factory()
     resolved_at = datetime.now(timezone.utc) if resolution.status == "resolved" else None
-    async with factory() as session:
-        await session.execute(text("""
-            UPDATE travel_place
-            SET address = COALESCE(:address, address),
-                longitude = :longitude,
-                latitude = :latitude,
-                amap_poi_id = :amap_poi_id,
-                adcode = :adcode,
-                place_type_resolved = :place_type_resolved,
-                poi_resolution_status = :status,
-                poi_resolution_attempts = :attempts,
-                poi_resolution_last_error = :last_error,
-                poi_alternatives_count = :alternatives_count,
-                poi_resolved_at = :resolved_at,
-                updated_time = NOW()
-            WHERE id = :place_id
-        """), {
-            "place_id": target.place_id,
-            "address": resolution.address,
-            "longitude": resolution.longitude,
-            "latitude": resolution.latitude,
-            "amap_poi_id": resolution.amap_poi_id,
-            "adcode": resolution.adcode,
-            "place_type_resolved": resolution.place_type_resolved,
-            "status": None if resolution.status == "pending" else resolution.status,
-            "attempts": attempts,
-            "last_error": resolution.last_error,
-            "alternatives_count": resolution.alternatives_count,
-            "resolved_at": resolved_at,
-        })
-        await session.execute(text("""
-            UPDATE travel_raw_item AS raw
-            SET amap_poi_id = :amap_poi_id,
-                longitude = :longitude,
-                latitude = :latitude,
-                adcode = :adcode,
-                place_type_resolved = :place_type_resolved,
-                poi_resolution_status = :raw_status,
-                poi_resolution_attempts = GREATEST(
-                    COALESCE(raw.poi_resolution_attempts, 0),
-                    :attempts
-                ),
-                poi_resolution_last_error = :last_error,
-                poi_alternatives_count = :alternatives_count,
-                poi_resolved_at = :resolved_at
-            FROM travel_content AS content
-            JOIN travel_content_place_mention AS mention
-              ON mention.content_id = content.id
-            WHERE raw.id = content.raw_item_id
-              AND mention.place_id = :place_id
-              AND (
-                raw.poi_resolution_status IS NULL
-                OR raw.poi_resolution_status <> 'resolved'
-                OR :raw_status = 'resolved'
-              )
-        """), {
-            "place_id": target.place_id,
-            "longitude": resolution.longitude,
-            "latitude": resolution.latitude,
-            "amap_poi_id": resolution.amap_poi_id,
-            "adcode": resolution.adcode,
-            "place_type_resolved": resolution.place_type_resolved,
-            "raw_status": None if resolution.status == "pending" else resolution.status,
-            "attempts": attempts,
-            "last_error": resolution.last_error,
-            "alternatives_count": resolution.alternatives_count,
-            "resolved_at": resolved_at,
-        })
-        await session.commit()
+    updated = await session.execute(text("""
+        UPDATE travel_place
+        SET address = COALESCE(:address, address),
+            longitude = :longitude,
+            latitude = :latitude,
+            amap_poi_id = :amap_poi_id,
+            adcode = :adcode,
+            place_type_resolved = :place_type_resolved,
+            poi_resolution_status = :status,
+            poi_resolution_attempts = :attempts,
+            poi_resolution_last_error = :last_error,
+            poi_alternatives_count = :alternatives_count,
+            poi_resolved_at = :resolved_at,
+            updated_time = NOW()
+        WHERE id = :place_id AND merged_into_place_id IS NULL
+    """), {
+        "place_id": target.place_id,
+        "address": resolution.address,
+        "longitude": resolution.longitude,
+        "latitude": resolution.latitude,
+        "amap_poi_id": resolution.amap_poi_id,
+        "adcode": resolution.adcode,
+        "place_type_resolved": resolution.place_type_resolved,
+        "status": None if resolution.status == "pending" else resolution.status,
+        "attempts": attempts,
+        "last_error": resolution.last_error,
+        "alternatives_count": resolution.alternatives_count,
+        "resolved_at": resolved_at,
+    })
+    if updated.rowcount != 1:
+        return False
+    await session.execute(text("""
+        UPDATE travel_raw_item AS raw
+        SET amap_poi_id = :amap_poi_id,
+            longitude = :longitude,
+            latitude = :latitude,
+            adcode = :adcode,
+            place_type_resolved = :place_type_resolved,
+            poi_resolution_status = :raw_status,
+            poi_resolution_attempts = GREATEST(
+                COALESCE(raw.poi_resolution_attempts, 0),
+                :attempts
+            ),
+            poi_resolution_last_error = :last_error,
+            poi_alternatives_count = :alternatives_count,
+            poi_resolved_at = :resolved_at
+        FROM travel_content AS content
+        JOIN travel_content_place_mention AS mention
+          ON mention.content_id = content.id
+        WHERE raw.id = content.raw_item_id
+          AND mention.place_id = :place_id
+          AND (
+            raw.poi_resolution_status IS NULL
+            OR raw.poi_resolution_status <> 'resolved'
+            OR :raw_status = 'resolved'
+          )
+    """), {
+        "place_id": target.place_id,
+        "longitude": resolution.longitude,
+        "latitude": resolution.latitude,
+        "amap_poi_id": resolution.amap_poi_id,
+        "adcode": resolution.adcode,
+        "place_type_resolved": resolution.place_type_resolved,
+        "raw_status": None if resolution.status == "pending" else resolution.status,
+        "attempts": attempts,
+        "last_error": resolution.last_error,
+        "alternatives_count": resolution.alternatives_count,
+        "resolved_at": resolved_at,
+    })
+    return True
+
+
+async def save_place_resolution(*, target: PlaceResolutionTarget,
+                                resolution: PoiResolution, attempts: int) -> bool:
+    """Savepoint retries are observable; the session owner commits once.
+
+    Always acquire provider lock before group row locks, including when the
+    fold is disabled. Resolved rows are never force re-queried by window tools.
+    """
+    async with get_session_factory()() as session:
+        for retry in range(3):
+            try:
+                async with session.begin_nested():
+                    if resolution.amap_poi_id:
+                        await lock_identity(session, target.city, resolution.amap_poi_id)
+                        ids = list((await session.execute(text("""SELECT id FROM travel_place
+                            WHERE city=:city AND amap_poi_id=:amap AND merged_into_place_id IS NULL"""),
+                            {"city": target.city, "amap": resolution.amap_poi_id})).scalars())
+                    else:
+                        ids = []
+                    rows = await lock_places(session, [target.place_id, *ids])
+                    source = next((r for r in rows if r['id'] == target.place_id), None)
+                    if source is None or source['city'] != target.city or source['merged_into_place_id'] is not None:
+                        return False
+                    if not await _save_place_resolution(session, target=target, resolution=resolution, attempts=attempts):
+                        return False
+                    if (get_settings().place_same_amap_fold_enabled and resolution.status == 'resolved'
+                            and resolution.amap_poi_id and ids):
+                        members = sorted(set([target.place_id, *ids]))
+                        snapshot = await group_snapshot(session, members)
+                        summaries = {r['place_id']: r['canonical_place_id'] for r in snapshot['travel_place_summary']}
+                        visible = {c['place_id'] for c in snapshot['travel_canonical_place'] if planner_visible(c)}
+                        counts = {i: sum(r['place_id'] == i for table in ('travel_content_place_mention','travel_place_fact')
+                                        for r in snapshot[table]) for i in members}
+                        survivor = max(members, key=lambda i: (summaries.get(i) in visible, counts[i], -i))
+                        await merge_source_places(session, city=target.city, amap_poi_id=resolution.amap_poi_id,
+                            survivor_id=survivor, loser_ids=[i for i in members if i != survivor], batch_id='auto')
+                await session.commit()
+                return True
+            except DBAPIError as exc:
+                state = getattr(exc.orig, 'sqlstate', None) or getattr(exc.orig, 'pgcode', None)
+                if state != '40P01' or retry == 2:
+                    raise
+                logger.warning('D1 savepoint deadlock retry place_id=%s retry=%s', target.place_id, retry + 1)
+                await asyncio.sleep(0.01 * (retry + 1))
+    return False
 
 
 async def resolve_targets(

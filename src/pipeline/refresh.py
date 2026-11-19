@@ -11,7 +11,7 @@ from src.pipeline.db import get_session_factory
 from src.pipeline.summary_identity import link_summary_identities
 from src.pipeline.visit_duration import (
     aggregate_visit_duration_facts,
-    fact_from_value,
+    load_canonical_duration_facts,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,54 +54,8 @@ async def _refresh_canonical_visit_durations(session, city: str | None = None) -
     if not has_duration_schema:
         return 0
 
-    city_filter = "AND canonical.city = :city" if city else ""
     params = {"city": city} if city else {}
-    rows = (await session.execute(
-        text(f"""
-            SELECT
-                canonical.place_id AS canonical_place_id,
-                canonical.canonical_name,
-                canonical.place_type,
-                fact.fact_value,
-                fact.confidence
-            FROM travel_canonical_place AS canonical
-            JOIN travel_place_summary AS summary
-              ON summary.canonical_place_id = canonical.place_id
-            JOIN travel_place_fact AS fact
-              ON fact.place_id = summary.place_id
-             AND fact.source_platform = 'xhs'
-             AND fact.fact_type = 'visit_duration'
-            WHERE canonical.is_active = TRUE
-              {city_filter}
-            ORDER BY canonical.place_id, fact.id
-        """),
-        params,
-    )).all()
-
-    grouped: dict[int, dict] = {}
-    for row in rows:
-        fact_value = _json_value(row.fact_value)
-        evidence = ""
-        if isinstance(fact_value, dict):
-            evidence = str(fact_value.get("evidence") or fact_value.get("raw") or "")
-        fact = fact_from_value(
-            fact_value,
-            confidence=float(row.confidence or 0.0),
-            place_name=str(row.canonical_name or ""),
-            place_type=str(row.place_type or ""),
-            evidence=evidence,
-        )
-        if fact is None:
-            continue
-        bucket = grouped.setdefault(
-            int(row.canonical_place_id),
-            {
-                "name": str(row.canonical_name or ""),
-                "place_type": str(row.place_type or ""),
-                "facts": [],
-            },
-        )
-        bucket["facts"].append(fact)
+    grouped = await load_canonical_duration_facts(session, city=city)
 
     updated = 0
     valid_ids: list[int] = []
@@ -123,7 +77,7 @@ async def _refresh_canonical_visit_durations(session, city: str | None = None) -
                     typical_visit_updated_at = NOW(),
                     updated_at = NOW()
                 WHERE place_id = :canonical_id
-                  AND typical_visit_source IS DISTINCT FROM 'manual'
+                  AND COALESCE(typical_visit_source, '') NOT IN ('manual', 'amap')
             """),
             {
                 "canonical_id": canonical_id,
@@ -302,6 +256,7 @@ async def refresh_place_summary(city: str | None = None):
                     WHERE pf.place_id = p.id
                 ) f ON true
                 WHERE 1=1 {city_filter_place}
+                  AND p.merged_into_place_id IS NULL
                   {v06_filter}
                 ON CONFLICT (place_id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -330,7 +285,8 @@ async def refresh_place_summary(city: str | None = None):
                     DELETE FROM travel_place_summary AS s
                     USING travel_place AS p
                     WHERE s.place_id = p.id
-                      AND p.poi_resolution_status IS DISTINCT FROM 'resolved'
+                      AND (p.poi_resolution_status IS DISTINCT FROM 'resolved'
+                           OR p.merged_into_place_id IS NOT NULL)
                       {city_filter_summary_alias}
                 """),
                 params,

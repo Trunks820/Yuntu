@@ -23,6 +23,7 @@ from src.agents.schema import (
     PlanOutput,
     PoiNarrativeFragment,
     RoutePlan,
+    TripRequest,
 )
 
 
@@ -56,12 +57,15 @@ class LockedSafeDay:
     places: tuple[LockedSafeActionContract, ...]
     commute_templates: tuple[LockedSafeCommuteTemplate, ...] = ()
     accommodation_access_summary: str = ""
+    preference_notices: tuple[str, ...] = ()
+    program_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class LockedSafePlan:
     plan_index: int
     days: tuple[LockedSafeDay, ...]
+    trip_notices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +164,7 @@ def lock_safe_input(
     route_plans: list[RoutePlan],
     action_contracts: Iterable[DeterministicActionContract],
     food_authorizations: Iterable[FoodAttachmentAuthorization] = (),
+    trip_request: TripRequest | None = None,
 ) -> LockedSafeInput:
     """Narrow route/action/food contracts at the Safe trust boundary."""
     if not route_plans:
@@ -172,7 +177,12 @@ def lock_safe_input(
 
     seen_keys: set[tuple[int, int, int]] = set()
     locked_plans: list[LockedSafePlan] = []
+    from src.agents.preference_notices import build_preference_notices, program_day_hints
     for plan_index, route_plan in enumerate(route_plans, 1):
+        notices = (
+            build_preference_notices(trip_request, route_plan)
+            if trip_request is not None else None
+        )
         if not route_plan.day_groups:
             raise SafeRenderError("empty_locked_plan")
         seen_days: set[int] = set()
@@ -256,10 +266,16 @@ def lock_safe_input(
                 places=tuple(locked_places),
                 commute_templates=tuple(locked_commute_templates),
                 accommodation_access_summary=access_summary(day_group) if route_plan.route_policy_version == "selector-route-v2" else "",
+                preference_notices=(
+                    (notices.day_lines or {}).get(int(day_group.day), ())
+                    if notices is not None else ()
+                ),
+                program_hints=tuple(program_day_hints(day_group)),
             ))
         locked_plans.append(LockedSafePlan(
             plan_index=plan_index,
             days=tuple(locked_days),
+            trip_notices=notices.trip_lines if notices is not None else (),
         ))
     route_place_keys = {
         (plan_index, day.day, place.place_id)
@@ -316,10 +332,13 @@ def _normalized_contract(locked_input: LockedSafeInput) -> list[dict[str, Any]]:
     return [
         {
             "plan_index": plan.plan_index,
+            **({"trip_notices": list(plan.trip_notices)} if plan.trip_notices else {}),
             "days": [
                 {
                     "day": day.day,
                     **({"accommodation_access_summary": day.accommodation_access_summary} if day.accommodation_access_summary else {}),
+                    **({"preference_notices": list(day.preference_notices)} if day.preference_notices else {}),
+                    **({"program_hints": list(day.program_hints)} if day.program_hints else {}),
                     "places": [
                         {
                             "place_id": place.place_id,
@@ -383,12 +402,23 @@ def render_safe_plans(
         day_place_names: list[list[str]] = []
         used_place_ids: list[int] = []
         used_place_names: list[str] = []
+        trip_notices = [
+            str(line).strip()
+            for line in plan_data.get("trip_notices") or []
+            if str(line).strip()
+        ]
+        if trip_notices:
+            text_parts.append("\n".join(trip_notices) + "\n\n")
 
         for day_data in plan_data["days"]:
             day = int(day_data["day"])
             text_parts.append(f"Day {day}\n")
             if day_data.get("accommodation_access_summary"):
                 text_parts.append(str(day_data["accommodation_access_summary"]) + "。\n")
+            for line in day_data.get("preference_notices") or []:
+                text_parts.append(str(line) + "\n")
+            for line in day_data.get("program_hints") or []:
+                text_parts.append(str(line) + "\n")
             day_names: list[str] = []
             commute_templates = {
                 (
@@ -455,10 +485,13 @@ def render_safe_plans(
             day_place_names.append(day_names)
 
         plan_text = "".join(text_parts).rstrip()
+        summary = "按锁定路线顺序整理的基础行程。"
+        if trip_notices:
+            summary = "\n".join([*trip_notices, summary])
         plans.append(PlanOutput(
             plan_name=f"基础行程 {plan_index}",
             plan_text=plan_text,
-            summary="按锁定路线顺序整理的基础行程。",
+            summary=summary,
             used_place_ids=used_place_ids,
             used_place_names=used_place_names,
             day_place_names=day_place_names,

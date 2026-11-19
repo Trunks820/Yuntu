@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_serializer
 
 from src.agents.schema import (
     DeliveryStatus,
@@ -23,6 +23,7 @@ from src.jobs import city_gate as city_gate_module
 from src.jobs import trip_worker as trip_worker_module
 
 from src.jobs.trip_store import (
+    GenerationPolicyNotEnabledError,
     RequestIdConflictError,
     TERMINAL_STATUSES,
     TripJobRecord,
@@ -37,6 +38,12 @@ from src.jobs.trip_store import (
     user_message_for_job,
     route_failure_code_for_job,
 )
+from src.jobs.generation_delivery import (
+    GenerationDelivery,
+    GenerationPolicyVersion,
+    validate_delivery_for_job,
+)
+from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +97,10 @@ class TripAsyncCreateRequest(BaseModel):
     message: str | None = None
     trip_request: TripAsyncStructuredRequest | None = None
     request_id: str = Field(max_length=512)
-    source: str = Field(default="WEB_USER", max_length=30)
-    conversation_id: str = Field(max_length=200)
+    source: str = Field(default="web", max_length=30)
+    conversation_id: str = Field(default="web-guest", max_length=200)
     user_display_name: str | None = Field(default=None, max_length=100)
+    generation_policy_version: GenerationPolicyVersion | None = None
 
 
 class TripAsyncCreateResponse(BaseModel):
@@ -103,6 +111,15 @@ class TripAsyncCreateResponse(BaseModel):
     queue_position: int
     message: str
     cached: bool
+    generation_policy_version: GenerationPolicyVersion
+    delivery: GenerationDelivery | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_delivery(self, handler):
+        payload = handler(self)
+        if self.delivery is None:
+            payload.pop("delivery", None)
+        return payload
 
 
 def _validation_error_mentions_time_preferences(
@@ -147,6 +164,15 @@ class TripJobStatusResponse(BaseModel):
     total_elapsed_ms: int | None = None
     created_time: str | None = None
     updated_time: str | None = None
+    generation_policy_version: GenerationPolicyVersion
+    delivery: GenerationDelivery | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_delivery(self, handler):
+        payload = handler(self)
+        if self.delivery is None:
+            payload.pop("delivery", None)
+        return payload
 
 
 def _iso(dt) -> str | None:
@@ -187,6 +213,8 @@ def _job_to_status_response(job: TripJobRecord) -> TripJobStatusResponse:
         total_elapsed_ms=compute_total_elapsed_ms(job),
         created_time=_iso(job.created_time),
         updated_time=_iso(job.updated_time),
+        generation_policy_version=getattr(job, "generation_policy_version", "legacy"),
+        delivery=getattr(job, "delivery", None),
     )
 
 
@@ -195,11 +223,40 @@ async def _job_to_status_response_async(job: TripJobRecord) -> TripJobStatusResp
     if job.status == "PENDING":
         response.queue_position = await queue_position_for_job(job)
     if job.status == "SUCCESS":
-        delivery = await get_trip_result_delivery_metadata(job.result_record_id)
+        delivery = await get_trip_result_delivery_metadata(
+            job.result_record_id,
+            job_id=job.job_id,
+        )
         if delivery is not None:
             response.published_variant = delivery["published_variant"]
             response.delivery_status = delivery["delivery_status"]
+    _validate_v012_job_delivery(
+        job,
+        published_variant=response.published_variant,
+        delivery_status=response.delivery_status,
+    )
     return response
+
+
+def _validate_v012_job_delivery(
+    job: TripJobRecord,
+    *,
+    published_variant: str | None = None,
+    delivery_status: str | None = None,
+) -> None:
+    if getattr(job, "generation_policy_version", "legacy") != "v0.12":
+        return
+    delivery = getattr(job, "delivery", None)
+    if delivery is None:
+        raise ValueError("v0.12 job delivery is missing")
+    validate_delivery_for_job(
+        delivery,
+        status=job.status,
+        result_type=job.result_type,
+        result_record_id=job.result_record_id,
+        published_variant=published_variant,
+        delivery_status=delivery_status,
+    )
 
 
 def _sse_event_for_job(job: TripJobRecord) -> str:
@@ -231,11 +288,27 @@ def _sse_failure_message(job: TripJobRecord) -> str:
 
 
 async def _sse_payload_for_job(job: TripJobRecord) -> tuple[str, dict]:
+    generation_policy_version = getattr(job, "generation_policy_version", "legacy")
+    generation_delivery = getattr(job, "delivery", None)
     event = _sse_event_for_job(job)
     if event == "complete":
-        delivery = await get_trip_result_delivery_metadata(job.result_record_id)
+        delivery = await get_trip_result_delivery_metadata(
+            job.result_record_id,
+            job_id=job.job_id,
+        )
+        _validate_v012_job_delivery(
+            job,
+            published_variant=(delivery or {}).get("published_variant"),
+            delivery_status=(delivery or {}).get("delivery_status"),
+        )
         return event, {
             "status": "COMPLETED",
+            "generation_policy_version": generation_policy_version,
+            **(
+                {"delivery": generation_delivery.model_dump(mode="json")}
+                if generation_delivery is not None
+                else {}
+            ),
             "result_type": job.result_type,
             "result_record_id": (
                 str(job.result_record_id)
@@ -246,15 +319,29 @@ async def _sse_payload_for_job(job: TripJobRecord) -> tuple[str, dict]:
             **(delivery or {}),
         }
     if event == "failed":
+        _validate_v012_job_delivery(job)
         return event, {
             "status": "FAILED",
+            "generation_policy_version": generation_policy_version,
+            **(
+                {"delivery": generation_delivery.model_dump(mode="json")}
+                if generation_delivery is not None
+                else {}
+            ),
             "error": {
                 "code": _sse_failure_code(job),
                 "message": _sse_failure_message(job),
             },
         }
+    _validate_v012_job_delivery(job)
     return event, {
         "status": _sse_status_for_progress(job),
+        "generation_policy_version": generation_policy_version,
+        **(
+            {"delivery": generation_delivery.model_dump(mode="json")}
+            if generation_delivery is not None
+            else {}
+        ),
         "current_stage": job.current_stage,
         "result_record_id": None,
         "error": None,
@@ -379,6 +466,13 @@ async def trip_async_create(req: TripAsyncCreateRequest) -> TripAsyncCreateRespo
         req.conversation_id,
     )
 
+    settings = get_settings()
+    policy_version: GenerationPolicyVersion = (
+        req.generation_policy_version
+        if req.generation_policy_version is not None
+        else ("v0.12" if settings.v012_trip_creation_enabled else "legacy")
+    )
+
     try:
         created = await create_async_trip_job(
             message=message,
@@ -389,6 +483,8 @@ async def trip_async_create(req: TripAsyncCreateRequest) -> TripAsyncCreateRespo
             source=req.source,
             conversation_id=req.conversation_id,
             user_display_name=req.user_display_name,
+            generation_policy_version=policy_version,
+            allow_new_v012=settings.v012_trip_creation_enabled,
         )
     except RequestIdConflictError as exc:
         return JSONResponse(
@@ -397,6 +493,15 @@ async def trip_async_create(req: TripAsyncCreateRequest) -> TripAsyncCreateRespo
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except GenerationPolicyNotEnabledError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "code": "GENERATION_POLICY_NOT_ENABLED",
+                "message": str(exc),
+            },
+        )
 
     return TripAsyncCreateResponse(
         job_id=created.job_id,
@@ -405,6 +510,8 @@ async def trip_async_create(req: TripAsyncCreateRequest) -> TripAsyncCreateRespo
         queue_position=created.queue_position,
         message=created.message,
         cached=created.cached,
+        generation_policy_version=getattr(created, "generation_policy_version", "legacy"),
+        delivery=getattr(created, "delivery", None),
     )
 
 

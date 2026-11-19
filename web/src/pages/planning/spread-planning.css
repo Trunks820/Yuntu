@@ -1,0 +1,668 @@
+/* =========================================================================
+   Yuntu PC Spread — Waiting Page ("生成等待页 · 装订中")
+   Source of truth: docs/design/yuntu-spread-20261022/book.css & HANDOFF.md
+   Scoped strictly under .yuntu-spread so mobile / legacy pages stay untouched.
+   ========================================================================= */
+
+@property --yuntu-bd-sky-p {
+  syntax: "<percentage>";
+  inherits: true;
+  initial-value: 0%;
+}
+
+@keyframes yuntu-bd-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes yuntu-bd-ping {
+  from {
+    transform: scale(0.3);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}
+
+.yuntu-spread .bd-atlas {
+  position: fixed;
+  inset: var(--top) 0 0;
+  z-index: 1;
+  border-top: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  overflow: hidden;
+}
+
+.yuntu-spread .bd-atlas,
+.yuntu-spread .bd-atlas * {
+  box-sizing: border-box;
+}
+
+:where(.yuntu-spread .bd-atlas) :where(p, h1, h2, h3, ul) {
+  margin: 0;
+}
+
+.yuntu-spread .bd-atlas button,
+.yuntu-spread .bd-atlas a {
+  font: inherit;
+  color: inherit;
+}
+
+.yuntu-spread .bd-atlas button {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.yuntu-spread .bd-atlas a {
+  text-decoration: none;
+}
+
+.yuntu-spread .bd-atlas :focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+  border-radius: var(--r-sm);
+}
+
+/* ───────── 整屏地图舞台与纸色兜底 ───────── */
+.yuntu-spread .bd-atlas .bd-stage {
+  position: absolute;
+  inset: 0;
+}
+
+.yuntu-spread .bd-atlas .bd-map {
+  width: 100%;
+  height: 100%;
+  background: var(--paper);
+  font: inherit;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* 仅对高德底图瓦片调暖柔化，不影响覆盖物标记 */
+.yuntu-spread .bd-atlas .amap-layers {
+  filter: sepia(0.28) saturate(0.45) contrast(0.86) brightness(1.07);
+  opacity: 0.78;
+}
+
+.yuntu-spread .bd-atlas .amap-logo,
+.yuntu-spread .bd-atlas .amap-copyright {
+  bottom: 244px !important;
+  opacity: 0.78;
+}
+
+/* 地图加载失败或缺少 Key 时退回纸色底 */
+.yuntu-spread .bd-atlas .bd-fallback {
+  position: absolute;
+  inset: 0;
+  background: var(--paper);
+  background-image:
+    linear-gradient(to right, rgba(23, 59, 53, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(23, 59, 53, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+}
+
+.yuntu-spread .bd-atlas .bd-fallback-center {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  transform: translate(-50%, -50%);
+}
+
+.yuntu-spread .bd-atlas .bd-fallback-pin {
+  position: relative;
+  width: 0;
+  height: 0;
+}
+
+.yuntu-spread .bd-atlas .bd-fallback-note {
+  margin-top: 22px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: rgba(247, 245, 239, 0.92);
+  border: 1px solid var(--line);
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* 城市那一点：每推近一级，绿圈荡开一次 */
+.yuntu-spread .bd-atlas .bd-ring {
+  position: relative;
+  pointer-events: none;
+}
+
+.yuntu-spread .bd-atlas .bd-ring i {
+  position: absolute;
+  left: -7px;
+  top: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow:
+    0 0 0 4px rgba(255, 254, 249, 0.92),
+    0 2px 8px rgba(23, 59, 53, 0.3);
+}
+
+.yuntu-spread .bd-atlas .bd-ring b {
+  position: absolute;
+  left: -44px;
+  top: -44px;
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  border: 1.5px solid var(--green);
+  opacity: 0;
+}
+
+.yuntu-spread .bd-atlas .bd-ring.pulse b {
+  animation: yuntu-bd-ping 1.6s ease-out both;
+}
+
+.yuntu-spread .bd-atlas .bd-ring span {
+  position: absolute;
+  left: 16px;
+  top: -14px;
+  padding: 3px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  box-shadow: var(--lift);
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+/* ───────── 浮层公用卡片底 ───────── */
+.yuntu-spread .bd-atlas .float {
+  position: absolute;
+  z-index: 900;
+  background: var(--surface);
+  border-radius: 16px;
+  box-shadow: var(--lift);
+}
+
+/* ───────── 左上：这次的条件卡片 ───────── */
+.yuntu-spread .bd-atlas .bd-hud {
+  left: 20px;
+  top: 16px;
+  width: 300px;
+  padding: 16px 20px 20px;
+  max-height: calc(100% - 268px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.yuntu-spread .bd-atlas .hud-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 0 6px -2px;
+  padding: 2px 6px 2px 2px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+
+.yuntu-spread .bd-atlas .hud-back:hover {
+  color: var(--green);
+  background: var(--green-tint);
+}
+
+.yuntu-spread .bd-atlas .hud-back .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.yuntu-spread .bd-atlas .bd-hud h3 {
+  margin-top: 10px;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1.45;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+}
+
+.yuntu-spread .bd-atlas .bd-hud.is-fail h3 {
+  color: var(--cinnabar);
+}
+
+.yuntu-spread .bd-atlas .bd-hud .s {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-family: var(--serif);
+  font-size: var(--fs-sm);
+  line-height: 1.8;
+  color: var(--ink);
+}
+
+.yuntu-spread .bd-atlas .bd-hud .k {
+  margin-top: 8px;
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.yuntu-spread .bd-atlas .bd-hud .k.is-alert {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--cinnabar-bg);
+  color: var(--cinnabar);
+}
+
+.yuntu-spread .bd-atlas .bd-hud .k.is-warn {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: #f6efdf;
+  color: #8a6a2f;
+}
+
+.yuntu-spread .bd-atlas .bd-hud :is(.s, .k) {
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+/* ───────── 底部：天色长卷 ───────── */
+.yuntu-spread .bd-atlas .bd-strip {
+  left: 20px;
+  right: 20px;
+  bottom: 16px;
+  padding: 0 14px 14px;
+}
+
+.yuntu-spread .bd-atlas .bd-sh {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 54px;
+  padding: 4px 6px;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.yuntu-spread .bd-atlas .bd-sh-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.yuntu-spread .bd-atlas .bd-sh b {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: var(--fs-md);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.yuntu-spread .bd-atlas .bd-sh b.fail {
+  color: var(--cinnabar);
+}
+
+.yuntu-spread .bd-atlas .bd-sep {
+  color: var(--faint);
+}
+
+.yuntu-spread .bd-atlas .bd-clock {
+  font-variant-numeric: tabular-nums;
+}
+
+.yuntu-spread .bd-atlas .bd-sh .acts {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-shrink: 0;
+}
+
+.yuntu-spread .bd-atlas .bd-sh .lk {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 1px;
+  border-bottom: 1px solid currentColor;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  white-space: nowrap;
+  transition: color 0.15s;
+}
+
+.yuntu-spread .bd-atlas .bd-sh .lk:hover:not(:disabled) {
+  color: var(--green);
+}
+
+.yuntu-spread .bd-atlas .bd-sh .lk:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.yuntu-spread .bd-atlas .bd-sh .lk .icon,
+.yuntu-spread .bd-atlas .bd-sh .btn .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.yuntu-spread .bd-atlas .bd-sh .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 18px;
+  border-radius: var(--r-pill);
+  background: var(--deep);
+  color: var(--on);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.yuntu-spread .bd-atlas .bd-sh .btn:hover:not(:disabled) {
+  background: var(--green);
+}
+
+.yuntu-spread .bd-atlas .bd-sh .btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.yuntu-spread .bd-atlas .bd-strip .sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* 天色长卷 */
+.yuntu-spread .bd-atlas .sk {
+  --sky: linear-gradient(
+    90deg,
+    var(--sky-morning) 0%,
+    var(--sky-morning) 18%,
+    var(--sky-afternoon) 32%,
+    var(--sky-afternoon) 43%,
+    var(--sky-evening) 57%,
+    var(--sky-evening) 69%,
+    var(--sky-night) 81%,
+    var(--sky-night) 100%
+  );
+  position: relative;
+  height: 156px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fbfaf6;
+  box-shadow: inset 0 0 0 1px var(--line);
+  transition: --yuntu-bd-sky-p 1.2s var(--ease);
+}
+
+.yuntu-spread .bd-atlas .sk::before,
+.yuntu-spread .bd-atlas .sk-lit {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--sky);
+}
+
+.yuntu-spread .bd-atlas .sk::before {
+  opacity: 0.14;
+}
+
+.yuntu-spread .bd-atlas .sk-lit {
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    #000 0,
+    #000 calc(var(--yuntu-bd-sky-p) - 5%),
+    transparent calc(var(--yuntu-bd-sky-p) + 3%)
+  );
+  mask-image: linear-gradient(
+    90deg,
+    #000 0,
+    #000 calc(var(--yuntu-bd-sky-p) - 5%),
+    transparent calc(var(--yuntu-bd-sky-p) + 3%)
+  );
+  transition: opacity 0.35s var(--ease);
+}
+
+.yuntu-spread .bd-atlas .sk.is-unlit .sk-lit {
+  opacity: 0;
+}
+
+.yuntu-spread .bd-atlas .sk-edge {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--yuntu-bd-sky-p);
+  width: 64px;
+  margin-left: -32px;
+  background: radial-gradient(
+    closest-side,
+    rgba(255, 255, 255, 0.6),
+    transparent
+  );
+  animation: yuntu-bd-pulse 2.8s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.yuntu-spread .bd-atlas .sk-lab {
+  position: absolute;
+  top: 22px;
+  width: 23%;
+  margin-left: -11.5%;
+  text-align: center;
+}
+
+.yuntu-spread .bd-atlas .sk-lab small {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+.yuntu-spread .bd-atlas .sk-lab b {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: clamp(14px, 1.24vw, 17px);
+  line-height: 1.35;
+  color: var(--ink);
+}
+
+.yuntu-spread .bd-atlas .sk-lab em {
+  display: block;
+  margin-top: 3px;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.yuntu-spread .bd-atlas .sk-lab.n em {
+  color: var(--green);
+  font-weight: 500;
+}
+
+.yuntu-spread .bd-atlas .sk-lab.f em {
+  color: var(--cinnabar);
+  font-weight: 500;
+}
+
+.yuntu-spread .bd-atlas .sk-lab.t b {
+  color: #9aa39c;
+  font-weight: 500;
+}
+
+.yuntu-spread .bd-atlas .sk-lab.t em {
+  color: #a7aea8;
+}
+
+.yuntu-spread .bd-atlas .sk-lab.nt :is(small, b, em) {
+  color: rgba(245, 243, 236, 0.9);
+}
+
+.yuntu-spread .bd-atlas .sk-road {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 38px;
+  height: 0;
+}
+
+.yuntu-spread .bd-atlas .sk-road .done {
+  position: absolute;
+  left: 0;
+  top: -1px;
+  width: var(--yuntu-bd-sky-p);
+  height: 2px;
+  background: var(--ink);
+  opacity: 0.5;
+}
+
+.yuntu-spread .bd-atlas .sk-road .rest {
+  position: absolute;
+  left: var(--yuntu-bd-sky-p);
+  right: 0;
+  top: -1px;
+  border-top: 2px dotted rgba(23, 59, 53, 0.22);
+}
+
+.yuntu-spread .bd-atlas .sk-dot {
+  position: absolute;
+  top: -8px;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  border-radius: 50%;
+  background: #fbfaf6;
+  border: 1.5px solid rgba(23, 59, 53, 0.28);
+  transition:
+    background 0.25s,
+    border-color 0.25s,
+    box-shadow 0.25s;
+}
+
+.yuntu-spread .bd-atlas .sk-dot.d {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+.yuntu-spread .bd-atlas .sk-dot.d.nt {
+  background: var(--on);
+  border-color: rgba(245, 243, 236, 0.9);
+}
+
+.yuntu-spread .bd-atlas .sk-dot.n {
+  border: 2px solid var(--green);
+  background: var(--surface);
+  box-shadow: 0 0 0 5px rgba(22, 108, 91, 0.14);
+}
+
+.yuntu-spread .bd-atlas .sk-dot.f {
+  border: 2px solid var(--cinnabar);
+  background: var(--cinnabar-bg);
+}
+
+.yuntu-spread .bd-atlas .sk[data-st="timeout"] .sk-dot.n,
+.yuntu-spread .bd-atlas .sk[data-st="unknown"] .sk-dot.n {
+  border-color: #a88a52;
+  box-shadow: 0 0 0 5px rgba(168, 138, 82, 0.14);
+}
+
+.yuntu-spread .bd-atlas .sk[data-st="timeout"] .sk-lab.n em,
+.yuntu-spread .bd-atlas .sk[data-st="unknown"] .sk-lab.n em {
+  color: #8a6a2f;
+}
+
+.yuntu-spread .bd-atlas .sk[data-st="timeout"] .sk-lab.n.nt em,
+.yuntu-spread .bd-atlas .sk[data-st="unknown"] .sk-lab.n.nt em {
+  color: rgba(245, 243, 236, 0.9);
+}
+
+/* ───────── 无效 jobId 兜底页 ───────── */
+.yuntu-spread .bd-invalid {
+  min-height: calc(100vh - var(--top));
+  display: grid;
+  place-items: center;
+  padding: 32px 24px;
+  background: var(--paper);
+}
+
+.yuntu-spread .bd-invalid-card {
+  width: min(440px, 100%);
+  padding: 32px 28px;
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--lift);
+  text-align: center;
+}
+
+.yuntu-spread .bd-invalid-card h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: var(--fs-lg);
+  color: var(--ink);
+}
+
+.yuntu-spread .bd-invalid-card p {
+  margin: 12px 0 22px;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.yuntu-spread .bd-invalid-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 38px;
+  padding: 0 20px;
+  border-radius: var(--r-pill);
+  border: 0;
+  background: var(--deep);
+  color: var(--on);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.yuntu-spread .bd-invalid-btn:hover {
+  background: var(--green);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yuntu-spread .bd-atlas .sk,
+  .yuntu-spread .bd-atlas .sk-lit,
+  .yuntu-spread .bd-atlas .sk-dot {
+    transition: none;
+  }
+
+  .yuntu-spread .bd-atlas .sk-edge,
+  .yuntu-spread .bd-atlas .bd-ring.pulse b {
+    animation: none;
+  }
+
+  .yuntu-spread .bd-atlas .sk-edge {
+    display: none;
+  }
+}

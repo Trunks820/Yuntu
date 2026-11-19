@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.agents.model_json import decode_model_json
 from src.agents.route_feasibility import access_summary
 from src.agents.arrival_copy import arrival_activity_copy
 
@@ -11,12 +12,16 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 from typing import Any
 
 from src.agents.blueprint_integrity import check_plan_blueprint_integrity
 from src.agents.activity_completion import completion_sentence_for_contract
-from src.agents.composition_blueprint import build_base_composition_blueprints
+from src.agents.composition_blueprint import (
+    _food_span_marker,
+    build_base_composition_blueprints,
+)
 from src.agents.evidence_strength import (
     StructuredEvidencePayload,
     build_structured_evidence_payload,
@@ -25,6 +30,12 @@ from src.agents.evidence_strength import (
     render_structured_evidence_prompt,
 )
 from src.agents.food_resolver import FoodAttachmentAuthorization
+from src.agents.poi_fragments import (
+    fragment_body_text, normalize_body_food_boundary, replace_body_preserving_food,
+)
+from src.agents.food_review import _normalize_none_tier_text, parse_food_spans
+from src.agents.preferences import family_arrangement_active
+from src.agents.explicit_preference_fulfillment import evaluate_explicit_preference_fulfillment
 
 from src.agents.fact_expression_taxonomy import (
     has_hard_fact_marker,
@@ -44,6 +55,14 @@ from src.agents.llm import (
     last_chat_metadata,
     llm_call_context,
 )
+from src.agents.lodging_section import (
+    await_lodging_price_at_writer_barrier,
+    lodging_mid_markup,
+    lodging_prices_for_assembly,
+    lodging_section_v2_enabled,
+    render_lodging_section,
+    writer_system_prompt,
+)
 from src.agents.speculative_archive import (
     SpeculativeArchiveRecord,
     append_speculative_archive,
@@ -57,13 +76,15 @@ from src.agents.speculative_writer import (
     SpeculativeExecutionResult,
     SpeculativeTelemetry,
     SpeculativeWriterExecutor,
+    StructuralDraftInvalid,
 )
 from src.agents.writer_relay_router import (
     ATTEMPT_TIMEOUT_SECONDS,
     STREAM_ATTEMPT_TIMEOUT_SECONDS,
     WORKFLOW_WALL_SECONDS,
 )
-from src.agents.yuntu_review import ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS
+from src.agents.yuntu_review import review_reserve_seconds
+from src.agents.writing_tiers import prompt_rules
 from src.agents.poi_alias import build_route_name_policy
 from src.agents.pretrip_advice import (
     PreTripAdvicePayload,
@@ -99,6 +120,7 @@ from src.agents.text_quality import (
 from src.agents.weather_advisory import (
     WeatherAdvisoryPayload,
     apply_weather_advisory_to_text,
+    is_weather_line,
     render_weather_prompt,
 )
 from src.agents.writer_repair_contract import (
@@ -154,8 +176,15 @@ class PlanWriteResult:
     keyed_fragment_repair_remaining_count: int = 0
     keyed_fragment_repair_latency_ms: int = 0
     keyed_fragment_repair_failure_reason: str = ""
+    keyed_preference_repair_target_count: int = 0
+    keyed_preference_repair_applied_count: int = 0
+    keyed_preference_repair_remaining_count: int = 0
     keyed_day_opening_count: int = 0
     keyed_day_opening_dropped: list[dict[str, Any]] = field(default_factory=list)
+    keyed_day_wrap_count: int = 0
+    keyed_day_wrap_dropped: list[dict[str, Any]] = field(default_factory=list)
+    keyed_meal_dropped: list[dict[str, Any]] = field(default_factory=list)
+    summary_rejection: str = ""
     pretrip_advice_metrics: dict[str, Any] = field(default_factory=dict)
     generator: str = "opus"
     adjudication_reason: str = ""
@@ -169,6 +198,8 @@ class PlanWriteResult:
     opus_first_token_ms: int | None = None
     opus_final_ms: int | None = None
     ds_final_ms: int | None = None
+    ds_qualified_at_ms: int | None = None
+    standby_grace_expires_at_ms: int | None = None
     adjudicated_at_ms: int | None = None
     probe_telemetry_enabled: bool = False
     probe_kill_count: int = 0
@@ -182,7 +213,36 @@ class PlanWriteResult:
     ds_latency_ms: int = 0
     ds_token_in: int = 0
     ds_token_out: int = 0
+    ds_structural_reasons: list[str] = field(default_factory=list)
+    opus_structural_reasons: list[str] = field(default_factory=list)
     archive_write_succeeded: bool | None = None
+
+
+def _structural_draft_codes(result: PlanWriteResult) -> tuple[str, ...]:
+    """Bounded structural reasons. Raw model text stays out of the codes."""
+    codes: list[str] = []
+    if result.failure_reason:
+        codes.append(f"failure:{result.failure_reason}"[:80])
+    if result.parse_error_type:
+        codes.append(f"parse:{result.parse_error_type}"[:80])
+    if result.plan is None:
+        codes.append("plan_count:0")
+    for detail in list(result.keyed_fragment_invalid_details)[:8]:
+        if not isinstance(detail, dict):
+            continue
+        codes.append(
+            "missing_key:plan_index={plan_index},day={day},place_id={place_id},reason={reason}".format(
+                plan_index=detail.get("plan_index", ""),
+                day=detail.get("day", ""),
+                place_id=detail.get("place_id", ""),
+                reason=str(detail.get("reason") or "")[:40],
+            )[:120]
+        )
+    if result.failure_reason == "route_plan_violation":
+        codes.append("gate:route_plan_violation")
+    if result.keyed_fragment_count:
+        codes.append(f"fragment_count:{int(result.keyed_fragment_count)}")
+    return tuple(codes[:8]) or ("plan_count:0",)
 
 
 @dataclass
@@ -196,6 +256,10 @@ class KeyedPlanAssemblyResult:
     failure_reason: str = ""
     day_opening_count: int = 0
     day_opening_dropped: list[dict[str, Any]] = field(default_factory=list)
+    day_wrap_count: int = 0
+    day_wrap_dropped: list[dict[str, Any]] = field(default_factory=list)
+    meal_dropped: list[dict[str, Any]] = field(default_factory=list)
+    code_lodging_section: str = ""
 
 
 SYSTEM_PROMPT = """你是云途旅行规划服务 的攻略撰写员。
@@ -317,8 +381,11 @@ SINGLE_PLAN_SYSTEM_PROMPT = """你是云途旅行规划服务 的单方案 POI �
 
 Food Stop 专项规则（仅当当前 slot 的 writing_hint 是含 evidence_tier 的 JSON object 时生效）：
 - writing_hint 中的 food_name 是路线外的附近餐饮附件，只允许出现在当前 meal_stop 的 food span 内；不得写进 Day 标题、路线、plan_name、used_place_names 或 day_place_names
-- full / structural tier 的完整餐饮附件句都必须由 writing_hint["span_marker"] 和 <!-- /food --> 包裹；从“午餐/晚餐/附近/步行”等餐饮附件句第一个字开始，到店名、评分、价格、授权证据等最后一个字结束，全部放在 marker 内，不得把“附近”“步行约N分钟”等前半句放在 marker 外
-- 当前路线锚点自身的行动文案可以写在 marker 前；餐饮附件的完整格式必须是 <!-- food:plan{i}_day{d}_anchor{a}_slot{s}_food{f} -->{完整餐饮附件句}<!-- /food -->
+- full / structural tier：当前 poi_fragment 的 text 只写路线锚点本身；将完整餐饮附件句单独放入可选 meal_fragment={"attachment_key":{...},"text":"完整餐饮附件句"}，不得混入锚点或其他 POI 正文
+- meal_fragment.attachment_key 必须原样复制匹配当前 writer_fragment_key 的 Food Stop Runtime Payload 中 attachment_key，包含且仅包含 plan_index、day、anchor_place_id、meal_slot、food_place_id 五字段；该 plan_index 为零基，poi_fragment.plan_index 为一基，两者不可混用
+- meal_fragment.text 必须包含准确的 food_name；从“午餐/晚餐/附近/步行”等餐饮附件句第一个字，到店名、评分、价格、授权证据等最后一个字，全部写在该子片段内；不写 HTML marker、Day 标题或路线箭头，后端仅在该子片段外生成 span_marker 与 <!-- /food -->
+- 普通 poi_fragment 仍只包含 plan_index、day、place_id、text；只有 full / structural 餐饮 slot 可额外包含 meal_fragment。none tier 不输出此字段
+- 已正确标记的旧格式兼容：<!-- food:plan{i}_day{d}_anchor{a}_slot{s}_food{f} -->{完整餐饮附件句}<!-- /food -->。不得在同一 fragment 混用旧 inline marker 与 meal_fragment；未标记的旧混合文案不会自动切分或获得餐饮授权
 - full tier：marker 内可写 food_name、amap_rating、amap_avg_price、步行约N分钟和 Food Stop Runtime Payload 中 authorization.direct_facts / authorization.weak_experience 的内容；不得扩展证据
 - structural tier：marker 内只写时段、food_name、amap_rating、amap_avg_price、步行约N分钟；禁止体验描述、菜品推断或其他事实
 - none tier：只写锚点 POI 的行动文案，不写餐饮附件；后端会拼接 none_tier_text 与 span_marker / <!-- /food -->。
@@ -330,12 +397,121 @@ Food Stop 专项规则（仅当当前 slot 的 writing_hint 是含 evidence_tier
 - full tier 若没有匹配的 authorization，按 structural tier 收紧，不得自行补充证据"""
 
 
-SINGLE_PLAN_JSON_RETRY_PROMPT = """上一次输出不是合法 JSON。请只输出一个合法 JSON object。
+# v0.15.1: the Food Stop rules are a contract with the meal-fragment checks,
+# so both prompt versions carry them unchanged.
+FOOD_STOP_RULES = SINGLE_PLAN_SYSTEM_PROMPT[SINGLE_PLAN_SYSTEM_PROMPT.index("\nFood Stop 专项规则"):]
+
+TIMELINE_SYSTEM_PROMPT = """你是去过这些地方的朋友，给这次同行的人写一份照着走就行的攻略。
+路线、每站时间和交通已经由后端排好（用户消息里有时间表）。你按稳定 key 填写每天开场、每站正文、每天收尾和全程总述；地点名、Day 标题、时间和交通由后端按时间表组装。
+读者在手机上一站一张卡片地看：卡片上已经有时间、停留时长和交通。你写的是卡片里那几句话，要让人一看就知道这地方是什么、到了看什么、怎么走。
+路线就当是你排的：直接写怎么玩，不评价、不夸这份行程（不写"安排得很合理""排得很科学"），不用表情符号。
+
+严格输出合法 JSON，不要输出任何其他内容：
+- 只能输出一个 JSON object，必须以 { 开头、以 } 结尾
+- 不要 Markdown、不要解释文字、不要代码围栏、不要前后缀说明
+- 所有字段名和字符串值必须使用双引号，不要尾随逗号，不要输出注释
+{
+  "day_openings": [
+    {"plan_index": 1, "day": 1, "text": "这一天的主线和节奏，2～4 句"}
+  ],
+  "poi_fragments": [
+    {"plan_index": 1, "day": 1, "place_id": 123, "text": "这地方是什么，到了看什么、怎么安排"}
+  ],
+  "day_wraps": [
+    {"plan_index": 1, "day": 1, "text": "一句收尾或提醒，可省略"}
+  ],
+  "summary": "全程 80～150 字",
+  "packing_checklist": [
+    {"category": "当季穿搭与防护", "items": ["带一把晴雨两用伞", "路线步行较多，准备已磨合的轻便运动鞋"]}
+  ],
+  "travel_tips": [
+    {"title": "出发前复核开放时段", "content": "行程中的某场馆当前展示周二至周日开放。", "evidence_ref": "amap:123:opentime_week"}
+  ]
+}
+
+怎么写：
+- 先通读时间表和各站材料，想清楚每天的主线：哪站是重头戏，哪几站是吃饭、歇脚和过渡，再动笔。
+- day_openings：每天 2～4 句，说今天在哪一片（老城、湖边、山上这类说法）、主线和节奏、最值得期待什么；不把每站要做的事列一遍。开场不写任何具体地名，西湖、前门这种大地名也不写（地点名在每站卡片上）。不以"第几天、Day"开头。
+- poi_fragments，每站按这个顺序写：
+  - 第一句说清这个地方是什么，要只属于它、换个地名就不成立：身份、来历、传说、最有名的景物或展陈。例如"白堤起点处的石拱桥，白蛇传说发生地""南宋时期的皇帝御道，两侧是老字号和手作铺子"。名气大的地方用你确定知道的公认知识；不出名的，用材料或地点类型说清它是个什么样的地方；拿不准的不写。
+  - 接着写到了这里具体看什么、怎么走：点名两三处具体的展品、殿堂、景物或路段（某件镇馆展品、某座主殿、某段长廊），说从哪头进、按什么顺序看、看到哪里就够（例如"往孤山方向走一段就够了，不用追求走完"）。停留久的站多写怎么安排。
+  - 再结合出行月份和这个时段，说这时候来能看到什么（几月的荷花、深秋残荷、清早人少）；这个季节看不到的不写成卖点，可以直说"这个季节没有……"。
+  - 有用的提醒单独写一句，用一般说法，例如"一般要提前实名预约""门票单次有效，出园不能再进"；时间表上这天正好是周一、而这类场馆常规周一闭馆的，写一句"常规周一闭馆，去前确认"。不写具体放票时间、提前几天、价格和金额，也不写怎么买票。
+  - 不写"先来、再去、逛完、吃完、正好、接着、出门第一站"这类顺序话，时间和先后卡片上已经有；只有真实的位置关系才写（例如"与上一站首尾相接，顺着走就到""就在景区出口旁"）。不写"第几天"。
+  - 说位置时不用别的地点名：写"湖西南角""江边""老城中心"，不写"西湖西南角""金鸡湖畔""洪崖洞附近"。能点名的只有当天的上一站和紧接着的下一站。
+  - 主要景点 3～4 句，停留两小时以上的可以写到 5 句；吃饭、咖啡和过渡的站 1～2 句：说清这是家什么样的店、这一顿怎么吃，这类吃食的常见吃法可以写（例如泡馍自己掰成小块、火锅点半份菜），具体菜名只写材料里有的；不写"招牌、必点、人气、受欢迎"这类词。
+  - 提醒别和看点写进同一句：同一句里有一处不合规，整句都会被删掉。
+- 材料是给你挑的，不用全写：每站挑对这趟最有用的一两条。面积、长度、占地、建成年份、安检和充电宝这类随身物品规定不写，除非它影响怎么玩。别人游记里的地铁出口、路线和其他店名不要照搬。"可弱表达"写成"一般、常能"这类说法，一站最多一处；"只能条件提醒"写成提醒，不写成卖点。
+- 跟着时间表写：上午的站不写看夜景，天黑后的站不写看日落。
+- day_wraps：每天一句，回头说说今天，或给晚上、明天留句话；没什么可说就省略。
+- summary：80～150 字，说清这趟怎么玩，可以点本路线里的地点名；不夸行程排得好。
+- 结合用户的人数、同行情况、偏好、出行日期和备注来写，但句子里不用反复写"两人""两个人"，整篇提一两次就够。语气像认真帮朋友安排行程，不写成广告。
+- 这些空话不写：适合两人、适合一起、慢慢逛、慢慢看、感受……氛围/气息/风情、补充体力、歇歇脚、边逛边拍、挑感兴趣的看、按体力决定、市井气息浓、沿街店铺很多。
+
+写法示例（只学写法，不要抄句子，也不要用示例里的地点）：
+材料：key=A 湖边公园（park）｜可直接陈述：环湖步道一圈约 5 公里；湖心有座石拱桥｜可弱表达：早上湖边常有人打太极
+材料：key=B 面馆（restaurant）｜没有材料
+材料：key=C 老街（attraction）｜可直接陈述：保留青石板路和老铺面｜可弱表达：巷子里有不少手作小店
+材料：key=D 城市博物馆（museum）｜可直接陈述：免费，需实名预约
+开场：今天都在湖和老街这一片，上午看湖，下午钻老街、进博物馆，路不远，节奏松。
+A：湖心立着一座石拱桥的大湖，整圈走下来不轻松。走到石拱桥就可以往回折，桥上看湖面最开阔，早上桥边常能看到打太极的老人。
+B：街口的一家面馆，中午吃碗面垫一下就好，下午还要走不少路。
+C：保留着青石板路和老铺面的一条老街。主街走到头再往两侧巷子里拐，手作小店多藏在巷子里，看到喜欢的就进去坐坐。
+D：讲这座城从古到今来历的综合博物馆。重点看青铜器和书画两个展厅，镇馆的几件青铜器值得站下来细看，其余展厅扫一眼就够。免费，一般要提前实名预约。
+收尾：今天走得不少，晚上早点歇，明天还要爬山。
+
+规则：
+- 输入给出的每个 (plan_index, day, place_id) 必须原样输出一次；不要新增或重复 key
+- text 不重复当前地点名，不写 Day 标题、路线箭头或时间表
+{tier_rules}
+- 餐厅写成午餐或晚餐，不写成景点活动；咖啡、甜品、面包店写成休息或补给，除非材料明确是正餐
+- 除锁定地点原名外，正文只使用常用简体字，不输出生僻字、异体字或 Unicode 扩展汉字
+- 只输出上面这些字段；不要输出 plan_name、plan_text、used_place_names、day_place_names 或 used_place_ids
+- packing_checklist 只能使用 packing_signals，禁止 note_tip_evidence 与 Amap 开放事实；质量目标 3～4 类、每类 2～3 项
+- travel_tips 没有最少条数；每条内部草稿必须且只能包含 title、content、evidence_ref，一条 tip 只引用一个授权 ref
+- Amap/笔记开放事实不得写入 poi_fragments、day_openings、day_wraps、summary 或 packing_checklist
+""".replace("{tier_rules}", prompt_rules()) + FOOD_STOP_RULES
+
+
+def writer_prompt_version() -> str:
+    """v0.15.1 switch: "article", "timeline" or the current "v6"."""
+    value = str(getattr(get_settings(), "writer_prompt_version", "v6") or "").strip()
+    return value if value in ("timeline", "article") else "v6"
+
+
+def timeline_assembly() -> bool:
+    """Timeline and article both lay each day out from the backend clock."""
+    return writer_prompt_version() in ("timeline", "article")
+
+
+def opus_prompt_label() -> str:
+    """Telemetry label for the primary writer's prompt."""
+    return {"timeline": "opus_timeline", "article": "opus_article"}.get(
+        writer_prompt_version(), OPUS_WRITER_PROMPT_VERSION)
+
+
+def single_plan_system_prompt() -> str:
+    """The Writer's system prompt for the configured prompt version."""
+    if writer_prompt_version() == "article":
+        return ARTICLE_SYSTEM_PROMPT
+    if writer_prompt_version() == "timeline":
+        return TIMELINE_SYSTEM_PROMPT
+    return SINGLE_PLAN_SYSTEM_PROMPT
+
+
+SINGLE_PLAN_JSON_RETRY_PROMPT ="""上一次输出不是合法 JSON。请只输出一个合法 JSON object。
 必须以 { 开头，以 } 结尾。
 不要 Markdown，不要代码围栏，不要解释文字。
 不要输出 plans 数组。
-字段只能包含 poi_fragments、day_openings、summary，以及可选的 packing_checklist 和 travel_tips；每个 fragment 只能包含 plan_index、day、place_id、text；每个 day_opening 只能包含 plan_index、day、text；summary 是一个字符串；每个 packing 分类只能包含 category 和 items；每条 travel_tips 必须且只能包含 title、content、evidence_ref。"""
+字段只能包含 poi_fragments、day_openings、summary，以及可选的 packing_checklist 和 travel_tips；每个 fragment 只能包含 plan_index、day、place_id、text，以及仅 full / structural 餐饮 slot 可用的可选 meal_fragment（attachment_key 五字段和 text）；每个 day_opening 只能包含 plan_index、day、text；summary 是一个字符串；每个 packing 分类只能包含 category 和 items；每条 travel_tips 必须且只能包含 title、content、evidence_ref。"""
 
+
+from src.agents.article_writer import (  # noqa: E402  (v0.15.1 article mode)
+    ARTICLE_SYSTEM_PROMPT,
+    article_to_keyed,
+    build_article_prompt,
+    food_hints as article_food_hints,
+)
 
 DATABASE_FLAVORED_PHRASES = BANNED_DATABASE_PHRASES
 
@@ -347,9 +523,8 @@ def _writer_strict_evidence_enabled() -> bool:
         return True
     if mode in {"0", "false", "no", "off", "never", "disabled"}:
         return False
-    profile = str(getattr(settings, "writer_relay_profile", "") or "").lower()
     model = str(getattr(settings, "writer_model", "") or "").lower()
-    return profile == "gemini" or "gemini" in model
+    return "gemini" in model
 
 
 def _writer_temperature(kind: str) -> float:
@@ -357,7 +532,11 @@ def _writer_temperature(kind: str) -> float:
     if kind == "repair":
         return float(getattr(settings, "writer_repair_temperature", 0.1))
     if kind == "retry":
+        if writer_prompt_version() == "article":
+            return float(settings.writer_article_temperature)
         return float(getattr(settings, "writer_retry_temperature", 0.1))
+    if writer_prompt_version() == "article":
+        return float(settings.writer_article_temperature)
     return float(getattr(settings, "writer_temperature", 0.15))
 
 
@@ -374,24 +553,30 @@ def _strict_evidence_prompt() -> str:
     )
 
 
-_FAMILY_MARKERS = (
-    "亲子",
-    "带娃",
-    "小孩",
-    "儿童",
-    "孩子",
-    "宝宝",
-    "遛娃",
+FAMILY_ARRANGEMENT_SLOT_GUIDANCE = (
+    "亲子安排上下文：按锁定站序写这一站家庭怎么一起走完；"
+    "转场写得更从容，少写折返和临时绕路；"
+    "路线里已有的休息或餐食按原样写，不得插入休息点。"
+    "不要只写人数或“三个人”；地点类型不能证明适龄或适合孩子。"
 )
 
 
 def _party_guidance(req: TripRequest) -> str:
     people_count = max(1, int(req.people_count or 1))
-    context_text = " ".join([*req.preferences, req.notes])
-    family_friendly = any(marker in context_text for marker in _FAMILY_MARKERS)
+    family_friendly = family_arrangement_active(req.preferences, notes=req.notes)
 
     lines = [f"同行人数：{people_count} 人。"]
-    if people_count == 1:
+    if family_friendly:
+        lines.append(
+            "用户明确有亲子/带娃语义：这是安排与口吻上下文，不是评分维度，也不是地点适宜性标签。"
+            "正文必须把亲子同行写进锁定行程的走法：按锁定站序一起完成各站，"
+            "转场更从容、减少折返，已有休息就按路线休息写。"
+            "禁止只用“几个人”或“三个人”交代同行；不得插入休息点、改动锁定站序，"
+            "也不得编造儿童年龄或无障碍条件。"
+            "地点类型不能证明适龄或适合孩子；没有专门授权证据时，"
+            "禁止把公园、景点或其他通用类型写成适合儿童。"
+        )
+    elif people_count == 1:
         lines.append(
             "按单人旅行写：突出灵活、citywalk 和可临时调整，不要写成多人同行或亲子场景。"
         )
@@ -403,11 +588,7 @@ def _party_guidance(req: TripRequest) -> str:
     else:
         lines.append("按双人/结伴出行写，保持正常同行节奏。")
 
-    if family_friendly:
-        lines.append(
-            "用户明确有亲子/带娃语义：写作中体现亲子友好、休息余量、少折返和儿童可接受节奏。"
-        )
-    else:
+    if not family_friendly:
         lines.append(
             "没有明确亲子/带娃语义时，禁止因为人数较多就自行写亲子、带娃、儿童或家庭标签。"
         )
@@ -428,19 +609,11 @@ def _parse_writer_output_with_diagnostics(
         "json_extract_failed": False,
     }
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            diagnostics["parse_error_type"] = "no_json_object_found"
-            diagnostics["json_extract_failed"] = True
-            return None, diagnostics
-        try:
-            data = json.loads(match.group())
-        except json.JSONDecodeError:
-            diagnostics["parse_error_type"] = "extracted_json_decode_error"
-            diagnostics["json_extract_failed"] = True
-            return None, diagnostics
+        data = decode_model_json(raw)
+    except (TypeError, json.JSONDecodeError):
+        diagnostics["parse_error_type"] = "extracted_json_decode_error"
+        diagnostics["json_extract_failed"] = True
+        return None, diagnostics
     if not isinstance(data, dict):
         diagnostics["parse_error_type"] = "json_root_not_object"
         return None, diagnostics
@@ -519,103 +692,22 @@ def _apply_json_decode_error_diagnostics(
     diagnostics["parse_error_position"] = offset + exc.pos
 
 
-def _strip_json_bom_and_control_chars(candidate: str) -> str:
-    text = candidate.lstrip("\ufeff")
-    return "".join(
-        char
-        for char in text
-        if ord(char) >= 32 or char in {"\t", "\n", "\r"}
-    )
-
-
-def _remove_json_trailing_commas(candidate: str) -> str:
-    return re.sub(r",\s*([\]}])", r"\1", candidate)
-
-
-def _escape_non_structural_json_string_quotes(candidate: str) -> str:
-    repaired: list[str] = []
-    in_string = False
-    escaped = False
-    length = len(candidate)
-    for index, char in enumerate(candidate):
-        if not in_string:
-            repaired.append(char)
-            if char == '"':
-                in_string = True
-            continue
-        if escaped:
-            repaired.append(char)
-            escaped = False
-            continue
-        if char == "\\":
-            repaired.append(char)
-            escaped = True
-            continue
-        if char != '"':
-            repaired.append(char)
-            continue
-
-        lookahead = index + 1
-        while lookahead < length and candidate[lookahead].isspace():
-            lookahead += 1
-        next_char = candidate[lookahead] if lookahead < length else ""
-        if next_char in {":", ",", "}", "]"}:
-            repaired.append(char)
-            in_string = False
-        else:
-            repaired.append('\\"')
-    return "".join(repaired)
-
-
-def _json_candidate_variants(candidate: str) -> list[str]:
-    variants = [candidate]
-    normalized = _remove_json_trailing_commas(
-        _strip_json_bom_and_control_chars(candidate)
-    )
-    if normalized != candidate:
-        variants.append(normalized)
-    quote_repaired = _escape_non_structural_json_string_quotes(normalized)
-    if quote_repaired not in variants:
-        variants.append(quote_repaired)
-    return variants
-
-
 def _extract_first_json_object_with_diagnostics(
     raw: str,
 ) -> tuple[dict | None, dict[str, Any]]:
     diagnostics = _base_writer_raw_output_diagnostics(raw)
-    text = raw or ""
-    decoder = json.JSONDecoder()
-    saw_object_start = False
-    last_decode_error: json.JSONDecodeError | None = None
-    last_decode_error_offset = 0
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
-        saw_object_start = True
-        for candidate in _json_candidate_variants(text[index:]):
-            try:
-                value, _end = decoder.raw_decode(candidate)
-            except json.JSONDecodeError as exc:
-                last_decode_error = exc
-                last_decode_error_offset = index
-                continue
-            if isinstance(value, dict):
-                return value, diagnostics
-            diagnostics["parse_error_type"] = "json_root_not_object"
-            diagnostics["parse_error_message"] = "JSON root is not an object"
-            diagnostics["parse_error_position"] = index
-            return None, diagnostics
-    diagnostics["json_extract_failed"] = True
-    diagnostics["parse_error_type"] = (
-        "extracted_json_decode_error" if saw_object_start else "no_json_object_found"
-    )
-    _apply_json_decode_error_diagnostics(
-        diagnostics,
-        last_decode_error,
-        offset=last_decode_error_offset,
-    )
-    return None, diagnostics
+    try:
+        value = decode_model_json(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        diagnostics["json_extract_failed"] = True
+        diagnostics["parse_error_type"] = "extracted_json_decode_error"
+        if isinstance(exc, json.JSONDecodeError):
+            _apply_json_decode_error_diagnostics(diagnostics, exc)
+        return None, diagnostics
+    if not isinstance(value, dict):
+        diagnostics["parse_error_type"] = "json_root_not_object"
+        return None, diagnostics
+    return value, diagnostics
 
 
 def _parse_single_plan_writer_output_with_diagnostics(
@@ -688,6 +780,7 @@ def _structured_evidence_summary(
 
 
 def _route_plan_prompt(route_plans: list[RoutePlan]) -> str:
+    from src.agents.route_experience_facts import day_experience_prompt
     sections = []
     for index, route_plan in enumerate(route_plans, 1):
         day_lines = []
@@ -718,6 +811,13 @@ def _route_plan_prompt(route_plans: list[RoutePlan]) -> str:
                 line += "\n  通勤参考：" + "；".join(day_group.commute_notes)
             if day_group.time_hints:
                 line += "\n  时段提示：" + "；".join(day_group.time_hints)
+            if day_group.time_policy:
+                policy = day_group.time_policy
+                line += "\n  内部锁定时间策略：" + json.dumps(policy.model_dump(), ensure_ascii=False)
+            if day_group.visit_profiles:
+                line += "\n  内部锁定活动安排（全天不是分钟或完整游览保证；园内成员名称须保留；不得自行选玩法）：" + json.dumps(
+                    [p.model_dump() for p in day_group.visit_profiles], ensure_ascii=False)
+            line += "\n  " + day_experience_prompt(day_group)
             day_lines.append(line)
         if route_plan.optimized:
             heading = (
@@ -730,6 +830,9 @@ def _route_plan_prompt(route_plans: list[RoutePlan]) -> str:
                 f"（对应候选组{route_plan.label}，"
                 f"最终共{len(route_plan.day_groups)}天）"
             )
+        if route_plan.preference_coverage:
+            day_lines.append("内部偏好取舍依据：" + json.dumps(route_plan.preference_coverage, ensure_ascii=False)
+                + "。NO_ELIGIBLE_MATCH/HARD_CONFLICT 仅说明当前可信资料和已核实条件的限制，正文须简短说明合理妥协；不能推断整座城市资源不足。搜索未找到或超时不能解释为偏好无法满足。")
         sections.append(f"{heading}：\n" + "\n".join(day_lines))
     return "\n\n".join(sections)
 
@@ -843,6 +946,9 @@ def _food_attachment_prompt(
                     },
                     "writing_hint": dict(hint),
                 }
+                if str(hint.get("evidence_tier")) in {"full", "structural"}:
+                    row["writer_output_field"] = "meal_fragment"
+                    row["anchor_text_field"] = "text"
                 if str(hint.get("evidence_tier")) == "full":
                     authorization = auth_map.get(attachment_key)
                     if authorization is not None:
@@ -1163,6 +1269,7 @@ def _merge_locked_place_fields(
     transport: TransportSuggestion | None = None,
     packing_checklist: list[PackingChecklistGroup] | None = None,
     travel_tips: list[TravelTip] | None = None,
+    code_lodging_section: str = "",
 ) -> PlanOutput:
     """Build PlanOutput and always fill place structure from the lock.
 
@@ -1174,6 +1281,8 @@ def _merge_locked_place_fields(
     omits it silently resets the plan summary to the deterministic fallback.
     Rebuilds of an existing Writer PlanOutput must also pass the already-sanitized
     ``packing_checklist`` and ``travel_tips``; omitting them resets both to None.
+    They must also pass ``code_lodging_section``; without it the publish gate
+    reads the code-written lodging paragraph as writer text.
     """
     del retrieval  # reserved for diagnostics; structure never comes from Writer
     if route_plan is not None:
@@ -1193,6 +1302,7 @@ def _merge_locked_place_fields(
             packing_checklist=packing_checklist,
             travel_tips=travel_tips,
             poi_fragments=poi_fragments or [],
+            code_lodging_section=code_lodging_section,
         )
     return PlanOutput(
         plan_name=plan_name,
@@ -1209,6 +1319,7 @@ def _merge_locked_place_fields(
         packing_checklist=packing_checklist,
         travel_tips=travel_tips,
         poi_fragments=poi_fragments or [],
+        code_lodging_section=code_lodging_section,
     )
 
 
@@ -1269,6 +1380,8 @@ def _single_route_prompt(
     validation_candidate_names: list[str] | None = None,
     structured_evidence_payload: StructuredEvidencePayload | None = None,
 ) -> str:
+    from src.agents.route_experience_facts import day_experience_prompt
+
     lines = []
     del validation_candidate_names
     if structured_evidence_payload is None:
@@ -1306,6 +1419,7 @@ def _single_route_prompt(
             f"Day {day_group.day}: "
             + "、".join(place.name for place in day_group.places)
             + commute
+            + "\n  " + day_experience_prompt(day_group)
             + "\n"
             + "\n".join(place_lines)
         )
@@ -1448,6 +1562,20 @@ def _fill_missing_locked_names_in_day_body(
     return result
 
 
+def _apply_plan_preference_notices(plan, route_plan, trip_request):
+    """Put fixed preference sentences back after Writer, repair, or weather edits."""
+    from src.agents.preference_notices import apply_preference_notices, plan_uses_program_hints
+
+    if route_plan is None or trip_request is None:
+        return plan
+    return apply_preference_notices(
+        plan,
+        route_plan,
+        trip_request,
+        program_hints=plan_uses_program_hints(plan),
+    )
+
+
 def _minimal_locked_day_text(day_group: RouteDayGroup) -> str:
     names = [place.name for place in day_group.places if place.name]
     if not names:
@@ -1534,11 +1662,33 @@ _DAY_OPENING_MIN_CHARS = 6
 _DAY_OPENING_MAX_CHARS = 80
 
 
+_LEADING_DAY_LABEL_RE = re.compile(
+    r"^\s*(?:Day\s*\d+|第\s*[一二三四五六七八九十\d]+\s*[天日])\s*[，,：:、。\s]*", re.I
+)
+
+
+def _blocking_fact_matches(text: str, *, timeline: bool) -> list:
+    """Unsupported-fact matches that drop a whole opening, wrap or summary.
+
+    The timeline prompt's tier table drops these only for block-tier rules;
+    record-tier wording is recorded elsewhere, not a reason to lose the text.
+    """
+    matches = unsupported_fact_pattern_matches(text)
+    if not timeline:
+        return matches
+    from src.agents.writing_tiers import blocking_fact_reasons
+    blocking = blocking_fact_reasons()
+    return [(reason, match) for reason, match in matches if reason in blocking]
+
+
 def _sanitize_day_opening_text(
     raw_text: Any,
     *,
     banned_names: list[str],
     same_day_place_names: list[str] | None = None,
+    max_chars: int = _DAY_OPENING_MAX_CHARS,
+    ordered_names: bool = True,
+    timeline: bool = False,
 ) -> tuple[str, str]:
     """Admit a theme-only day opening or return a drop reason.
 
@@ -1553,8 +1703,13 @@ def _sanitize_day_opening_text(
     """
     if not isinstance(raw_text, str) or not raw_text.strip():
         return "", "opening_empty"
+    if writer_prompt_version() == "article":
+        return _article_prose(raw_text, max_chars=ARTICLE_OPENING_MAX_CHARS)
     text = re.sub(r"\s+", " ", raw_text).strip()
-    if not (_DAY_OPENING_MIN_CHARS <= len(text) <= _DAY_OPENING_MAX_CHARS):
+    if timeline:
+        # "第一天先……" is how models open a day; the label is backend's job.
+        text = _LEADING_DAY_LABEL_RE.sub("", text, count=1).strip()
+    if not (_DAY_OPENING_MIN_CHARS <= len(text) <= max_chars):
         return "", "opening_length_out_of_range"
     if re.search(r"\d", text):
         return "", "opening_contains_digit"
@@ -1564,6 +1719,11 @@ def _sanitize_day_opening_text(
         return "", "opening_contains_backend_structure"
     if any(marker in text for marker in _DAY_OPENING_TRANSIT_MARKERS):
         return "", "opening_contains_transit"
+    # Weather lives in the structured weather card. Weather prose in an
+    # opening or wrap has no fragment owner to prune or repair, so the
+    # downstream weather check would fail the whole plan (v0.15.1 replay).
+    if is_weather_line(text):
+        return "", "opening_weather_claim"
     day_names = [name for name in (same_day_place_names or []) if name]
     day_name_set = set(day_names)
     if any(
@@ -1572,13 +1732,13 @@ def _sanitize_day_opening_text(
         if name not in day_name_set
     ):
         return "", "opening_contains_place_name"
-    if day_names:
+    if day_names and ordered_names:
         mentioned = extract_claimed_names(text, day_names)
         if mentioned and mentioned != day_names[: len(mentioned)]:
             return "", "opening_place_order_violation"
     if has_hard_fact_marker(text):
         return "", "opening_contains_hard_fact"
-    if unsupported_fact_pattern_matches(text):
+    if _blocking_fact_matches(text, timeline=timeline):
         return "", "opening_unsupported_expression"
     if untrusted_transport_claim_matches(text):
         return "", "opening_transport_claim"
@@ -1589,14 +1749,44 @@ def _sanitize_day_opening_text(
     return text, ""
 
 
+# v0.15.1 article: a day's intro is shown whole (the result narrative is cut at 1500).
+ARTICLE_OPENING_MAX_CHARS = 1400
+
+
+def _article_prose(raw_text: str, *, max_chars: int) -> tuple[str, str]:
+    """An article intro keeps its lines; only what the backend owns goes.
+
+    A leading day label repeats the day title, and an arrow or a line that
+    starts like a day title would be read as route structure downstream.
+    """
+    text = ""
+    for line in raw_text.splitlines():
+        line = _LEADING_DAY_LABEL_RE.sub("", line.strip(), count=1).strip()
+        line = line.replace("->", "，").replace("→", "，")
+        if not line or _KEYED_FRAGMENT_DAY_SYNTAX_RE.search(line):
+            continue
+        if len(text) + len(line) + 1 > max_chars:
+            break
+        text = f"{text}\n{line}" if text else line
+    return (text, "") if text else ("", "opening_empty")
+
+
 _SUMMARY_MIN_CHARS = 50
 _SUMMARY_MAX_CHARS = 130
+# v0.15.1 timeline prompt: 2-4 sentence openings, one-line wraps, a summary
+# that may name route places.
+TIMELINE_OPENING_MAX_CHARS = 160
+TIMELINE_WRAP_MAX_CHARS = 80
+TIMELINE_SUMMARY_MAX_CHARS = 160
 
 
 def _sanitize_summary_text(
     raw_text: Any,
     *,
     banned_names: list[str],
+    allowed_names: set[str] | frozenset[str] = frozenset(),
+    max_chars: int = _SUMMARY_MAX_CHARS,
+    timeline: bool = False,
 ) -> tuple[str, str]:
     """Admit a Writer whole-trip summary or return a drop reason.
 
@@ -1608,17 +1798,20 @@ def _sanitize_summary_text(
     if not isinstance(raw_text, str) or not raw_text.strip():
         return "", "summary_empty"
     text = re.sub(r"\s+", " ", raw_text).strip()
-    if not (_SUMMARY_MIN_CHARS <= len(text) <= _SUMMARY_MAX_CHARS):
+    if writer_prompt_version() == "article":
+        # The article's first lines, already checked per sentence (article_writer).
+        return text[:TIMELINE_SUMMARY_MAX_CHARS], ""
+    if not (_SUMMARY_MIN_CHARS <= len(text) <= max_chars):
         return "", "summary_length_out_of_range"
     if _KEYED_FRAGMENT_DAY_SYNTAX_RE.search(text) or any(
         marker in text for marker in _KEYED_FRAGMENT_ROUTE_SYNTAX
     ):
         return "", "summary_contains_backend_structure"
-    if any(name and name in text for name in banned_names):
+    if any(name and name in text and name not in allowed_names for name in banned_names):
         return "", "summary_contains_place_name"
     if has_hard_fact_marker(text):
         return "", "summary_contains_hard_fact"
-    if unsupported_fact_pattern_matches(text):
+    if _blocking_fact_matches(text, timeline=timeline):
         return "", "summary_unsupported_expression"
     if untrusted_transport_claim_matches(text):
         return "", "summary_transport_claim"
@@ -1648,6 +1841,7 @@ def _sanitize_keyed_fragment_text(
     weather_advisory_payload: WeatherAdvisoryPayload | None,
     allowed_contextual_names: list[str] | None = None,
     same_day_prior_place_names: set[str] | None = None,
+    fragment_key: tuple[int, int, int] | None = None,
 ) -> tuple[str, list[Any], str]:
     """Clean one already-keyed fragment without inferring its owner from text."""
     if not isinstance(raw_text, str) or not raw_text.strip():
@@ -1693,6 +1887,27 @@ def _sanitize_keyed_fragment_text(
         },
         key=lambda value: (-len(value), value),
     )
+    if writer_prompt_version() == "article":
+        # v0.15.1 D3: the article may name any place; naming is not visiting.
+        # Route checks read the backend skeleton (article_writer.article_skeleton).
+        disallowed_names = []
+    elif writer_prompt_version() == "timeline":
+        # Another day's stop (or a later one past the next) named here fails
+        # the whole draft on route order; drop the sentence instead (v0.15.1
+        # replay P06: "开在洪崖洞附近的火锅店" on day 3, 洪崖洞 on day 1).
+        disallowed_names = sorted(
+            {*disallowed_names, *(
+                p.name for d in route_plan.day_groups for p in d.places
+                if p.name and p.name != place_name
+                and p.name not in allowed_names and p.name not in effective_same_day
+            )},
+            key=lambda value: (-len(value), value),
+        )
+    reference_places = [
+        p for d in route_plan.day_groups for p in d.places
+        if fragment_key is not None and (d.day, p.place_id) == fragment_key[1:]
+        and p.name == place_name
+    ]
     sanitized, sanitizer_actions = sanitize_repair_text(
         weather_cleaned,
         issues=initial_issues,
@@ -1703,10 +1918,13 @@ def _sanitize_keyed_fragment_text(
             *sorted(effective_same_day),
         ],
         locked_day_names=None,
+        reference_place=reference_places[0] if len(reference_places) == 1 else None,
+        reference_locked_names={p.name for d in route_plan.day_groups for p in d.places},
     )
     text = re.sub(r"\s+", " ", sanitized).strip()
     text = re.sub(
-        rf"^\s*{re.escape(place_name)}\s*[：:，,。\-—]*\s*",
+        # "李公堤是金鸡湖边…" keeps its subject; only "李公堤：…" repeats the heading
+        rf"^\s*{re.escape(place_name)}\s*[：:，,。\-—]+\s*",
         "",
         text,
         count=1,
@@ -1718,6 +1936,13 @@ def _sanitize_keyed_fragment_text(
         "",
         text,
     ).strip()
+    if timeline_assembly():
+        # "第二天一早……" names the day the card already sits under; drop the
+        # label rather than the whole stop (v0.15.1 replay, 3 of 8 fallbacks).
+        # A label that is the sentence's subject reads as "今天": "第一天的第一口"
+        # must not become "的第一口" (11-18 DS replay).
+        text = _LEADING_DAY_LABEL_RE.sub(
+            lambda m: "" if re.search(r"[，,：:、。]", m.group(0)) else "今天", text, count=1).strip()
     actions: list[Any] = [*weather_actions, *sanitizer_actions]
     if not text:
         return "", actions, "fragment_empty_after_sanitizer"
@@ -1726,6 +1951,243 @@ def _sanitize_keyed_fragment_text(
     ):
         return "", actions, "fragment_contains_backend_structure"
     return text, actions, ""
+
+
+def _name_occurrence_intervals(text: str, name: str):
+    """Retain every exact occurrence, including overlapping occurrences."""
+    if not name:
+        return
+    start = text.find(name)
+    while start >= 0:
+        yield start, start + len(name)
+        start = text.find(name, start + 1)
+
+
+def _meal_text_ownership_rejection(
+    text: str, *, food_name: str, route_narrative_names: set[str],
+    validation_candidate_names: list[str],
+) -> str:
+    # Judge original occurrence boundaries; deleting the restaurant substring
+    # can destroy a longer or partially overlapping known POI name. Only a
+    # complete known-name occurrence within one exact food-name occurrence is
+    # exempt. Policy-provided names remain the sole alias/context authority.
+    food_intervals = list(_name_occurrence_intervals(text, food_name))
+    route_narrative_found = False
+    for name in set(validation_candidate_names) | route_narrative_names:
+        for start, end in _name_occurrence_intervals(text, name):
+            if any(a <= start and end <= b for a, b in food_intervals):
+                continue
+            if any(start < b and a < end for a, b in food_intervals):
+                return "meal_fragment_contains_candidate_name_collision"
+            if name in route_narrative_names:
+                route_narrative_found = True
+    if route_narrative_found:
+        return "meal_fragment_contains_route_narrative"
+    # Disjoint external candidates stay subject to the existing membership gate.
+    return ""
+
+
+# v0.15.1 timeline: these meal_fragment faults stay inside the meal sentence,
+# so only that sentence is dropped. Marker and legacy-span faults still fail.
+_TIMELINE_DROPPABLE_MEAL_REJECTIONS = frozenset({
+    "meal_fragment_shape_invalid",
+    "meal_fragment_slot_not_authorized",
+    "meal_fragment_key_invalid",
+    "meal_fragment_key_not_locked",
+    "meal_fragment_text_empty",
+    "meal_fragment_contains_backend_structure",
+    "meal_fragment_food_name_missing",
+    "meal_fragment_contains_route_narrative",
+    "meal_fragment_contains_candidate_name_collision",
+})
+
+
+def _keyed_meal_fragment_text(
+    raw_item: dict[str, Any],
+    *,
+    key: tuple[int, int, int],
+    food_hint: dict[str, Any] | None,
+    route_narrative_names: set[str],
+    validation_candidate_names: list[str],
+) -> tuple[str, str]:
+    """Read an explicit private meal slot without guessing ownership from prose.
+
+    This only binds text to the existing attachment key. The unchanged food
+    authorization and publish checks still decide whether it may be delivered.
+    """
+    if "meal_fragment" not in raw_item:
+        # Compatible legacy spans must be one complete matching pair. Never
+        # reinterpret conflicting/nested markup or infer an unmarked boundary.
+        legacy_text = raw_item.get("text")
+        if isinstance(legacy_text, str) and (
+            "<!--" in legacy_text or "-->" in legacy_text
+        ):
+            spans = parse_food_spans(legacy_text)
+            if (
+                food_hint is None
+                or food_hint.get("evidence_tier") not in {"full", "structural", "none"}
+                or len(spans) != 1
+                or legacy_text.count("<!--") != 2
+                or legacy_text.count("-->") != 2
+                or spans[0].key != (
+                    key[0] - 1, key[1], key[2], food_hint.get("meal_slot"),
+                    food_hint.get("food_place_id"),
+                )
+            ):
+                return "", "meal_fragment_legacy_marker_invalid"
+            # An empty, correctly bound none-tier slot carries no Writer facts.
+            # Let the backend fill its canonical text below. Nonempty content
+            # still must match the authorized text; never discard extra claims.
+            if food_hint.get("evidence_tier") == "none" and spans[0].content.strip() and (
+                _normalize_none_tier_text(spans[0].content)
+                != _normalize_none_tier_text(str(food_hint.get("none_tier_text") or ""))
+            ):
+                return "", "meal_fragment_legacy_none_text_invalid"
+            if food_hint.get("evidence_tier") in {"full", "structural"}:
+                rejection = _meal_text_ownership_rejection(
+                    spans[0].content,
+                    food_name=str(food_hint.get("food_name") or ""),
+                    route_narrative_names=route_narrative_names,
+                    validation_candidate_names=validation_candidate_names,
+                )
+                if rejection:
+                    return "", rejection
+        return "", ""
+    meal = raw_item["meal_fragment"]
+    if not isinstance(meal, dict) or set(meal) != {"attachment_key", "text"}:
+        return "", "meal_fragment_shape_invalid"
+    if food_hint is None or food_hint.get("evidence_tier") not in {"full", "structural"}:
+        return "", "meal_fragment_slot_not_authorized"
+    attachment_key = meal["attachment_key"]
+    key_fields = {"plan_index", "day", "anchor_place_id", "meal_slot", "food_place_id"}
+    if not isinstance(attachment_key, dict) or set(attachment_key) != key_fields:
+        return "", "meal_fragment_key_invalid"
+    if any(
+        type(attachment_key[field]) is not int
+        for field in ("plan_index", "day", "anchor_place_id", "food_place_id")
+    ) or not isinstance(attachment_key["meal_slot"], str):
+        return "", "meal_fragment_key_invalid"
+    expected = {
+        "plan_index": key[0] - 1,
+        "day": key[1],
+        "anchor_place_id": key[2],
+        "meal_slot": food_hint.get("meal_slot"),
+        "food_place_id": food_hint.get("food_place_id"),
+    }
+    if attachment_key != expected:
+        return "", "meal_fragment_key_not_locked"
+    marker = _food_span_marker(**expected)
+    if marker != food_hint.get("span_marker"):
+        return "", "meal_fragment_hint_marker_conflict"
+    anchor_text = raw_item.get("text")
+    meal_text = meal["text"]
+    if not isinstance(meal_text, str) or not meal_text.strip():
+        return "", "meal_fragment_text_empty"
+    if any(
+        token in str(text or "")
+        for text in (anchor_text, meal_text)
+        for token in ("<!--", "-->")
+    ):
+        return "", "meal_fragment_marker_conflict"
+    if (
+        _KEYED_FRAGMENT_DAY_SYNTAX_RE.search(meal_text)
+        or re.search(r"(?i)\bDay\s*\d+|第\s*[一二三四五六七八九十\d]+\s*[天日]", meal_text)
+        or any(token in meal_text for token in ("通勤参考", "->", "→"))
+    ):
+        return "", "meal_fragment_contains_backend_structure"
+    food_name = str(food_hint.get("food_name") or "")
+    if not food_name or food_name not in meal_text:
+        return "", "meal_fragment_food_name_missing"
+    rejection = _meal_text_ownership_rejection(
+        meal_text, food_name=food_name, route_narrative_names=route_narrative_names,
+        validation_candidate_names=validation_candidate_names,
+    )
+    if rejection:
+        return "", rejection
+    return meal_text.strip(), ""
+
+
+_NONE_TIER_CLAUSE_RE = re.compile(r"([。；;])")
+# Positive dining advice is "找家{venue}" plus only the closed filler words that
+# appear in the canonical none sentence and the known pure-meal rewrites.
+# 随便 is the confirmed synonym of 随缘/随意. Any other character keeps the clause.
+# An absent action word is not evidence.
+_NONE_TIER_SUGGESTION_CORES = (
+    "找家美食街",
+    "找家咖啡店",
+    "找家甜品店",
+    "找家餐厅",
+    "找家餐馆",
+    "找家小吃",
+)
+_NONE_TIER_SUGGESTION_FILLERS = (
+    "这一带",
+    "当午饭",
+    "可以",
+    "随缘",
+    "随意",
+    "随便",
+    "就近",
+    "午餐",
+    "晚餐",
+    "午饭",
+    "中午",
+    "用餐",
+    "吃饭",
+    "茶歇",
+    "夜宵",
+    "小吃",
+    "解决",
+)
+_NONE_TIER_SUGGESTION_TOKENS = tuple(
+    sorted(
+        (*_NONE_TIER_SUGGESTION_CORES, *_NONE_TIER_SUGGESTION_FILLERS),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _is_pure_none_dining_clause(body: str) -> bool:
+    """True only when every character is a find-a-restaurant suggestion.
+
+    Meal-adjacent action, movement, and restaurant-building prose stay, including
+    wording that merely contains 午饭, 午餐, 用餐, or 餐馆.
+    """
+    text = body.strip()
+    if not text or not any(core in text for core in _NONE_TIER_SUGGESTION_CORES):
+        return False
+    remainder = text
+    for token in _NONE_TIER_SUGGESTION_TOKENS:
+        remainder = remainder.replace(token, "")
+    return remainder.strip() == ""
+
+
+def _strip_pure_none_dining_clauses(text: str) -> str:
+    """Drop pure dining clauses. Keep sentence punctuation on retained clauses."""
+    parts = _NONE_TIER_CLAUSE_RE.split(text)
+    kept: list[str] = []
+    index = 0
+    while index < len(parts):
+        body = parts[index]
+        delimiter = parts[index + 1] if index + 1 < len(parts) else ""
+        index += 2 if delimiter else 1
+        if _is_pure_none_dining_clause(body):
+            continue
+        kept.append(body)
+        if delimiter:
+            kept.append(delimiter)
+    return "".join(kept)
+
+
+def _separate_canonical_none_sentence(text: str) -> str:
+    """Keep the canonical none sentence from gluing onto a retained clause."""
+    stripped = text.rstrip()
+    if not stripped or stripped.endswith(("：", ":", "。", "！", "？", "!", "?")):
+        return stripped
+    if stripped.endswith(("；", ";")):
+        return stripped[:-1] + "。"
+    return stripped + "。"
 
 
 def _assemble_keyed_writer_plan(
@@ -1737,9 +2199,13 @@ def _assemble_keyed_writer_plan(
     composition_blueprint: CompositionBlueprint | None,
     validation_candidate_names: list[str],
     weather_advisory_payload: WeatherAdvisoryPayload | None,
+    retrieval_city: str = "",
+    poi_identity_result: PoiIdentityResult | None = None,
     raw_day_openings: Any = None,
     accommodation: AccommodationSuggestion | None = None,
     transport: TransportSuggestion | None = None,
+    trip_request: TripRequest | None = None,
+    raw_day_wraps: Any = None,
 ) -> KeyedPlanAssemblyResult:
     """Validate Writer fragment slots and assemble final text in backend order.
 
@@ -1747,6 +2213,19 @@ def _assemble_keyed_writer_plan(
     closed from the pre-Writer Action Plan.  No whole-plan LLM retry is used.
     """
     result = KeyedPlanAssemblyResult()
+    timeline = timeline_assembly()
+    # Consume the same accepted route/context surfaces as the product gate.
+    # Do not create Writer-specific city stripping, aliases or POI authority.
+    name_policy = build_route_name_policy(
+        locked_places=[
+            place for day_group in route_plan.day_groups
+            for place in day_group.places
+        ],
+        candidate_names=validation_candidate_names,
+        identity_result=poi_identity_result,
+        city_name=retrieval_city,
+    )
+    route_narrative_names = name_policy.route_names | name_policy.contextual_text_names
     expected_places = {
         (plan_index, day_group.day, place.place_id): (day_group, place)
         for day_group in route_plan.day_groups
@@ -1814,9 +2293,8 @@ def _assemble_keyed_writer_plan(
             else []
         )
     }
-    # Map (plan_index, day, place_id) → writing_hint for food-stop marker
-    # injection.  The Writer never outputs HTML comment markers; the
-    # assembler injects them deterministically so publish_gate can verify.
+    # The existing hint binds a private meal subfragment to its exact slot.
+    # Correct legacy inline spans remain gate-checked without reclassification.
     food_hint_by_key: dict[tuple[int, int, int], dict[str, Any]] = {}
     for day in (
         composition_blueprint.days
@@ -1902,6 +2380,8 @@ def _assemble_keyed_writer_plan(
                 item.get("text"),
                 banned_names=opening_banned_names,
                 same_day_place_names=opening_day_names.get(opening_day),
+                max_chars=TIMELINE_OPENING_MAX_CHARS if timeline else _DAY_OPENING_MAX_CHARS,
+                timeline=timeline,
             )
             if rejection:
                 result.day_opening_dropped.append({
@@ -1911,6 +2391,30 @@ def _assemble_keyed_writer_plan(
                 })
                 continue
             openings_by_day[opening_day] = text
+
+    # v0.15.1: one closing line per day after its places. Any same-day place
+    # may be named (all of them came first); other days' places may not.
+    wraps_by_day: dict[int, str] = {}
+    if timeline and isinstance(raw_day_wraps, list):
+        for raw_index, item in enumerate(raw_day_wraps):
+            wrap_day = _raw_positive_int(item.get("day")) if isinstance(item, dict) else None
+            if (not isinstance(item, dict) or _raw_positive_int(item.get("plan_index")) != plan_index
+                    or wrap_day is None or wrap_day in wraps_by_day):
+                result.day_wrap_dropped.append({"raw_index": raw_index, "reason": "wrap_key_invalid"})
+                continue
+            text, rejection = _sanitize_day_opening_text(
+                item.get("text"),
+                banned_names=opening_banned_names,
+                same_day_place_names=opening_day_names.get(wrap_day),
+                max_chars=TIMELINE_WRAP_MAX_CHARS,
+                ordered_names=False,
+                timeline=True,
+            )
+            if rejection:
+                result.day_wrap_dropped.append({"raw_index": raw_index, "day": wrap_day,
+                                                "reason": rejection.replace("opening_", "wrap_")})
+                continue
+            wraps_by_day[wrap_day] = text
 
     parts: list[str] = []
     cursor = 0
@@ -1950,7 +2454,20 @@ def _assemble_keyed_writer_plan(
             )
 
     if accommodation is not None:
-        if accommodation.source == "user_specified":
+        if lodging_section_v2_enabled():
+            rendered = render_lodging_section(
+                accommodation=accommodation,
+                route_plan=route_plan,
+                trip_request=trip_request,
+                prices=lodging_prices_for_assembly(),
+                nearby_hotel_names=route_plan.nearby_lodging_hotel_names,
+                mid_markup=lodging_mid_markup(),
+            )
+            if rendered:
+                block = rendered + "\n\n"
+                append(block)
+                result.code_lodging_section = block
+        elif accommodation.source == "user_specified":
             if route_plan.accommodation_policy_version and route_plan.accommodation_anchor:
                 precision = route_plan.accommodation_anchor.location_precision
                 basis = "住宿区域" if precision == "area" else "住宿位置"
@@ -1966,10 +2483,15 @@ def _assemble_keyed_writer_plan(
                     "每天安排已考虑往返距离。\n\n"
                 )
         else:
-            append(
-                f"【住宿建议】建议住在{accommodation.name}附近，"
-                f"{accommodation.reason}。\n\n"
-            )
+            reason = f"，{accommodation.reason}" if accommodation.reason else ""
+            append(f"【住宿建议】建议住在{accommodation.name}附近{reason}。\n\n")
+
+    preference_notices = None
+    if trip_request is not None:
+        from src.agents.preference_notices import build_preference_notices
+        preference_notices = build_preference_notices(trip_request, route_plan)
+        if preference_notices.trip_lines:
+            append("\n".join(preference_notices.trip_lines) + "\n\n")
 
     for day_offset, day_group in enumerate(route_plan.day_groups):
         if day_offset:
@@ -1983,6 +2505,9 @@ def _assemble_keyed_writer_plan(
             summary = access_summary(day_group)
             if summary:
                 append(summary + "。\n")
+        if preference_notices is not None:
+            for line in (preference_notices.day_lines or {}).get(int(day_group.day), ()):
+                append(line + "\n")
         grounded_arrival_lines: list[str] = []
         opening = openings_by_day.get(day_group.day)
         if opening:
@@ -2011,18 +2536,62 @@ def _assemble_keyed_writer_plan(
                 })
                 return result
             raw_item = raw_by_key.get(key)
+            meal_text, meal_rejection = _keyed_meal_fragment_text(
+                raw_item or {}, key=key, food_hint=food_hint_by_key.get(key),
+                route_narrative_names=route_narrative_names,
+                validation_candidate_names=validation_candidate_names,
+            )
+            anchor_raw = (raw_item or {}).get("text")
+            if (
+                meal_rejection in _TIMELINE_DROPPABLE_MEAL_REJECTIONS
+                and timeline
+                and "meal_fragment" in (raw_item or {})
+                and not any(token in str(anchor_raw or "") for token in ("<!--", "-->"))
+            ):
+                result.meal_dropped.append({
+                    "plan_index": key[0], "day": key[1], "place_id": key[2],
+                    "reason": meal_rejection,
+                })
+                meal_rejection = ""
+            if meal_rejection:
+                result.failure_reason = "writer_keyed_meal_fragment_invalid"
+                result.invalid_details.append({
+                    "reason": meal_rejection,
+                    "plan_index": key[0], "day": key[1], "place_id": key[2],
+                })
+                return result
             raw_text = raw_item.get("text") if raw_item is not None else None
+            food_hint = food_hint_by_key.get(key)
+            legacy_food = ""
+            if isinstance(raw_text, str):
+                legacy_food = "".join(
+                    raw_text[span.start:span.end] for span in parse_food_spans(raw_text)
+                )
+                attachment_text = (
+                    f"{food_hint['span_marker']}{meal_text}<!-- /food -->"
+                    if meal_text and food_hint else raw_text
+                )
+                raw_text = normalize_body_food_boundary(
+                    raw_text, key=key, attachment_text=attachment_text,
+                    food_hint=food_hint, place_name=place.name,
+                    route_place_names=tuple(
+                        p.name for group in route_plan.day_groups for p in group.places
+                    ),
+                )
             cleaned, actions, rejection = _sanitize_keyed_fragment_text(
                 raw_text,
                 place_name=place.name,
                 route_plan=route_plan,
                 validation_candidate_names=validation_candidate_names,
                 weather_advisory_payload=weather_advisory_payload,
+                fragment_key=key,
                 allowed_contextual_names=contextual_names_by_key.get(key),
                 same_day_prior_place_names={
                     p.name
-                    for p in day_group.places[:place_offset]
-                    if p.name
+                    # v0.15.1 timeline prompt may preview the next stop:
+                    # first-hit order still holds after this stop's label.
+                    for p in day_group.places[:place_offset + (2 if timeline else 1)]
+                    if p.name and p.place_id != place.place_id
                 },
             )
             result.sanitizer_actions.extend(actions)
@@ -2050,6 +2619,8 @@ def _assemble_keyed_writer_plan(
                     "plan_index": key[0],
                     "day": key[1],
                     "place_id": key[2],
+                    # v0.15.1: which draft text the checks emptied, for the replay.
+                    **({"raw_snippet": str(raw_text or "")[:80]} if timeline else {}),
                 })
                 result.sanitizer_actions.append({
                     "action": "keyed_fragment_completion",
@@ -2066,35 +2637,42 @@ def _assemble_keyed_writer_plan(
                 line = f"{place.name}：{cleaned}"
                 source = "writer"
 
-            # ── Food span marker injection ──────────────────────────
-            # The Writer never outputs HTML comment markers.  For every
-            # food-stop slot we deterministically wrap the food prose
-            # with the marker pair that publish_gate expects.
+            # Only explicitly keyed meal text receives a new food span.
+            # Neither the anchor narrative nor ambiguous legacy prose is wrapped.
             food_hint = food_hint_by_key.get(key)
             if food_hint is not None:
                 span_marker = str(food_hint.get("span_marker") or "")
                 tier = str(food_hint.get("evidence_tier") or "")
                 close_marker = "<!-- /food -->"
                 if tier == "none":
-                    # None tier: replace any Writer attempt with the
-                    # canonical none_tier_text wrapped in markers.
+                    # Preserve canonical none-tier assembly; the Writer has no
+                    # private meal-text authority on this tier.
                     none_text = str(food_hint.get("none_tier_text") or "")
+                    # A legacy none span was key-checked and either empty or canonical.
+                    # Remove that exact span, then render canonical text once;
+                    # malformed or expanded none spans never reach this branch.
+                    for legacy_span in reversed(parse_food_spans(line)):
+                        line = line[:legacy_span.start] + line[legacy_span.end:]
                     food_span = f"{span_marker}{none_text}{close_marker}"
-                    # Append to the existing line (anchor POI text + food span)
                     if none_text:
-                        line = line.replace(none_text, "").rstrip("，,；; ")
+                        label = f"{place.name}："
+                        if line.startswith(label):
+                            body = _strip_pure_none_dining_clauses(line[len(label):])
+                            line = label + _separate_canonical_none_sentence(body)
+                        else:
+                            line = _separate_canonical_none_sentence(
+                                _strip_pure_none_dining_clauses(line)
+                            )
                     line = f"{line}{food_span}"
                     source = "deterministic_food_none"
-                else:
-                    # structural / full tier: scan the Writer text for
-                    # the food prose and wrap it.  If the Writer already
-                    # included markers, leave as-is.
-                    if span_marker not in line and close_marker not in line:
-                        # Best-effort: the food prose is usually at the
-                        # end of the fragment after the anchor POI text.
-                        # We wrap everything after the anchor place_name
-                        # colon header that mentions meal-related keywords.
-                        line = f"{line}{span_marker}{close_marker}"
+                elif meal_text:
+                    line = f"{line}{span_marker}{meal_text}{close_marker}"
+                elif legacy_food:
+                    # The shared boundary kept the exact legacy span away
+                    # from prose cleaners; restore it once, byte for byte.
+                    line = f"{line}{legacy_food}"
+                # Unmarked legacy text gets no empty marker and remains
+                # subject to the ordinary gates.
 
             start = cursor
             append(line)
@@ -2116,6 +2694,10 @@ def _assemble_keyed_writer_plan(
             transition = commute_line.removeprefix("通勤参考：").rstrip("。")
             if not any(transition in required for required in required_lines):
                 append("\n" + commute_line)
+        wrap = wraps_by_day.get(day_group.day)
+        if wrap:
+            append("\n" + wrap)
+            result.day_wrap_count += 1
 
     result.plan_text = "".join(parts)
     return result
@@ -2378,6 +2960,7 @@ def _build_fragment_slots(
     plan_index: int,
     route_plan: RoutePlan,
     structured_evidence_payload: StructuredEvidencePayload,
+    family_arrangement: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build Writer fragment slots with arrival context for non-first stops.
 
@@ -2428,6 +3011,8 @@ def _build_fragment_slots(
                     None,
                 ),
             }
+            if family_arrangement:
+                slot["family_arrangement"] = FAMILY_ARRANGEMENT_SLOT_GUIDANCE
             if prev_place is not None:
                 prev_ids = {
                     value
@@ -2491,15 +3076,25 @@ def _merge_raw_keyed_fragment_replacements(
         item for item in raw_fragments
         if _raw_fragment_key(item) not in target_keys
     ]
-    retained.extend(
-        {
-            "plan_index": key[0],
-            "day": key[1],
-            "place_id": key[2],
-            "text": text,
-        }
-        for key, text in replacements.items()
-    )
+    for key, text in replacements.items():
+        originals = [item for item in raw_fragments if _raw_fragment_key(item) == key]
+        if len(originals) > 1 and any(
+            "meal_fragment" in item or "<!--" in str(item.get("text") or "")
+            for item in originals
+        ):
+            return None
+        original = originals[0] if len(originals) == 1 else {}
+        merged_text = replace_body_preserving_food(
+            str(original.get("text") or ""), replacement=text, key=key,
+        )
+        if merged_text is None:
+            return None
+        item = {"plan_index": key[0], "day": key[1], "place_id": key[2], "text": merged_text}
+        if "meal_fragment" in original:
+            # Preserve the existing private attachment; the normal assembler
+            # rechecks its complete authorization key and tier unchanged.
+            item["meal_fragment"] = original["meal_fragment"]
+        retained.append(item)
     data["poi_fragments"] = retained
     return json.dumps(data, ensure_ascii=False)
 
@@ -2612,67 +3207,170 @@ def _adopted_speculative_archive_record(
     return None
 
 
-async def _generate_one_locked_plan(
+_TIMELINE_KIND_LABELS = {
+    "sight": "", "lunch": "午饭｜", "dinner": "晚饭｜", "snack": "小吃｜", "night": "夜景｜",
+}
+_WEEKDAYS = "一二三四五六日"
+
+
+def _stay_text(minutes: int) -> str:
+    hours, rest = divmod(max(0, int(minutes)), 60)
+    if not hours:
+        return f"约 {rest} 分钟"
+    if not rest:
+        return f"约 {hours} 小时"
+    return f"约 {hours} 小时 {rest} 分钟" if rest != 30 else f"约 {hours}.5 小时"
+
+
+def _move_text(move: Any) -> str:
+    if move is None or move.minutes is None:
+        return ""
+    return f"{move.mode}约 {move.minutes} 分钟"
+
+
+def _timeline_day_lines(day_group: Any, *, plan_index: int, trip_request: TripRequest) -> list[str]:
+    """One day of the route clock as the Writer reads it (v0.15.1)."""
+    from src.agents.route_timeline import day_timeline
+
+    timeline = day_timeline(day_group, trip_request)
+    names = {place.place_id: place.name for place in day_group.places}
+    heading = f"Day {day_group.day}"
+    try:
+        day_date = date.fromisoformat(str(trip_request.start_date or "")[:10]) + timedelta(days=int(day_group.day) - 1)
+        heading += f"（{day_date.month} 月 {day_date.day} 日，周{_WEEKDAYS[day_date.weekday()]}）"
+    except ValueError:
+        pass
+    depart = _move_text(timeline.depart_move)
+    lines = [f"{heading}｜{timeline.start} 从住处出门" + (f"，{depart}到第一站" if depart else "")]
+    for item in timeline.items:
+        if item.kind == "rest":
+            where = "回住处歇" if item.rest_via_lodge else "附近找地方歇一会儿"
+            lines.append(f"  {item.arrive} {where}，{_stay_text(item.stay_minutes)}")
+        else:
+            key = f"({plan_index},{day_group.day},{item.place_id})"
+            lines.append(
+                f"  {item.arrive} {_TIMELINE_KIND_LABELS.get(item.kind, '')}{names.get(item.place_id, '')}"
+                f" key={key}，停留{_stay_text(item.stay_minutes)}"
+            )
+        move = _move_text(item.move_to_next)
+        if move and item is not timeline.items[-1]:
+            lines.append(f"    ↓ {move}")
+    lines.append(f"  {timeline.return_at} 前后回到住处")
+    return lines
+
+
+def _timeline_material_line(place: Any, evidence: Any, *, key: str) -> str:
+    parts = [f"key={key} {place.name}（{place.place_type}）"]
+    if evidence is not None:
+        for label, values in (
+            ("可直接陈述", evidence.direct_facts),
+            ("可弱表达", evidence.weak_experience),
+            ("只能条件提醒", evidence.risk_only_warnings),
+        ):
+            if values:
+                parts.append(f"{label}：" + "；".join(values))
+    if len(parts) == 1:
+        parts.append("没有材料：这个地方本身有名，就写你确定知道的来历和看点；不出名的，按地点类型写怎么逛；不编价格、时间和具体数字")
+    return "｜".join(parts)
+
+
+def _timeline_writer_prompt(
     *,
+    trip_request: TripRequest,
+    route_plan: RoutePlan,
+    plan_index: int,
     zero_index: int,
+    fragment_slots: list[dict[str, Any]],
+    structured_evidence_payload: StructuredEvidencePayload,
+    composition_blueprint: CompositionBlueprint | None,
+    attachment_auth_map: FoodAttachmentAuthMap | None,
+    publish_retry_feedback: list[dict[str, Any]] | None,
+    pretrip_advice_payload: PreTripAdvicePayload | None,
+) -> str:
+    """v0.15.1: the route clock and each stop's material, without action lists."""
+    preferences = "、".join(trip_request.preferences or []) or "未填"
+    parts = [
+        (
+            f"用户：目的地 {trip_request.to_city}；{trip_request.days} 天；{trip_request.people_count} 人；"
+            f"出发日期 {trip_request.start_date or '未定'}；偏好 {preferences}；"
+            f"备注「{(trip_request.notes or '').strip() or '无'}」"
+        ),
+        "人数与同行场景写作要求：\n" + _party_guidance(trip_request),
+    ]
+    timeline_lines: list[str] = []
+    for day_group in route_plan.day_groups:
+        timeline_lines.extend(_timeline_day_lines(day_group, plan_index=plan_index, trip_request=trip_request))
+    parts.append("时间表（后端已排定；正文不写钟点、分钟数和交通方式）：\n" + "\n".join(timeline_lines))
+    evidence_by_id = {place.place_id: place for place in structured_evidence_payload.places}
+    material_lines = [
+        _timeline_material_line(
+            place, evidence_by_id.get(place.place_id), key=f"({plan_index},{day_group.day},{place.place_id})",
+        )
+        for day_group in route_plan.day_groups
+        for place in day_group.places
+    ]
+    parts.append("各站材料：\n" + "\n".join(material_lines))
+    if composition_blueprint is not None:
+        food_prompt = _food_attachment_prompt(
+            [composition_blueprint], attachment_auth_map, plan_indexes=[zero_index],
+        )
+        if food_prompt:
+            parts.append(food_prompt)
+    parts.append(
+        "必须逐项填写以下 key（poi_fragments 每个恰好一次）；full / structural 餐饮附件另填带完整 attachment_key 的 meal_fragment：\n"
+        + json.dumps(
+            [
+                {k: slot[k] for k in ("plan_index", "day", "place_id", "place_name") if k in slot}
+                for slot in fragment_slots
+            ],
+            ensure_ascii=False,
+        )
+    )
+    retry_instruction = _publish_retry_feedback_prompt(publish_retry_feedback, plan_index=plan_index)
+    if retry_instruction:
+        parts.append(retry_instruction)
+    if pretrip_advice_payload is not None:
+        parts.append(render_pretrip_advice_writer_prompt(pretrip_advice_payload))
+    return "\n\n".join(parts)
+
+
+def _locked_plan_writer_prompt(
+    *,
     trip_request: TripRequest,
     retrieval: RetrievalResult,
     route_plan: RoutePlan,
-    sibling_route_plans: list[RoutePlan],
-    budget_result: BudgetResult | None = None,
-    poi_identity_result: PoiIdentityResult | None = None,
+    plan_index: int,
+    zero_index: int,
+    fragment_slots: list[dict[str, Any]],
+    structured_evidence_payload: StructuredEvidencePayload,
     composition_blueprint: CompositionBlueprint | None = None,
-    structured_evidence_payload: StructuredEvidencePayload | None = None,
-    weather_advisory_payload: WeatherAdvisoryPayload | None = None,
-    publish_retry_feedback: list[dict[str, Any]] | None = None,
     attachment_auth_map: FoodAttachmentAuthMap | None = None,
-    accommodation: AccommodationSuggestion | None = None,
-    transport: TransportSuggestion | None = None,
+    publish_retry_feedback: list[dict[str, Any]] | None = None,
     pretrip_advice_payload: PreTripAdvicePayload | None = None,
-    workflow_deadline_monotonic: float | None = None,
-    residual_reserve_seconds: float = 20.0,
-    speculative_initial_generation: bool = True,
-    speculative_adopted_archive_sink: list[SpeculativeArchiveRecord] | None = None,
-    _raw_override: str | None = None,
-) -> PlanWriteResult:
-    t0 = time.monotonic()
-    plan_index = zero_index + 1
-    alignment_error = _label_alignment_failure(
-        route_plan=route_plan,
-        budget_result=budget_result,
-        poi_identity_result=poi_identity_result,
-        composition_blueprint=composition_blueprint,
-    )
-    if alignment_error:
-        return PlanWriteResult(
+    accommodation: AccommodationSuggestion | None = None,
+) -> str:
+    """Instruction text sent for one locked plan. No model call."""
+    if writer_prompt_version() == "article":
+        return build_article_prompt(
+            trip_request=trip_request,
+            route_plan=route_plan,
+            structured_evidence_payload=structured_evidence_payload,
+            hints=article_food_hints(composition_blueprint, zero_index),
+            accommodation=accommodation,
+        )
+    if writer_prompt_version() == "timeline":
+        return _timeline_writer_prompt(
+            trip_request=trip_request,
+            route_plan=route_plan,
+            plan_index=plan_index,
             zero_index=zero_index,
-            failure_reason=alignment_error,
-            latency_ms=0,
+            fragment_slots=fragment_slots,
+            structured_evidence_payload=structured_evidence_payload,
+            composition_blueprint=composition_blueprint,
+            attachment_auth_map=attachment_auth_map,
+            publish_retry_feedback=publish_retry_feedback,
+            pretrip_advice_payload=pretrip_advice_payload,
         )
-    if structured_evidence_payload is None:
-        structured_evidence_payload = build_structured_evidence_payload(
-            retrieval,
-            route_plans=[route_plan],
-            composition_blueprints=(
-                [composition_blueprint]
-                if composition_blueprint is not None
-                else None
-            ),
-        )
-
-    fragment_slots, missing_contract_details = _build_fragment_slots(
-        plan_index=plan_index,
-        route_plan=route_plan,
-        structured_evidence_payload=structured_evidence_payload,
-    )
-    if missing_contract_details:
-        return PlanWriteResult(
-            zero_index=zero_index,
-            failure_reason="writer_keyed_fragment_action_contract_missing",
-            latency_ms=int((time.monotonic() - t0) * 1000),
-            keyed_fragment_invalid_details=missing_contract_details,
-        )
-    sibling_unique = _sibling_unique_names(route_plan, sibling_route_plans)
     blueprint_prompt = (
         _composition_blueprint_prompt(
             [composition_blueprint],
@@ -2706,8 +3404,16 @@ async def _generate_one_locked_plan(
                 structured_evidence_payload=structured_evidence_payload,
             )
         ),
+    ]
+    if family_arrangement_active(trip_request.preferences, notes=trip_request.notes):
+        prompt_parts.append(
+            "亲子安排是各地点 slot 的 family_arrangement 写作上下文，"
+            "必须按该站锁定事实写家庭怎么一起走完，不能只用人数或“三个人”带过；"
+            "family_arrangement 不是适龄、设施或加站授权。"
+        )
+    prompt_parts.extend([
         (
-            "必须逐项填写以下后端稳定 slots；只回传 key 和 text，顺序不作为结构依据：\n"
+            "必须逐项填写以下后端稳定 slots；回传 key 和锚点 text；full / structural 餐饮附件另填带完整 attachment_key 的 meal_fragment，顺序不作为结构依据：\n"
             + json.dumps(
                 [
                     {k: v for k, v in slot.items() if k != "writing_hint"}
@@ -2741,9 +3447,9 @@ async def _generate_one_locked_plan(
 
 day_openings：每天一句，60 字以内，概括当天有依据的内容或节奏；不用强行对仗或抒情，不复述站点清单。不写数字、交通或其他可核验事实。若点名，只能按当天路线从第一站开始依次出现。
 summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，归纳锁定安排支持的路线特征。用平常的话写，不为收束而回扣意象；不出现具体地点名、价格、营业时间或交通方式。
-输出：单个 JSON 对象，包含 poi_fragments、day_openings、summary，以及按授权输入填写的可选 packing_checklist 和 travel_tips。每个稳定 key 恰好一次。地点名、Day 标题和交通由后端添加；text 不重复当前地点名、不写路线箭头。不新增或调换地点，不补路线外专名。餐饮附件按 System 与 Food Stop Runtime Payload 执行。
+输出：单个 JSON 对象，包含 poi_fragments、day_openings、summary，以及按授权输入填写的可选 packing_checklist 和 travel_tips。每个稳定 key 恰好一次。地点名、Day 标题和交通由后端添加；text 不重复当前地点名、不写路线箭头。不新增或调换地点，不补路线外专名。餐饮附件按 System 与 Food Stop Runtime Payload 执行，full / structural 使用独立 meal_fragment；锚点 text 不混入餐饮附件。
 """,
-    ]
+    ])
     if blueprint_prompt:
         prompt_parts.insert(
             3,
@@ -2763,7 +3469,90 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         )
     if _writer_strict_evidence_enabled():
         prompt_parts.append(_strict_evidence_prompt())
-    prompt = "\n\n".join(prompt_parts)
+    return "\n\n".join(prompt_parts)
+
+
+async def _generate_one_locked_plan(
+    *,
+    zero_index: int,
+    trip_request: TripRequest,
+    retrieval: RetrievalResult,
+    route_plan: RoutePlan,
+    sibling_route_plans: list[RoutePlan],
+    budget_result: BudgetResult | None = None,
+    poi_identity_result: PoiIdentityResult | None = None,
+    composition_blueprint: CompositionBlueprint | None = None,
+    structured_evidence_payload: StructuredEvidencePayload | None = None,
+    weather_advisory_payload: WeatherAdvisoryPayload | None = None,
+    publish_retry_feedback: list[dict[str, Any]] | None = None,
+    attachment_auth_map: FoodAttachmentAuthMap | None = None,
+    accommodation: AccommodationSuggestion | None = None,
+    transport: TransportSuggestion | None = None,
+    pretrip_advice_payload: PreTripAdvicePayload | None = None,
+    workflow_deadline_monotonic: float | None = None,
+    residual_reserve_seconds: float = 20.0,
+    speculative_initial_generation: bool = True,
+    speculative_adopted_archive_sink: list[SpeculativeArchiveRecord] | None = None,
+    plan_retry_remaining: int = 1,
+    body_semantics_by_review: bool = False,
+    _raw_override: str | None = None,
+) -> PlanWriteResult:
+    t0 = time.monotonic()
+    plan_index = zero_index + 1
+    alignment_error = _label_alignment_failure(
+        route_plan=route_plan,
+        budget_result=budget_result,
+        poi_identity_result=poi_identity_result,
+        composition_blueprint=composition_blueprint,
+    )
+    if alignment_error:
+        return PlanWriteResult(
+            zero_index=zero_index,
+            failure_reason=alignment_error,
+            latency_ms=0,
+        )
+    if structured_evidence_payload is None:
+        structured_evidence_payload = build_structured_evidence_payload(
+            retrieval,
+            route_plans=[route_plan],
+            composition_blueprints=(
+                [composition_blueprint]
+                if composition_blueprint is not None
+                else None
+            ),
+        )
+
+    fragment_slots, missing_contract_details = _build_fragment_slots(
+        plan_index=plan_index,
+        route_plan=route_plan,
+        structured_evidence_payload=structured_evidence_payload,
+        family_arrangement=family_arrangement_active(
+            trip_request.preferences,
+            notes=trip_request.notes,
+        ),
+    )
+    if missing_contract_details:
+        return PlanWriteResult(
+            zero_index=zero_index,
+            failure_reason="writer_keyed_fragment_action_contract_missing",
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            keyed_fragment_invalid_details=missing_contract_details,
+        )
+    sibling_unique = _sibling_unique_names(route_plan, sibling_route_plans)
+    prompt = _locked_plan_writer_prompt(
+        trip_request=trip_request,
+        retrieval=retrieval,
+        route_plan=route_plan,
+        plan_index=plan_index,
+        zero_index=zero_index,
+        fragment_slots=fragment_slots,
+        structured_evidence_payload=structured_evidence_payload,
+        composition_blueprint=composition_blueprint,
+        attachment_auth_map=attachment_auth_map,
+        publish_retry_feedback=publish_retry_feedback,
+        pretrip_advice_payload=pretrip_advice_payload,
+        accommodation=accommodation,
+    )
 
     settings = get_settings()
     stream_probes = bool(settings.writer_stream_probe_enabled)
@@ -2790,6 +3579,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
     )
     if speculation_enabled:
         opus_budget_cancel_requested = asyncio.Event()
+        opus_standby_ready_cancel_requested = asyncio.Event()
         keyed_repair_used = {"opus": False, "ds_flash": False}
         keyed_repair_observations: dict[str, dict[str, Any]] = {}
         validation_kwargs = {
@@ -2811,6 +3601,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             "workflow_deadline_monotonic": workflow_deadline_monotonic,
             "residual_reserve_seconds": residual_reserve_seconds,
             "speculative_initial_generation": speculative_initial_generation,
+            "body_semantics_by_review": body_semantics_by_review,
         }
 
         reconstructed_routes = list(sibling_route_plans)
@@ -2835,15 +3626,100 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 result.keyed_fragment_repair_remaining_count = len(fallback_keys)
                 return result
 
+            # Prepare known hard facts with their existing deterministic
+            # operator before spending this already-triggered Writer round.
+            # No additional model call or fact authorization is introduced.
+            from src.agents.generation_issues import collect_deterministic_generation_issues
+            from src.agents.fragment_repair import (
+                deterministic_unsupported_fact_fragment_repair, qualify_review_fragment_issues,
+            )
+            from src.agents.preflight import collect_phrase_preflight
+            from src.agents.poi_fragments import fragment_for_span
+            hard_facts = [issue for issue in collect_deterministic_generation_issues(
+                [result.plan], trip_request=trip_request, retrieval=retrieval,
+                route_plans=[route_plan], budget_results=[budget_result] if budget_result else None,
+                composition_blueprints=[composition_blueprint] if composition_blueprint else None,
+                weather_advisory_payload=weather_advisory_payload,
+                attachment_auth_map=attachment_auth_map, accommodation=accommodation,
+                body_semantics_by_review=body_semantics_by_review,
+            ) if issue.reason == "unsupported_fact_expansion"
+                and issue.category in {"BLOCKER", "REPAIR"} and issue.publish_action == "REPAIR_PLAN"]
+            if zero_index == 0 and hard_facts:
+                qualified = qualify_review_fragment_issues([result.plan], hard_facts, route_plans=[route_plan])
+                prepared = deterministic_unsupported_fact_fragment_repair(
+                    result.plan, route_plan=route_plan, issues=qualified, plan_index=1,
+                    structured_evidence_payload=structured_evidence_payload,
+                )
+                if prepared.applied:
+                    changes = {}
+                    for fragment in prepared.plans[0].poi_fragments:
+                        previous = result.plan.poi_fragment(plan_index=fragment.plan_index,
+                            day=fragment.day, place_id=fragment.place_id)
+                        if previous is not None and previous.text != fragment.text:
+                            body = fragment_body_text(prepared.plans[0], fragment)
+                            if body is None:
+                                continue
+                            body = body.split("：", 1)[1] if "：" in body else body
+                            changes[(fragment.plan_index, fragment.day, fragment.place_id)] = body
+                    prepared_raw = _merge_raw_keyed_fragment_replacements(raw, changes)
+                    if prepared_raw is not None:
+                        raw = prepared_raw
+                        result = await _generate_one_locked_plan(**validation_kwargs, _raw_override=raw)
+                        if result.plan is None or result.failure_reason:
+                            return result
+                        fallback_keys = list(dict.fromkeys(result.keyed_fragment_fallback_keys))
+
+            def copy_gap_keys(plan):
+                keys = []
+                for finding in collect_phrase_preflight([plan], route_plans=[route_plan]):
+                    if finding.reason != "placeholder_wording":
+                        continue
+                    fragment = fragment_for_span(plan, start=finding.start, end=finding.end)
+                    if fragment is not None:
+                        keys.append((fragment.plan_index, fragment.day, fragment.place_id))
+                return list(dict.fromkeys(keys))
+
+            copy_keys = copy_gap_keys(result.plan)
+            preference_report = evaluate_explicit_preference_fulfillment(
+                trip_request=trip_request, route_plans=[route_plan], plans=[result.plan],
+                structured_evidence_payload=structured_evidence_payload,
+                plan_index_offset=zero_index,
+                body_review_required=body_semantics_by_review,
+            )
+            # Only admitted body requirements join this already-triggered
+            # Writer repair. Route/registry/action failures cannot gain new
+            # authority through a writing requirement.
+            admitted = not (preference_report.blocking_route_findings()
+                            or preference_report.admission_block_findings())
+            preference_codes, preference_hints = (
+                preference_report.early_writer_requirements(repair_triggered=True)
+                if admitted else ({}, {})
+            )
+            # The original fallback-ratio guard above already triggered this round.
+            # Include every admitted requirement in that same call. In Review mode
+            # its body status is pending, not a lexical verdict or a new trigger.
+            repair_keys = list(dict.fromkeys([*fallback_keys, *preference_codes, *copy_keys]))
+            if not repair_keys:
+                return result
+            issue_codes = {key: {"writer_keyed_fragment_fallback"} for key in fallback_keys}
+            for key, codes in preference_codes.items():
+                issue_codes.setdefault(key, set()).update(codes)
+            for key in copy_keys:
+                issue_codes.setdefault(key, set()).add("placeholder_wording")
+
             result.keyed_fragment_repair_attempted = True
-            result.keyed_fragment_repair_target_count = len(fallback_keys)
+            result.keyed_fragment_repair_target_count = len(repair_keys)
+            result.keyed_preference_repair_target_count = len(preference_codes)
             observation: dict[str, Any] = {
                 "attempted": True,
-                "target_count": len(fallback_keys),
+                "target_count": len(repair_keys),
                 "applied_count": 0,
-                "remaining_count": len(fallback_keys),
+                "remaining_count": len(repair_keys),
                 "latency_ms": 0,
                 "failure_reason": "",
+                "preference_target_count": len(preference_codes),
+                "preference_applied_count": 0,
+                "preference_remaining_count": len(preference_codes),
             }
             keyed_repair_observations[generator] = observation
             if keyed_repair_used[generator]:
@@ -2860,7 +3736,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             )
             required_budget = (
                 KEYED_FRAGMENT_REPAIR_TIMEOUT_SECONDS
-                + ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS
+                + review_reserve_seconds(v012_policy=body_semantics_by_review)
                 + residual_reserve_seconds
             )
             if deadline - time.monotonic() < required_budget:
@@ -2870,18 +3746,29 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 return result
 
             targets = build_keyed_fragment_targets(
-                fallback_keys,
+                repair_keys,
                 route_plans=reconstructed_routes,
                 structured_evidence_payload=structured_evidence_payload,
+                issue_codes_by_key=issue_codes,
             )
-            if len(targets) != len(fallback_keys):
+            if len(targets) != len(repair_keys):
                 result.failure_reason = "writer_excessive_keyed_fragment_fallback"
                 result.keyed_fragment_repair_failure_reason = "target_contract_missing"
                 observation["failure_reason"] = "target_contract_missing"
                 return result
+            targets = [replace(
+                target,
+                plan_context={"summary": result.plan.summary, "plan_text": result.plan.plan_text},
+                current_text=(fragment.text if (fragment := result.plan.poi_fragment(
+                    plan_index=target.plan_index, day=target.day, place_id=target.place_id,
+                )) is not None else ""),
+                required_body_elements=((preference_hints[target.key],)
+                                        if target.key in preference_hints else ()),
+            ) for target in targets]
             repair = await call_keyed_fragment_repair(
                 generator=generator,
                 targets=targets,
+                timeout_seconds=KEYED_FRAGMENT_REPAIR_TIMEOUT_SECONDS,
             )
             result.keyed_fragment_repair_latency_ms = repair.latency_ms
             observation["latency_ms"] = repair.latency_ms
@@ -2910,17 +3797,40 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             remaining_keys = list(dict.fromkeys(
                 repaired.keyed_fragment_fallback_keys
             ))
+            unresolved_preferences = set(preference_codes)
+            if repaired.plan is not None:
+                after_preferences = evaluate_explicit_preference_fulfillment(
+                    trip_request=trip_request, route_plans=[route_plan], plans=[repaired.plan],
+                    structured_evidence_payload=structured_evidence_payload,
+                    plan_index_offset=zero_index,
+                    body_review_required=body_semantics_by_review,
+                )
+                unresolved_preferences = {finding.key for finding in (
+                    *after_preferences.blocking_route_findings(),
+                    *after_preferences.admission_block_findings(),
+                    *after_preferences.unresolved_body_findings(),
+                )} & set(preference_codes)
+            if body_semantics_by_review:
+                # Pending semantic assessment is neither an early pass nor a new retry.
+                unresolved_preferences = set()
+            unresolved_copy = (set(copy_gap_keys(repaired.plan)) & set(copy_keys)
+                               if repaired.plan is not None else set(copy_keys))
+            unresolved_targets = ((set(remaining_keys) & set(repair_keys))
+                                  | unresolved_preferences | unresolved_copy)
+            applied_keys = (set(repair.replacements) & set(repair_keys)) - unresolved_targets
             repaired.keyed_fragment_repair_attempted = True
-            repaired.keyed_fragment_repair_target_count = len(fallback_keys)
-            repaired.keyed_fragment_repair_remaining_count = len(remaining_keys)
-            repaired.keyed_fragment_repair_applied_count = max(
-                0,
-                len(fallback_keys) - len(set(fallback_keys) & set(remaining_keys)),
-            )
+            repaired.keyed_fragment_repair_target_count = len(repair_keys)
+            repaired.keyed_fragment_repair_remaining_count = len(unresolved_targets)
+            repaired.keyed_fragment_repair_applied_count = len(applied_keys)
+            repaired.keyed_preference_repair_target_count = len(preference_codes)
+            repaired.keyed_preference_repair_remaining_count = len(unresolved_preferences)
+            repaired.keyed_preference_repair_applied_count = len(applied_keys & set(preference_codes))
             repaired.keyed_fragment_repair_latency_ms = repair.latency_ms
             observation.update({
                 "applied_count": repaired.keyed_fragment_repair_applied_count,
-                "remaining_count": len(remaining_keys),
+                "remaining_count": len(unresolved_targets),
+                "preference_applied_count": repaired.keyed_preference_repair_applied_count,
+                "preference_remaining_count": len(unresolved_preferences),
             })
             if (
                 repaired.plan is None
@@ -2937,6 +3847,15 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 observation["failure_reason"] = (
                     repaired.keyed_fragment_repair_failure_reason
                 )
+            elif unresolved_preferences:
+                # Preserve draft ownership. The unchanged deterministic L3
+                # gate will refuse this body; do not start another round or
+                # turn semantic nonfulfillment into a new Writer retry.
+                repaired.keyed_fragment_repair_failure_reason = "explicit_preference_still_missing"
+                observation["failure_reason"] = repaired.keyed_fragment_repair_failure_reason
+            elif unresolved_copy:
+                repaired.keyed_fragment_repair_failure_reason = "required_copy_still_missing"
+                observation["failure_reason"] = repaired.keyed_fragment_repair_failure_reason
             return repaired
 
         async def run_opus(attempt_prompt: str, call_reason: str) -> OpusDraftResult[PlanWriteResult]:
@@ -2946,14 +3865,15 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                     role="writer",
                     stage="WRITER",
                     writer_budget_cancel_event=opus_budget_cancel_requested,
+                    writer_standby_ready_cancel_event=opus_standby_ready_cancel_requested,
                     writer_speculative_observer=speculative_telemetry,
                 ):
                     raw = await chat(
-                        system=SINGLE_PLAN_SYSTEM_PROMPT,
+                        system=writer_system_prompt(single_plan_system_prompt()),
                         user=attempt_prompt,
                         role="writer",
                         temperature=_writer_temperature("original"),
-                        json_mode=True,
+                        json_mode=writer_prompt_version() != "article",
                     )
             except Exception as exc:
                 return OpusDraftResult(
@@ -2966,11 +3886,12 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 return OpusDraftResult(
                     OpusAdjudicationState.INVALID,
                     failure_type=result.failure_reason,
+                    structural_reasons=_structural_draft_codes(result),
                     raw_text=raw,
                     latency_ms=int(metadata.get("latency_ms") or 0),
                     token_in=int(metadata.get("token_input") or 0),
                     token_out=int(metadata.get("token_output") or 0),
-                    prompt_version=OPUS_WRITER_PROMPT_VERSION,
+                    prompt_version=opus_prompt_label(),
                 )
             return OpusDraftResult(
                 OpusAdjudicationState.VALID,
@@ -2979,7 +3900,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 latency_ms=int(metadata.get("latency_ms") or 0),
                 token_in=int(metadata.get("token_input") or 0),
                 token_out=int(metadata.get("token_output") or 0),
-                prompt_version=OPUS_WRITER_PROMPT_VERSION,
+                prompt_version=opus_prompt_label(),
             )
 
         async def run_opus_initial() -> OpusDraftResult[PlanWriteResult]:
@@ -2990,7 +3911,8 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
 
         async def run_opus_retry() -> OpusDraftResult[PlanWriteResult]:
             return await run_opus(
-                prompt + "\n\n" + SINGLE_PLAN_JSON_RETRY_PROMPT,
+                prompt if writer_prompt_version() == "article"
+                else prompt + "\n\n" + SINGLE_PLAN_JSON_RETRY_PROMPT,
                 f"writer_original_plan_{plan_index}_json_retry",
             )
 
@@ -2999,7 +3921,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 result = await validate_raw_result(raw, generator="ds_flash")
                 if result.plan is not None and not result.failure_reason:
                     return result
-                return None
+                raise StructuralDraftInvalid(_structural_draft_codes(result))
 
             return DSStandbyTask.start(
                 user=prompt,
@@ -3022,8 +3944,11 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                 if stream_probes
                 else ATTEMPT_TIMEOUT_SECONDS
             ),
-            review_cost_seconds=ORDINARY_REVIEW_REQUEST_TIMEOUT_SECONDS,
+            review_cost_seconds=review_reserve_seconds(v012_policy=body_semantics_by_review),
+            plan_retry_remaining=plan_retry_remaining,
             request_opus_budget_cancel=opus_budget_cancel_requested.set,
+            request_opus_standby_cancel=opus_standby_ready_cancel_requested.set,
+            standby_grace_seconds=getattr(settings, "writer_standby_grace_seconds", None),
             telemetry=speculative_telemetry,
         )
         execution = await executor.execute()
@@ -3047,8 +3972,8 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         else:
             adopted_result = execution.adopted_draft
             adopted_result.generator = decision.adopted.value
-            adopted_result.writer_plan_retry_used = execution.opus_retry_used
-            adopted_result.writer_plan_retry_count = int(execution.opus_retry_used)
+        adopted_result.writer_plan_retry_used = bool(execution.opus_retry_used)
+        adopted_result.writer_plan_retry_count = int(bool(execution.opus_retry_used))
         adopted_result.adjudication_reason = decision.reason.value
         adopted_result.opus_adjudication_state = decision.opus_state.value
         adopted_result.ds_adjudication_state = decision.ds_state.value
@@ -3061,7 +3986,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         )
         adopted_result.speculative_enabled = True
         adopted_result.writer_prompt_version = (
-            OPUS_WRITER_PROMPT_VERSION
+            opus_prompt_label()
             if decision.adopted is AdoptedGenerator.OPUS
             else (
                 execution.ds_result.prompt_version
@@ -3073,6 +3998,8 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         adopted_result.opus_first_token_ms = telemetry.opus_first_token_ms
         adopted_result.opus_final_ms = telemetry.opus_final_ms
         adopted_result.ds_final_ms = telemetry.ds_final_ms
+        adopted_result.ds_qualified_at_ms = telemetry.ds_qualified_at_ms
+        adopted_result.standby_grace_expires_at_ms = telemetry.standby_grace_expires_at_ms
         adopted_result.adjudicated_at_ms = telemetry.adjudicated_at_ms
         adopted_result.probe_telemetry_enabled = True
         adopted_result.probe_kill_count = telemetry.probe_kill_count
@@ -3097,14 +4024,19 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         adopted_result.ds_latency_ms = execution.ds_result.latency_ms
         adopted_result.ds_token_in = execution.ds_result.token_in
         adopted_result.ds_token_out = execution.ds_result.token_out
+        adopted_result.ds_structural_reasons = [
+            str(code)[:120] for code in execution.ds_result.structural_reasons
+        ][:8]
+        adopted_result.opus_structural_reasons = [
+            str(code)[:120] for code in execution.opus_result.structural_reasons
+        ][:8]
         adopted_result.archive_write_succeeded = archive_write_succeeded
-        repair_observation = keyed_repair_observations.get(
-            decision.adopted.value,
-            next(
-                iter(keyed_repair_observations.values()),
-                None,
-            ),
-        )
+        # A losing generator's repair cannot spend the adopted draft's round.
+        repair_observation = keyed_repair_observations.get(decision.adopted.value)
+        if repair_observation is None and execution.adopted_draft is None:
+            # Keep the original no-draft failure diagnostics; there is no
+            # adopted draft whose repair allowance could be charged here.
+            repair_observation = next(iter(keyed_repair_observations.values()), None)
         if repair_observation is not None:
             adopted_result.keyed_fragment_repair_attempted = bool(
                 repair_observation.get("attempted")
@@ -3124,6 +4056,9 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             adopted_result.keyed_fragment_repair_failure_reason = str(
                 repair_observation.get("failure_reason") or ""
             )
+            adopted_result.keyed_preference_repair_target_count = int(repair_observation.get("preference_target_count") or 0)
+            adopted_result.keyed_preference_repair_applied_count = int(repair_observation.get("preference_applied_count") or 0)
+            adopted_result.keyed_preference_repair_remaining_count = int(repair_observation.get("preference_remaining_count") or 0)
         return adopted_result
 
     data: dict[str, Any] | None = None
@@ -3134,7 +4069,9 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
     retry_latency_ms = 0
     retry_used = False
     retry_count = 0
-    for attempt_index in range(1 if _raw_override is not None else 2):
+    article = writer_prompt_version() == "article"
+    article_actions: list[dict[str, Any]] = []
+    for attempt_index in range(1 if _raw_override is not None or article else 2):
         retry_used_for_attempt = attempt_index == 1
         attempt_t0 = time.monotonic()
         attempt_prompt = prompt
@@ -3157,7 +4094,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                     ),
                 ):
                     raw = await chat(
-                        system=SINGLE_PLAN_SYSTEM_PROMPT,
+                        system=writer_system_prompt(single_plan_system_prompt()),
                         user=attempt_prompt,
                         role="writer",
                         temperature=_writer_temperature(
@@ -3165,7 +4102,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                             if publish_retry_feedback
                             else "original"
                         ),
-                        json_mode=True,
+                        json_mode=writer_prompt_version() != "article",
                     )
             except Exception as exc:
                 return attach_probe_metrics(PlanWriteResult(
@@ -3180,6 +4117,26 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
                     writer_plan_attempt_json_extract_failed=attempt_json_extract_failed,
                     writer_plan_retry_latency_ms=retry_latency_ms,
                 ))
+        if article:
+            conversion = article_to_keyed(
+                raw,
+                plan_index=plan_index,
+                trip_request=trip_request,
+                route_plan=route_plan,
+                structured_evidence_payload=structured_evidence_payload,
+                hints=article_food_hints(composition_blueprint, zero_index),
+            )
+            article_actions = conversion.actions
+            if conversion.data is None:
+                return attach_probe_metrics(PlanWriteResult(
+                    zero_index=zero_index,
+                    failure_reason=f"article_{conversion.failure}",
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    raw_length=len(raw or ""),
+                    writer_plan_attempt_count=attempt_index + 1,
+                    sanitizer_actions=list(article_actions),
+                ))
+            raw = json.dumps(conversion.data, ensure_ascii=False)
         data, parse_diagnostics = _parse_single_plan_writer_output_with_diagnostics(raw)
         if retry_used_for_attempt:
             retry_latency_ms = int((time.monotonic() - attempt_t0) * 1000)
@@ -3234,6 +4191,7 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         "writer_plan_retry_latency_ms": retry_latency_ms,
     }
 
+    await await_lodging_price_at_writer_barrier()
     assembly = _assemble_keyed_writer_plan(
         plan_index=plan_index,
         raw_fragments=data.get("poi_fragments"),
@@ -3244,10 +4202,15 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             candidate.name for candidate in retrieval.candidates
         ],
         weather_advisory_payload=weather_advisory_payload,
+        retrieval_city=retrieval.city,
+        poi_identity_result=poi_identity_result,
         raw_day_openings=data.get("day_openings"),
         accommodation=accommodation,
         transport=transport,
+        trip_request=trip_request,
+        raw_day_wraps=data.get("day_wraps"),
     )
+    assembly.sanitizer_actions[:0] = article_actions
     assembly_fields = {
         "keyed_fragment_count": len(assembly.fragments),
         "keyed_fragment_fallback_keys": assembly.fallback_keys,
@@ -3255,6 +4218,9 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         "keyed_fragment_invalid_details": assembly.invalid_details,
         "keyed_day_opening_count": assembly.day_opening_count,
         "keyed_day_opening_dropped": assembly.day_opening_dropped,
+        "keyed_day_wrap_count": assembly.day_wrap_count,
+        "keyed_day_wrap_dropped": assembly.day_wrap_dropped,
+        "keyed_meal_dropped": assembly.meal_dropped,
     }
     if assembly.failure_reason:
         return attach_probe_metrics(PlanWriteResult(
@@ -3269,19 +4235,21 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             sanitizer_actions=assembly.sanitizer_actions,
         ))
 
+    route_names = {place.name for day_group in route_plan.day_groups for place in day_group.places}
+    timeline_prompt = timeline_assembly()
     summary_text, summary_rejection = _sanitize_summary_text(
         data.get("summary"),
         banned_names=sorted(
             {
                 *(candidate.name for candidate in retrieval.candidates),
-                *(
-                    place.name
-                    for day_group in route_plan.day_groups
-                    for place in day_group.places
-                ),
+                *route_names,
             },
             key=lambda value: (-len(value), value),
         ),
+        # v0.15.1 timeline prompt: the summary may name this route's places.
+        allowed_names=route_names if timeline_prompt else frozenset(),
+        max_chars=TIMELINE_SUMMARY_MAX_CHARS if timeline_prompt else _SUMMARY_MAX_CHARS,
+        timeline=timeline_prompt,
     )
     if summary_rejection:
         logger.info(
@@ -3289,6 +4257,12 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
             plan_index,
             summary_rejection,
         )
+    assembly_fields["summary_rejection"] = summary_rejection
+    from src.agents.preference_notices import build_preference_notices, merge_trip_summary
+    summary_text = merge_trip_summary(
+        summary_text,
+        build_preference_notices(trip_request, route_plan).trip_lines,
+    )
     plan = _merge_locked_place_fields(
         plan_name=_locked_plan_name(
             trip_request=trip_request,
@@ -3314,6 +4288,11 @@ summary：80-120 字，交代这趟行程主要看什么、各天怎样组织，
         data,
         pretrip_advice_payload,
     )
+    if assembly.code_lodging_section:
+        plan = plan.model_copy(update={
+            "code_lodging_section": assembly.code_lodging_section,
+        })
+    plan = _apply_plan_preference_notices(plan, route_plan, trip_request)
     sanitizer_actions = assembly.sanitizer_actions
     sibling_violations = [
         name
@@ -3398,6 +4377,8 @@ async def generate_locked_plans_concurrently(
     residual_reserve_seconds: float = 20.0,
     speculative_initial_generation: bool = True,
     speculative_adopted_archive_sink: list[SpeculativeArchiveRecord] | None = None,
+    plan_retry_remaining: int = 1,
+    body_semantics_by_review: bool = False,
 ) -> tuple[list[PlanOutput] | None, dict]:
     """Generate one keyed locked plan per route, optionally in parallel.
 
@@ -3467,9 +4448,16 @@ async def generate_locked_plans_concurrently(
         "writer_keyed_fragment_repair_remaining_count": 0,
         "writer_keyed_fragment_repair_latency_ms": 0,
         "writer_keyed_fragment_repair_failure_reason": "",
+        "writer_keyed_preference_repair_target_count": 0,
+        "writer_keyed_preference_repair_applied_count": 0,
+        "writer_keyed_preference_repair_remaining_count": 0,
         "writer_day_opening_count": 0,
         "writer_day_opening_dropped_count": 0,
         "writer_day_opening_dropped_details": [],
+        "writer_day_wrap_count": 0,
+        "writer_day_wrap_dropped_details": [],
+        "writer_meal_dropped_details": [],
+        "writer_summary_dropped_reasons": [],
         "writer_packing_groups_retained": 0,
         "writer_packing_items_retained": 0,
         "writer_tips_retained": 0,
@@ -3573,9 +4561,11 @@ async def generate_locked_plans_concurrently(
             workflow_deadline_monotonic=workflow_deadline_monotonic,
             residual_reserve_seconds=residual_reserve_seconds,
             speculative_initial_generation=speculative_initial_generation,
+            body_semantics_by_review=body_semantics_by_review,
             speculative_adopted_archive_sink=(
                 speculative_adopted_archive_sink
             ),
+            plan_retry_remaining=plan_retry_remaining,
         ))
     if parallel:
         results = await asyncio.gather(*tasks)
@@ -3642,6 +4632,8 @@ async def generate_locked_plans_concurrently(
             "opus_first_token_ms": speculative_result.opus_first_token_ms,
             "opus_final_ms": speculative_result.opus_final_ms,
             "ds_final_ms": speculative_result.ds_final_ms,
+            "ds_qualified_at_ms": speculative_result.ds_qualified_at_ms,
+            "standby_grace_expires_at_ms": speculative_result.standby_grace_expires_at_ms,
             "adjudicated_at_ms": speculative_result.adjudicated_at_ms,
             "ds_attempted": speculative_result.ds_attempted,
             "ds_completed": speculative_result.ds_completed,
@@ -3650,6 +4642,8 @@ async def generate_locked_plans_concurrently(
             "ds_latency_ms": speculative_result.ds_latency_ms,
             "ds_token_in": speculative_result.ds_token_in,
             "ds_token_out": speculative_result.ds_token_out,
+            "ds_structural_reasons": list(speculative_result.ds_structural_reasons),
+            "opus_structural_reasons": list(speculative_result.opus_structural_reasons),
             "writer_prompt_version": speculative_result.writer_prompt_version,
             "archive_write_succeeded": (
                 speculative_result.archive_write_succeeded
@@ -3718,6 +4712,10 @@ async def generate_locked_plans_concurrently(
         ),
         "",
     )
+    for field_name in ("target_count", "applied_count", "remaining_count"):
+        metrics[f"writer_keyed_preference_repair_{field_name}"] = sum(
+            getattr(result, f"keyed_preference_repair_{field_name}") for result in repair_results
+        )
     metrics["writer_day_opening_count"] = sum(
         result.keyed_day_opening_count for result in results
     )
@@ -3728,6 +4726,16 @@ async def generate_locked_plans_concurrently(
     ]
     metrics["writer_day_opening_dropped_count"] = len(opening_dropped)
     metrics["writer_day_opening_dropped_details"] = opening_dropped
+    metrics["writer_day_wrap_count"] = sum(result.keyed_day_wrap_count for result in results)
+    metrics["writer_day_wrap_dropped_details"] = [
+        detail for result in results for detail in result.keyed_day_wrap_dropped
+    ]
+    metrics["writer_meal_dropped_details"] = [
+        detail for result in results for detail in result.keyed_meal_dropped
+    ]
+    metrics["writer_summary_dropped_reasons"] = [
+        result.summary_rejection for result in results if result.summary_rejection
+    ]
     dropped_reasons: dict[str, int] = {}
     for result in results:
         piece = result.pretrip_advice_metrics or {}
@@ -4059,6 +5067,9 @@ async def repair_plan(
             "writer_repair_local_delete_only_used": True,
             "writer_repair_sanitizer_action_count": len(local_actions),
         }
+        local_repaired = _apply_plan_preference_notices(
+            local_repaired, route_plan, trip_request,
+        )
         local_repair_candidate = local_repaired
         local_repair_actions = local_actions
         local_repair_metrics = local_metrics
@@ -4094,7 +5105,7 @@ async def repair_plan(
 
     with llm_call_context(call_reason=f"writer_repair_plan_{plan_index or 'unknown'}"):
         raw = await chat(
-            system=SYSTEM_PROMPT,
+            system=writer_system_prompt(SYSTEM_PROMPT),
             user=prompt,
             role="writer",
             temperature=_writer_temperature("repair"),
@@ -4117,19 +5128,23 @@ async def repair_plan(
                 payload=weather_advisory_payload,
             )
             minimal_actions = [*minimal_actions, *weather_minimal_actions]
-            minimal_repaired = local_repair_candidate.model_copy(update={
-                "plan_name": (
-                    f"{retrieval_city or trip_request.to_city}锁定路线方案"
-                    + (str(plan_index) if plan_index else "")
-                ),
-                "plan_text": minimal_text,
-                "used_place_ids": locked_ids,
-                "used_place_names": locked_names,
-                "day_place_names": locked_day_names,
-                "composition_blueprint": composition_blueprint,
-                "poi_identity_result": poi_identity_result,
-                "budget_result": budget_result,
-            })
+            minimal_repaired = _apply_plan_preference_notices(
+                local_repair_candidate.model_copy(update={
+                    "plan_name": (
+                        f"{retrieval_city or trip_request.to_city}锁定路线方案"
+                        + (str(plan_index) if plan_index else "")
+                    ),
+                    "plan_text": minimal_text,
+                    "used_place_ids": locked_ids,
+                    "used_place_names": locked_names,
+                    "day_place_names": locked_day_names,
+                    "composition_blueprint": composition_blueprint,
+                    "poi_identity_result": poi_identity_result,
+                    "budget_result": budget_result,
+                }),
+                route_plan,
+                trip_request,
+            )
             if (
                 not route_plan_violations([minimal_repaired], [route_plan])
                 and not check_plan_blueprint_integrity(
@@ -4190,6 +5205,7 @@ async def repair_plan(
         transport=original_plan.transport,
         packing_checklist=original_plan.packing_checklist,
         travel_tips=original_plan.travel_tips,
+        code_lodging_section=original_plan.code_lodging_section,
     )
     sanitized_text, sanitizer_actions = sanitize_repair_text(
         repaired.plan_text,
@@ -4203,13 +5219,17 @@ async def repair_plan(
         payload=weather_advisory_payload,
     )
     sanitizer_actions = [*sanitizer_actions, *weather_actions]
-    repaired = repaired.model_copy(update={
-        "plan_text": _ensure_locked_route_text(
-            sanitized_text,
-            route_plan,
-            composition_blueprint,
-        )
-    })
+    repaired = _apply_plan_preference_notices(
+        repaired.model_copy(update={
+            "plan_text": _ensure_locked_route_text(
+                sanitized_text,
+                route_plan,
+                composition_blueprint,
+            )
+        }),
+        route_plan,
+        trip_request,
+    )
     metrics = {
         **base_metrics,
         "repair_mode": "llm_repair",
@@ -4339,7 +5359,7 @@ async def generate(
             attempt=attempt + 1,
         ):
             raw = await chat(
-                system=SYSTEM_PROMPT,
+                system=writer_system_prompt(SYSTEM_PROMPT),
                 user=prompt,
                 role="writer",
                 temperature=(
@@ -4422,6 +5442,7 @@ async def generate(
                 payload=weather_advisory_payload,
             )
             plan = plan.model_copy(update={"plan_text": weather_text})
+            plan = _apply_plan_preference_notices(plan, route_plan, trip_request)
         plans.append(plan)
 
     logger.info("Final Writer produced %d plans", len(plans))

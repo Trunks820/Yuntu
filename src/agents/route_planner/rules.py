@@ -18,6 +18,9 @@ from src.agents.pace import (
 from src.agents.preferences import (
     CITYWALK,
     NIGHT_VIEW,
+    candidate_is_family_place,
+    candidate_is_night_place,
+    candidate_is_tea_place,
     family_arrangement_active,
     food_preference_active,
     normalize_preferences,
@@ -65,6 +68,9 @@ PACE_LIMIT = {"relaxed": 3, "default": 4, "compact": 5}
 PACE_LABEL = {"relaxed": "轻松", "default": "适中", "compact": "紧凑"}
 OTHER_PREFS = ("自然风光", "文化历史", "拍照")
 TEA_MARKERS = ("茶馆", "喝茶", "品茶")
+# Shop name or category tag. 梁山鸡、芋儿鸡、烤鱼 stay out: they are a
+# different meal, and a shorter word would catch unrelated shops.
+POT_MEAL_MARKERS = ("火锅", "串串", "冒菜", "涮肉", "打边炉")
 AREA_TYPES = {"business_area", "accommodation_area"}
 CLOSED_NAME = re.compile(r"暂停营业|停业|歇业|已关闭")
 JSON_RETRY_HINT = "只输出合法 JSON"
@@ -98,6 +104,22 @@ class PlannerRules:
     taxi_ratio: float = 0.5
     start_month: int = 0
     excursion_budget: int = 0
+    # True when the pool has a place that can satisfy the matching check.
+    # Defaults keep hand-built rules on the old "the preference is required" path.
+    night_candidate: bool = True
+    food_candidate: bool = True
+    tea_candidate: bool = True
+    family_candidate: bool = True
+    # Relaxed-only clocks and caps. Defaults keep hand-built rules on the
+    # old combined-limit / 22:00 / 150-minute path.
+    day_sight_limit: int | None = None
+    night_limit: int | None = None
+    relaxed_day_end_minute: int | None = None
+    relaxed_return_plain_minute: int | None = None
+    relaxed_sight_hours: float = 6.0
+    require_day_rest: bool = False
+    skip_unrequested_snacks: bool = False
+    rest_via_lodge_only_when_near: bool = False
 
 
 def sunset_minutes(latitude: float, longitude: float, day: date) -> int:
@@ -187,6 +209,42 @@ def _tea_requested(request: TripRequest) -> bool:
     return any(marker in text for marker in TEA_MARKERS)
 
 
+def is_pot_meal(place: CandidatePlace | None) -> bool:
+    """True when the shop name or a category tag names a boiling-pot meal."""
+    if place is None:
+        return False
+    texts = [place.name or ""]
+    texts.extend(str(tag) for tag in (place.category_tags or []) if str(tag).strip())
+    blob = " ".join(texts)
+    return any(marker in blob for marker in POT_MEAL_MARKERS)
+
+
+def preference_candidate_flags(
+    places: list[CandidatePlace],
+    amap_ids: set[int] | None = None,
+) -> dict[str, bool]:
+    """Whether this pool can satisfy each preference check.
+
+    Night, family and tea use the same predicates as ``collect_issues``.
+    Family still only counts once a stop is sight or night; the flag only
+    says such a place exists. Food requires a proper visitor meal: a blank
+    Amap row sits in ``amap_ids`` and does not count, while an Amap row that
+    still has visitor text is absent from ``amap_ids`` and does. That is the
+    check's reading of the prompt line that a marked 【高德餐厅】 also counts.
+    """
+    from src.agents.route_planner.schedule import _proper_meal, _visitor_meal
+
+    blocked = amap_ids or set()
+    return {
+        "night_candidate": any(candidate_is_night_place(place) for place in places),
+        "family_candidate": any(candidate_is_family_place(place) for place in places),
+        "tea_candidate": any(candidate_is_tea_place(place) for place in places),
+        "food_candidate": any(
+            _proper_meal(place) and _visitor_meal(place, blocked) for place in places
+        ),
+    }
+
+
 def _family_requested(request: TripRequest) -> bool:
     if family_arrangement_active(request.preferences, request.notes or ""):
         return True
@@ -209,7 +267,17 @@ def build_rules(
 ) -> PlannerRules:
     pace_mode = detect_pace_mode(request)
     start = parse_hhmm(request.daily_start) or PACE_START[pace_mode]
-    end = parse_hhmm(request.daily_end) or DEFAULT_END
+    user_end = parse_hhmm(request.daily_end)
+    relaxed = pace_mode == "relaxed"
+    if user_end is not None:
+        end = user_end
+        return_plain = user_end
+    elif relaxed:
+        end = parse_hhmm(settings.route_planner_relaxed_return_night) or DEFAULT_END
+        return_plain = parse_hhmm(settings.route_planner_relaxed_return_plain)
+    else:
+        end = DEFAULT_END
+        return_plain = None
     start_day = _start_day(request, today)
     center = _center(places)
     if center is None:
@@ -217,6 +285,7 @@ def build_rules(
     else:
         dark = sunset_minutes(center[0], center[1], start_day) + 25
     dimensions = normalize_preferences(request.preferences).scoring_dimensions
+    flags = preference_candidate_flags(places)
     must_ids = tuple(sorted(valid_must_include_ids(request, RetrievalResult(city=request.to_city or "", candidates=places))))
     # valid_must_include_ids reads retrieval.candidates. The pool may already
     # have dropped a duplicate, so also trust flags on the places we were given.
@@ -239,7 +308,11 @@ def build_rules(
         commute_mode=request.commute_mode,
         commute_budget=daily_commute_budget_minutes(request, settings),
         excursion_budget=excursion_daily_limit_minutes(request, settings),
-        urban_commute_cap=int(settings.route_planner_urban_commute_cap_minutes),
+        urban_commute_cap=(
+            int(settings.route_planner_relaxed_urban_commute_cap_minutes)
+            if relaxed
+            else int(settings.route_planner_urban_commute_cap_minutes)
+        ),
         taxi_over_minutes=int(settings.route_planner_taxi_when_transit_over_minutes),
         taxi_ratio=float(settings.route_planner_taxi_ratio),
         family=_family_requested(request),
@@ -253,6 +326,20 @@ def build_rules(
         other_preferences=tuple(item for item in OTHER_PREFS if item in (request.preferences or [])),
         city=request.to_city or "",
         start_month=start_day.month,
+        night_candidate=flags["night_candidate"],
+        food_candidate=flags["food_candidate"],
+        tea_candidate=flags["tea_candidate"],
+        family_candidate=flags["family_candidate"],
+        day_sight_limit=2 if relaxed else None,
+        night_limit=1 if relaxed else None,
+        relaxed_day_end_minute=(
+            parse_hhmm(settings.route_planner_relaxed_day_end) if relaxed else None
+        ),
+        relaxed_return_plain_minute=return_plain if relaxed else None,
+        relaxed_sight_hours=(
+            float(settings.route_planner_relaxed_sight_hours) if relaxed else 6.0
+        ),
+        require_day_rest=relaxed,
+        skip_unrequested_snacks=relaxed,
+        rest_via_lodge_only_when_near=relaxed,
     )
-
-

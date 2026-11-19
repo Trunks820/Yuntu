@@ -2,7 +2,7 @@
 
 Transport remains owned by the ordinary Writer relay path and the independent
 DS client.  This module races their *typed* results, applies design §8.4 as a
-closed truth table, and exposes only the two cancellations authorized by §6.2.
+closed truth table, including the v0.15 qualified-standby grace cutoff.
 """
 
 from __future__ import annotations
@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Generic, TypeVar
 
@@ -22,12 +23,59 @@ logger = logging.getLogger(__name__)
 
 DraftT = TypeVar("DraftT")
 
+# This bounds cancellation bookkeeping, not model execution or the grace choice.
+# A slow store finalizer keeps its task until completion; the existing relay
+# lease reaper still owns recovery if its process disappears.
+_CANCEL_DRAIN_SECONDS = 0.25
+_pending_cancel_cleanup: set[asyncio.Task] = set()
+
+
+async def _drain_cancelled_opus(task: asyncio.Task, *, remaining: float) -> None:
+    done, _ = await asyncio.wait({task}, timeout=min(_CANCEL_DRAIN_SECONDS, max(0.0, remaining)))
+    if done:
+        await asyncio.gather(task, return_exceptions=True)
+        return
+    _pending_cancel_cleanup.add(task)
+
+    def consume(completed: asyncio.Task) -> None:
+        _pending_cancel_cleanup.discard(completed)
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(consume)
+
+
+class StructuralDraftInvalid(Exception):
+    """Bounded structural codes for a DS body that cannot be published.
+
+    Codes name plan count, missing keys, parse class, or gate reason.
+    They never carry raw model text.
+    """
+
+    def __init__(self, codes: tuple[str, ...] | list[str]) -> None:
+        cleaned = tuple(str(code)[:120] for code in codes if str(code).strip())[:8]
+        self.codes = cleaned or ("plan_count:0",)
+        super().__init__(",".join(self.codes))
+
+
+def retry_budget_admitted(
+    remaining: float | None,
+    writer_cost: float,
+    review_cost: float,
+    reserve: float,
+) -> bool:
+    """One Writer retry needs Writer cost, Review cost, and the publish reserve."""
+    if remaining is None:
+        return True
+    return float(remaining) >= float(writer_cost) + float(review_cost) + float(reserve)
+
 
 class OpusAdjudicationState(str, Enum):
     VALID = "valid"
     INVALID = "invalid"
     DEAD = "dead"
     CANCELLED_BUDGET = "cancelled_budget"
+    CANCELLED_STANDBY_READY = "cancelled_standby_ready"
 
 
 class DSAdjudicationState(str, Enum):
@@ -52,6 +100,7 @@ class AdjudicationReason(str, Enum):
     BUDGET_CUTOFF_DS_REJECTED = "budget_cutoff_ds_rejected"
     BUDGET_CUTOFF_DS_FAILED = "budget_cutoff_ds_failed"
     BUDGET_CUTOFF_NO_DRAFT = "budget_cutoff_no_draft"
+    STANDBY_GRACE_DS_ADOPTED = "standby_grace_expired_ds_adopted"
 
 
 class AdoptedGenerator(str, Enum):
@@ -89,6 +138,8 @@ class SpeculativeTelemetrySnapshot:
     probe_kill_endpoints: tuple[str, ...]
     probe_kill_kind: str | None
     probe_partial_output_before_kill: bool | None
+    ds_qualified_at_ms: int | None = None
+    standby_grace_expires_at_ms: int | None = None
 
 
 @dataclass
@@ -100,6 +151,8 @@ class SpeculativeTelemetry:
     opus_final_monotonic: float | None = None
     ds_final_monotonic: float | None = None
     adjudicated_monotonic: float | None = None
+    ds_qualified_monotonic: float | None = None
+    standby_grace_deadline_monotonic: float | None = None
     probe_kills: list[ProbeKillObservation] = field(default_factory=list)
 
     def start(self, observed_at_monotonic: float) -> None:
@@ -149,6 +202,8 @@ class SpeculativeTelemetry:
             opus_final_ms=elapsed(self.opus_final_monotonic),
             ds_final_ms=elapsed(self.ds_final_monotonic),
             adjudicated_at_ms=elapsed(self.adjudicated_monotonic),
+            ds_qualified_at_ms=elapsed(self.ds_qualified_monotonic),
+            standby_grace_expires_at_ms=elapsed(self.standby_grace_deadline_monotonic),
             probe_kill_count=len(self.probe_kills),
             probe_kill_endpoints=tuple(item.endpoint for item in self.probe_kills),
             probe_kill_kind=last_kill.kind if last_kill is not None else None,
@@ -174,7 +229,7 @@ def adjudicate(
     opus_state: OpusAdjudicationState,
     ds_state: DSAdjudicationState,
 ) -> AdjudicationDecision:
-    """Apply the 13-row design §8.4 table without inferred wildcards."""
+    """Apply the original §8.4 table plus the explicit v0.15 standby cutoff."""
     if opus_state is OpusAdjudicationState.VALID:
         return AdjudicationDecision(
             AdjudicationReason.OPUS_OK,
@@ -186,6 +241,12 @@ def adjudicate(
         )
 
     rows = {
+        (OpusAdjudicationState.CANCELLED_STANDBY_READY, DSAdjudicationState.VALID): (
+            AdjudicationReason.STANDBY_GRACE_DS_ADOPTED,
+            AdoptedGenerator.DS_FLASH,
+            ReviewPolicy.MANDATORY_FULL,
+            None,
+        ),
         (OpusAdjudicationState.INVALID, DSAdjudicationState.VALID): (
             AdjudicationReason.OPUS_REJECTED_DS_ADOPTED,
             AdoptedGenerator.DS_FLASH,
@@ -288,6 +349,8 @@ class OpusDraftResult(Generic[DraftT]):
     token_in: int = 0
     token_out: int = 0
     prompt_version: str = "opus_v4"
+    structural_reasons: tuple[str, ...] = ()
+    completed_monotonic: float | None = None
 
     def __post_init__(self) -> None:
         if (self.state is OpusAdjudicationState.VALID) != (self.draft is not None):
@@ -297,6 +360,7 @@ class OpusDraftResult(Generic[DraftT]):
             in {
                 OpusAdjudicationState.DEAD,
                 OpusAdjudicationState.CANCELLED_BUDGET,
+                OpusAdjudicationState.CANCELLED_STANDBY_READY,
             }
             and self.raw_text is not None
         ):
@@ -333,6 +397,8 @@ class DSStandbyResult(Generic[DraftT]):
     model: str = ""
     prompt_version: str = "flash_v3"
     failure_type: str = ""
+    structural_reasons: tuple[str, ...] = ()
+    qualified_monotonic: float | None = None
 
     def __post_init__(self) -> None:
         if self.terminal_state is DSTerminalState.COMPLETED:
@@ -355,9 +421,11 @@ class DSStandbyTask(Generic[DraftT]):
         *,
         request: Callable[[], Awaitable[SpeculativeDSWriterResponse]],
         validate: Callable[[str], DraftT | None | Awaitable[DraftT | None]],
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._request = request
         self._validate = validate
+        self._monotonic = monotonic
         self._cancel_state: DSTerminalState | None = None
         self._cancel_lock = asyncio.Lock()
         self._task = asyncio.create_task(self._run())
@@ -402,16 +470,35 @@ class DSStandbyTask(Generic[DraftT]):
             )
 
         validation_failure_type = ""
+        structural_reasons: tuple[str, ...] = ()
         try:
             validated = self._validate(response.text)
             draft = await validated if inspect.isawaitable(validated) else validated
-        except Exception as exc:
+        except asyncio.CancelledError:
+            if self._cancel_state is None:
+                raise
+            return DSStandbyResult(
+                terminal_state=self._cancel_state,
+                latency_ms=int((time.monotonic_ns() - started) // 1_000_000),
+            )
+        except StructuralDraftInvalid as exc:
             draft = None
             validation_failure_type = exc.__class__.__name__
+            structural_reasons = tuple(exc.codes)
             logger.warning(
                 "speculative_ds_structural_validation_failed error_type=%s",
                 validation_failure_type,
             )
+        except Exception as exc:
+            draft = None
+            validation_failure_type = exc.__class__.__name__
+            structural_reasons = (f"failure:{validation_failure_type}"[:80],)
+            logger.warning(
+                "speculative_ds_structural_validation_failed error_type=%s",
+                validation_failure_type,
+            )
+        if draft is None and not structural_reasons:
+            structural_reasons = ("plan_count:0",)
         return DSStandbyResult(
             terminal_state=DSTerminalState.COMPLETED,
             draft=draft,
@@ -423,6 +510,8 @@ class DSStandbyTask(Generic[DraftT]):
             model=response.model,
             prompt_version=response.prompt_version,
             failure_type=validation_failure_type,
+            structural_reasons=structural_reasons,
+            qualified_monotonic=self._monotonic() if draft is not None else None,
         )
 
     @property
@@ -476,7 +565,10 @@ class SpeculativeWriterExecutor(Generic[DraftT]):
         residual_reserve_seconds: float,
         opus_attempt_cost_seconds: float,
         review_cost_seconds: float,
+        plan_retry_remaining: int = 1,
         request_opus_budget_cancel: Callable[[], None] | None = None,
+        request_opus_standby_cancel: Callable[[], None] | None = None,
+        standby_grace_seconds: float | None = None,
         telemetry: SpeculativeTelemetry | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -487,7 +579,17 @@ class SpeculativeWriterExecutor(Generic[DraftT]):
         self._reserve = float(residual_reserve_seconds)
         self._opus_attempt_cost = float(opus_attempt_cost_seconds)
         self._review_cost = float(review_cost_seconds)
+        self._plan_retry_remaining = int(plan_retry_remaining)
         self._request_opus_budget_cancel = request_opus_budget_cancel
+        self._request_opus_standby_cancel = request_opus_standby_cancel
+        if standby_grace_seconds is not None and (
+            not math.isfinite(float(standby_grace_seconds))
+            or float(standby_grace_seconds) <= 0
+        ):
+            raise ValueError("standby_grace_seconds must be finite and positive or None")
+        self._standby_grace_seconds = (
+            float(standby_grace_seconds) if standby_grace_seconds is not None else None
+        )
         self._telemetry = telemetry or SpeculativeTelemetry()
         self._monotonic = monotonic
 
@@ -495,8 +597,13 @@ class SpeculativeWriterExecutor(Generic[DraftT]):
         return self._workflow_deadline - self._monotonic()
 
     def _retry_admitted(self) -> bool:
-        return self._remaining() >= (
-            self._opus_attempt_cost + self._review_cost + self._reserve
+        if self._plan_retry_remaining <= 0:
+            return False
+        return retry_budget_admitted(
+            self._remaining(),
+            self._opus_attempt_cost,
+            self._review_cost,
+            self._reserve,
         )
 
     def _cutoff_delay(self) -> float:
@@ -540,151 +647,175 @@ class SpeculativeWriterExecutor(Generic[DraftT]):
 
     async def execute(self) -> SpeculativeExecutionResult[DraftT]:
         self._telemetry.start(self._monotonic())
-        # These two calls are deliberately adjacent: both paths fire at T0.
-        opus_task = asyncio.create_task(self._run_opus_initial())
+
+        async def run_opus(run):
+            result = await run()
+            return replace(result, completed_monotonic=self._monotonic())
+
+        # Both providers start at T0. Their existing per-attempt limits remain
+        # in the transports; the workflow cutoff and grace can only shorten them.
+        opus_task = asyncio.create_task(run_opus(self._run_opus_initial))
         ds_task = self._start_ds()
+        cutoff_deadline = self._workflow_deadline - self._review_cost - self._reserve
         cutoff_task = asyncio.create_task(asyncio.sleep(self._cutoff_delay()))
+        grace_task: asyncio.Task[None] | None = None
+        grace_deadline: float | None = None
         opus_result: OpusDraftResult[DraftT] | None = None
         ds_result: DSStandbyResult[DraftT] | None = None
+        ds_qualified_in_budget = True
         opus_retry_used = False
-        opus_invalid_in_hand = False
         opus_invalid_result_in_hand: OpusDraftResult[DraftT] | None = None
         completed_opus_results: list[OpusDraftResult[DraftT]] = []
+
+        def current_ds_state() -> DSAdjudicationState:
+            assert ds_result is not None
+            if not ds_qualified_in_budget:
+                return DSAdjudicationState.CANCELLED_BUDGET
+            return ds_adjudication_state(ds_result)
+
         try:
             while True:
                 waiters: set[asyncio.Task[object]] = {cutoff_task}
+                if grace_task is not None:
+                    waiters.add(grace_task)
                 if opus_result is None:
                     waiters.add(opus_task)
                 if ds_result is None:
                     waiters.add(ds_task._task)
                 await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
 
-                # Identity precedence also governs simultaneous completions.
+                # Qualification is recorded at the end of validation, not when
+                # the wire body arrives or when this arbitration loop wakes up.
+                if ds_result is None and ds_task.done:
+                    ds_result = await ds_task.wait()
+                    self._telemetry.mark_ds_final(self._monotonic())
+                    if ds_result.structurally_valid:
+                        qualified_at = ds_result.qualified_monotonic
+                        if qualified_at is None:
+                            qualified_at = self._monotonic()
+                        self._telemetry.ds_qualified_monotonic = qualified_at
+                        ds_qualified_in_budget = qualified_at <= cutoff_deadline
+                        if ds_qualified_in_budget and self._standby_grace_seconds is not None:
+                            grace_deadline = qualified_at + self._standby_grace_seconds
+                            self._telemetry.standby_grace_deadline_monotonic = grace_deadline
+                            grace_task = asyncio.create_task(asyncio.sleep(
+                                max(0.0, grace_deadline - self._monotonic())
+                            ))
+
+                active_deadline = min(cutoff_deadline, grace_deadline or cutoff_deadline)
+                # Opus wins a genuine tie, but a body qualified after the earlier
+                # deadline cannot overwrite the already selected standby.
                 if opus_result is None and opus_task.done():
                     try:
                         opus_result = await opus_task
                     except asyncio.CancelledError:
-                        opus_result = OpusDraftResult(
-                            OpusAdjudicationState.CANCELLED_BUDGET
-                        )
+                        opus_result = OpusDraftResult(OpusAdjudicationState.CANCELLED_BUDGET)
 
                     if opus_result.raw_text is not None:
                         completed_opus_results.append(opus_result)
-
-                    if (
-                        opus_retry_used
-                        and opus_result.state is not OpusAdjudicationState.VALID
-                    ):
-                        if opus_result.state is not OpusAdjudicationState.INVALID:
-                            assert opus_invalid_result_in_hand is not None
-                            opus_result = OpusDraftResult(
-                                OpusAdjudicationState.INVALID,
-                                failure_type=(
-                                    opus_result.failure_type
-                                    or opus_invalid_result_in_hand.failure_type
-                                ),
-                                raw_text=opus_invalid_result_in_hand.raw_text,
-                                latency_ms=opus_invalid_result_in_hand.latency_ms,
-                                token_in=opus_invalid_result_in_hand.token_in,
-                                token_out=opus_invalid_result_in_hand.token_out,
-                                prompt_version=(
-                                    opus_invalid_result_in_hand.prompt_version
-                                ),
-                            )
-
-                    if (
-                        opus_result.state is OpusAdjudicationState.INVALID
-                        and opus_result.failure_type
-                        != "writer_excessive_keyed_fragment_fallback"
-                        and not opus_retry_used
-                        and self._retry_admitted()
-                    ):
-                        opus_retry_used = True
-                        opus_invalid_in_hand = True
-                        opus_invalid_result_in_hand = opus_result
-                        opus_task = asyncio.create_task(self._run_opus_retry())
+                    completed_at = opus_result.completed_monotonic
+                    if completed_at is None:
+                        completed_at = self._monotonic()
+                    if completed_at > active_deadline:
                         opus_result = None
-                        continue
+                    else:
+                        if opus_retry_used and opus_result.state is not OpusAdjudicationState.VALID:
+                            if opus_result.state is not OpusAdjudicationState.INVALID:
+                                assert opus_invalid_result_in_hand is not None
+                                opus_result = replace(
+                                    opus_invalid_result_in_hand,
+                                    failure_type=(opus_result.failure_type
+                                                  or opus_invalid_result_in_hand.failure_type),
+                                )
 
-                    self._telemetry.mark_opus_final(self._monotonic())
+                        if (
+                            opus_result.state is OpusAdjudicationState.INVALID
+                            and opus_result.failure_type != "writer_excessive_keyed_fragment_fallback"
+                            and not opus_retry_used
+                            and self._monotonic() < active_deadline
+                            and self._retry_admitted()
+                        ):
+                            opus_retry_used = True
+                            opus_invalid_result_in_hand = opus_result
+                            opus_task = asyncio.create_task(run_opus(self._run_opus_retry))
+                            opus_result = None
+                            # The existing grace task/deadline survives the retry.
+                            continue
 
-                    if opus_result.state is OpusAdjudicationState.VALID:
-                        if ds_result is None:
-                            ds_result = (
-                                await ds_task.wait()
-                                if ds_task.done
-                                else await ds_task.cancel_by_opus_win()
+                        self._telemetry.mark_opus_final(self._monotonic())
+                        if opus_result.state is OpusAdjudicationState.VALID:
+                            if ds_result is None:
+                                ds_result = await ds_task.cancel_by_opus_win()
+                                self._telemetry.mark_ds_final(self._monotonic())
+                            return self._finish(
+                                decision=adjudicate(opus_result.state, current_ds_state()),
+                                opus_result=opus_result,
+                                ds_result=ds_result,
+                                opus_retry_used=opus_retry_used,
+                                completed_opus_results=completed_opus_results,
                             )
-                            self._telemetry.mark_ds_final(self._monotonic())
-                        decision = adjudicate(
-                            OpusAdjudicationState.VALID,
-                            ds_adjudication_state(ds_result),
-                        )
-                        return self._finish(
-                            decision=decision,
-                            opus_result=opus_result,
-                            ds_result=ds_result,
-                            opus_retry_used=opus_retry_used,
-                            completed_opus_results=completed_opus_results,
-                        )
 
-                if ds_result is None and ds_task.done:
-                    ds_result = await ds_task.wait()
-                    self._telemetry.mark_ds_final(self._monotonic())
-
+                # Explicit primary failure never waits for the grace window.
                 if opus_result is not None and ds_result is not None:
-                    decision = adjudicate(
-                        opus_result.state,
-                        ds_adjudication_state(ds_result),
-                    )
                     return self._finish(
-                        decision=decision,
+                        decision=adjudicate(opus_result.state, current_ds_state()),
                         opus_result=opus_result,
                         ds_result=ds_result,
                         opus_retry_used=opus_retry_used,
                         completed_opus_results=completed_opus_results,
                     )
 
-                if cutoff_task.done():
+                now = self._monotonic()
+                budget_cutoff = now >= cutoff_deadline or cutoff_task.done()
+                grace_cutoff = grace_deadline is not None and now >= grace_deadline
+                if budget_cutoff or grace_cutoff:
+                    # If scheduling delays both timers, the earlier absolute
+                    # deadline owns the outcome. Equal deadlines favor budget.
+                    use_grace = grace_cutoff and grace_deadline < cutoff_deadline
                     if opus_result is None:
-                        if self._request_opus_budget_cancel is not None:
-                            self._request_opus_budget_cancel()
-                        opus_task.cancel("CANCELLED_BY_BUDGET_CUTOFF")
-                        await asyncio.gather(opus_task, return_exceptions=True)
+                        if use_grace:
+                            if self._request_opus_standby_cancel is not None:
+                                self._request_opus_standby_cancel()
+                            opus_task.cancel("CANCELLED_BY_STANDBY_READY")
+                        else:
+                            if self._request_opus_budget_cancel is not None:
+                                self._request_opus_budget_cancel()
+                            opus_task.cancel("CANCELLED_BY_BUDGET_CUTOFF")
+                        await _drain_cancelled_opus(
+                            opus_task, remaining=cutoff_deadline - self._monotonic(),
+                        )
                         opus_result = (
-                            opus_invalid_result_in_hand
-                            if opus_invalid_in_hand
-                            else OpusDraftResult(
-                                OpusAdjudicationState.CANCELLED_BUDGET
+                            OpusDraftResult(OpusAdjudicationState.CANCELLED_STANDBY_READY)
+                            if use_grace else (
+                                opus_invalid_result_in_hand
+                                or OpusDraftResult(OpusAdjudicationState.CANCELLED_BUDGET)
                             )
                         )
-                        assert opus_result is not None
                         self._telemetry.mark_opus_final(self._monotonic())
                     if ds_result is None:
                         ds_result = await ds_task.cancel_by_budget_cutoff()
                         self._telemetry.mark_ds_final(self._monotonic())
-                    decision = adjudicate(
-                        opus_result.state,
-                        ds_adjudication_state(ds_result),
-                    )
                     return self._finish(
-                        decision=decision,
+                        decision=adjudicate(opus_result.state, current_ds_state()),
                         opus_result=opus_result,
                         ds_result=ds_result,
                         opus_retry_used=opus_retry_used,
                         completed_opus_results=completed_opus_results,
                     )
         except asyncio.CancelledError:
-            # The outer workflow deadline is the same budget-cutoff lifecycle.
             if not opus_task.done():
                 if self._request_opus_budget_cancel is not None:
                     self._request_opus_budget_cancel()
                 opus_task.cancel("CANCELLED_BY_BUDGET_CUTOFF")
             if not ds_task.done:
                 await ds_task.cancel_by_budget_cutoff()
-            await asyncio.gather(opus_task, return_exceptions=True)
+            await _drain_cancelled_opus(
+                opus_task, remaining=cutoff_deadline - self._monotonic(),
+            )
             raise
         finally:
-            if not cutoff_task.done():
-                cutoff_task.cancel()
-            await asyncio.gather(cutoff_task, return_exceptions=True)
+            timers = [cutoff_task] + ([grace_task] if grace_task is not None else [])
+            for timer in timers:
+                if not timer.done():
+                    timer.cancel()
+            await asyncio.gather(*timers, return_exceptions=True)

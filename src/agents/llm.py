@@ -15,9 +15,10 @@ import logging
 import random
 import re
 import time
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextvars import Token
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,6 +28,7 @@ from openai import AsyncOpenAI
 from src.agents.role_relay_store import POOLED_ROLES, PostgresRoleRelayStore
 from src.agents.writer_relay_router import WriterRelayRouter, WriterStreamEvent, classify_failure
 from src.agents.writer_relay_store import PostgresWriterRelayStore
+from src.agents.model_call_observation import enrich_record, internal_reason, observed_usage, provider_error_code
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,7 @@ _TRACE_TRUTH_PURPOSES = frozenset({
     "DATA_EXTRACTION",
     "SEMANTIC_GROUPING",
     "POI_SELECTOR",
+    "ROUTE_PLANNER",
     "WRITER_PRIMARY",
     "WRITER_STANDBY",
     "PUBLISH_RETRY_WRITER",
@@ -104,11 +107,39 @@ DeepSeek 非思考模式专项执行约束：
 - 输出前静默检查：JSON 可解析、key 集合完全相等、无重复 key、无额外字段、opening 无数字、summary 无地点名。任何不确定信息直接不写，不要解释或道歉。
 - [INTERNAL 开头的 writing_hint 是内部写作参考，不要输出到 text 中。"""
 
+# v0.15.1 timeline prompt: the same discipline, with the new opening, wrap and
+# summary rules instead of the one-sentence opening and place-free summary.
+_DS_TIMELINE_EXECUTION_SUFFIX = """
+
+DeepSeek 非思考模式专项执行约束：
+- 先在内部逐项核对 slot key，最终只输出 JSON；不要输出核对过程。
+- 把输入 slots 视为不可变账本：每个 (plan_index, day, place_id) 恰好返回一次，三项数值逐字复制；禁止自行创建、补全、合并、排序或遗漏 key。
+- 每一天都要写：day_openings 覆盖输入中的每个 Day，恰好一条，2～4 句，不点具体地点名；不要只写第一天就停。
+- poi_fragments 的 text 不得重复当前地点名；除当天更早的站和紧接着的下一站外，不得出现其他专名。
+- 普通 fragment 里不写钟点、分钟数和交通方式。只有 Food Stop 专项规则明确要求且输入给出对应值时，才可逐字复制评分、价格或步行分钟。
+- summary 是单个 80～150 个中文字符的字符串，可以出现本路线的地点名，不写价格、营业时间或交通方式。
+- 输出前静默检查：JSON 可解析、key 集合完全相等、无重复 key、无额外字段、每天都有 opening。任何不确定的信息直接不写，不要解释或道歉。"""
+
 
 def _ds_system_prompt() -> str:
-    """Build DS system prompt = Opus SINGLE_PLAN_SYSTEM_PROMPT + DS suffix."""
-    from src.agents.final_writer import SINGLE_PLAN_SYSTEM_PROMPT
-    return SINGLE_PLAN_SYSTEM_PROMPT + _DS_EXECUTION_SUFFIX
+    """Build DS system prompt = the primary's system prompt + DS suffix."""
+    from src.agents.final_writer import single_plan_system_prompt, writer_prompt_version
+    from src.agents.lodging_section import writer_system_prompt
+    if writer_prompt_version() == "article":
+        # The same occasion and facts as the primary; the JSON discipline does not apply.
+        return writer_system_prompt(single_plan_system_prompt())
+    suffix = (
+        _DS_TIMELINE_EXECUTION_SUFFIX
+        if writer_prompt_version() == "timeline"
+        else _DS_EXECUTION_SUFFIX
+    )
+    return writer_system_prompt(single_plan_system_prompt()) + suffix
+
+
+def _ds_prompt_label() -> str:
+    from src.agents.final_writer import writer_prompt_version
+    return {"timeline": "flash_timeline", "article": "flash_article"}.get(
+        writer_prompt_version(), SPECULATIVE_DS_PROMPT_VERSION)
 # Job-isolated observation sinks for timeout/cancel persist. Never use a single
 # process-global slot: concurrent jobs would cross-contaminate.
 _observation_sinks: dict[str, dict[str, Any]] = {}
@@ -176,6 +207,7 @@ def _trace_truth_role(record: dict[str, Any]) -> str | None:
         "yuntu_review": "review",
         "semantic_grouping": "grouping",
         "poi_selector": "selector",
+        "route_planner": "route_planner",
         "intent_parser": "intent",
         "data_extraction": "extract",
     }
@@ -196,6 +228,8 @@ def _trace_truth_purpose(record: dict[str, Any], role: str) -> str:
         return "SEMANTIC_GROUPING"
     if "poi_selector" in reason or role == "selector":
         return "POI_SELECTOR"
+    if "route_planner" in reason or role == "route_planner":
+        return "ROUTE_PLANNER"
     if "fragment_repair" in reason or "keyed_fragment_repair" in reason:
         return "FRAGMENT_REPAIR"
     if reason in {"publish_failure_polish", "city_clarification_polish"}:
@@ -207,6 +241,18 @@ def _trace_truth_purpose(record: dict[str, Any], role: str) -> str:
             return "PUBLISH_RETRY_WRITER"
         return "WRITER_PRIMARY"
     return "OTHER_SAFE"
+
+
+def public_llm_role_purpose(role: object, purpose: object) -> tuple[object, object]:
+    """Alias the route planner only on the payload that leaves Travel.
+
+    Observation records keep ``route_planner`` / ``ROUTE_PLANNER``. BFF
+    ``LlmCallRole`` / ``LlmCallPurpose`` and Admin's matching unions have no
+    pairing rule, and both accept ``selector`` with ``OTHER_SAFE``.
+    """
+    if role == "route_planner" or purpose == "ROUTE_PLANNER":
+        return "selector", "OTHER_SAFE"
+    return role, purpose
 
 
 def _trace_truth_status(record: dict[str, Any]) -> str:
@@ -268,12 +314,15 @@ def project_llm_usage(
             )
         except (TypeError, ValueError):
             return project_llm_usage(None, complete=False)
+        public_role, public_purpose = public_llm_role_purpose(
+            role, _trace_truth_purpose(record, role)
+        )
         calls.append({
             "sequence": sequence,
             "provider": provider[:40],
             "model": model[:120],
-            "role": role,
-            "purpose": _trace_truth_purpose(record, role),
+            "role": public_role,
+            "purpose": public_purpose,
             "status": _trace_truth_status(record),
             "attempt": attempt,
             "publish_retry_round": publish_retry_round,
@@ -402,19 +451,19 @@ def pop_last_observation_flush() -> dict[str, Any] | None:
 _PROVIDER_BASE_URLS: dict[str, str] = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "deepseek": "https://api.deepseek.com",
+    "openai": "https://api.openai.com/v1",
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",  # placeholder, overridden by config
 }
+# Profiles for the roles kept outside src/model_routes.py (intent, grouping,
+# the closed review). The writer's "claude_opus" is only a label now.
 _RELAY_PROFILES = frozenset({
     "gpt",
-    "gpt_extract",
     "gpt_grouping",
     "gpt_review",
-    "claude",
-    "claude_newapi",
-    "claude_opus",
-    "claude_sonnet_backup",
-    "gemini",
 })
+# Roles whose account, model and key come from src/model_routes.py.
+_TABLE_ROLES = frozenset({"selector", "route_planner", "writer", "extract"})
+_WRITER_RELAY_PROFILE = "claude_opus"
 _RELAY_WIRE_APIS = frozenset({
     "openai_chat",
     "openai_responses",
@@ -465,6 +514,9 @@ _speculative_ds_bulkheads: dict[int, asyncio.Semaphore] = {}
 _pooled_trial: contextvars.ContextVar[tuple[str, str, int] | None] = contextvars.ContextVar(
     "pooled_relay_trial", default=None
 )
+_pooled_generations: contextvars.ContextVar[dict[str, int]] = contextvars.ContextVar(
+    "pooled_relay_generations", default={}
+)
 RECOVERY_PROBE_SYSTEM = "Reply with the single token ok."
 RECOVERY_PROBE_USER = "ok"
 ROLE_RELAY_HOT_PATH_TIMEOUT_SECONDS = 0.1
@@ -508,6 +560,7 @@ class SpeculativeDSWriterResponse:
     latency_ms: int
     model: str
     prompt_version: str = SPECULATIVE_DS_PROMPT_VERSION
+    observed_usage: dict[str, int | None] | None = None
 
 
 @contextmanager
@@ -683,6 +736,7 @@ def _sanitize_llm_record(record: dict[str, Any]) -> dict[str, Any]:
         cleaned["prompt_tokens"] = cleaned.get("token_input")
     if "completion_tokens" not in cleaned and "token_output" in cleaned:
         cleaned["completion_tokens"] = cleaned.get("token_output")
+    cleaned["internal_reason_code"] = internal_reason(cleaned)
     return cleaned
 
 
@@ -777,13 +831,16 @@ def _record_attempt(
         "error_type": error_type,
         "http_status_code": http_status_code,
         "cancelled_at": cancelled_at or context.get("cancelled_at"),
+        "observed_usage": _captured_usage(config),
+        "transport_attempts": list((context.get("transport_attempts") or {}).get(_usage_capture_key(config), [])),
     })
 
 
 def _record_llm_call(record: dict[str, Any]) -> dict[str, Any] | None:
     records = _call_records.get()
     if records is not None:
-        stored = _sanitize_llm_record(record)
+        stored = enrich_record(_sanitize_llm_record(record))
+        stored.setdefault("observation_id", uuid.uuid4().hex)
         stored.setdefault("observation_sequence", len(records) + 1)
         records.append(stored)
         return stored
@@ -816,7 +873,7 @@ def _resolve_router_pending_cancellations(
             continue
         record["termination_reason"] = termination_reason
         record["status"] = (
-            "cancelled" if "cancel" in termination_reason else "error"
+            "cancelled" if "cancel" in termination_reason or termination_reason == "standby_ready" else "error"
         )
         resolved += 1
     return resolved
@@ -1011,6 +1068,8 @@ def resolve_role_config(role: str) -> RoleConfig:
             f"Unknown LLM role {role!r}. Valid roles: {sorted(VALID_ROLES)}"
         )
     s = get_settings()
+    if role in _TABLE_ROLES:
+        return _table_role_config(role, s)
     provider: str = getattr(s, f"{role}_provider", "deepseek")
     if provider not in _PROVIDER_BASE_URLS and provider != "relay":
         raise ValueError(
@@ -1086,17 +1145,26 @@ def resolve_role_config(role: str) -> RoleConfig:
                 ),
             )
     else:
-        base_url = _PROVIDER_BASE_URLS[provider]
+        base_url = (
+            str(getattr(s, f"{role}_base_url", "") or "").strip()
+            or _PROVIDER_BASE_URLS[provider]
+        )
         wire_api = "openai_chat"
-        api_key: str = getattr(s, f"{role}_api_key", "")
-        if not api_key and provider == "gemini":
-            api_key = s.gemini_api_key
+        api_key: str = str(getattr(s, f"{role}_api_key", "") or "").strip()
+        if not api_key:
+            from src.model_routes import resolve_open_source_leg
+
+            fallback = resolve_open_source_leg(s, "selector")
+            if fallback.api_key:
+                api_key = fallback.api_key
+                if provider != fallback.provider and not str(getattr(s, f"{role}_api_key", "") or "").strip():
+                    provider = fallback.provider
+                    base_url = fallback.base_url
+                    model = fallback.model
     if not api_key:
-        fallback_hint = " or GEMINI_API_KEY" if provider == "gemini" else ""
         raise ValueError(
             f"No API key for role {role!r}. "
-            f"Set {role.upper()}_API_KEY{fallback_hint} in .env "
-            f"for provider {provider!r}"
+            f"Set {role.upper()}_API_KEY, GEMINI_API_KEY, or DEEPSEEK_API_KEY in .env"
         )
     return RoleConfig(
         provider=provider,
@@ -1108,6 +1176,88 @@ def resolve_role_config(role: str) -> RoleConfig:
         relay_endpoint=relay_endpoint,
         relay_pool=relay_pool,
     )
+
+
+def _table_role_config(role: str, settings: Any, *, slot: str = "primary") -> RoleConfig:
+    """Build a role's config from open-source settings and route defaults."""
+    from src.model_routes import resolve_open_source_leg
+
+    agent = "writer_gemini" if (role == "writer" and slot == "primary" and getattr(settings, "writer_primary_gemini", False)) else role
+    resolved = resolve_open_source_leg(settings, agent, slot)
+    if not resolved.api_key:
+        raise ValueError(
+            f"No API key for role {role!r}. Set {role.upper()}_API_KEY, GEMINI_API_KEY, or DEEPSEEK_API_KEY in .env"
+        )
+    return RoleConfig(
+        provider=resolved.provider,
+        model=resolved.model,
+        api_key=resolved.api_key,
+        base_url=resolved.base_url,
+        wire_api="openai_chat",
+    )
+
+
+def _writer_gemini_config(settings: Any) -> RoleConfig:
+    """WRITER_PRIMARY=gemini: the writer's primary seat, called directly."""
+    return _table_role_config("writer", settings, slot="primary")
+
+
+def route_planner_backup_config(settings: Any) -> RoleConfig:
+    """The route planner's backup leg. Raises when its key is not set."""
+    return _table_role_config("route_planner", settings, slot="backup")
+
+
+def writer_standby_config(settings: Any, *, agent: str = "writer") -> RoleConfig:
+    """Optional standby draft leg when a dedicated backup key is configured."""
+    from src.model_routes import resolve_open_source_leg
+
+    resolved = resolve_open_source_leg(settings, agent, "backup")
+    return RoleConfig(
+        provider=resolved.provider,
+        model=resolved.model,
+        api_key=resolved.api_key,
+        base_url=resolved.base_url,
+        wire_api="openai_chat",
+    )
+
+
+class _ObservedAsyncClient(httpx.AsyncClient):
+    """Observe each SDK send while preserving the SDK's existing retries."""
+
+    async def send(self, request, **kwargs):
+        started = time.monotonic_ns()
+        response = None
+        error = None
+        try:
+            response = await super().send(request, **kwargs)
+            return response
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            context = _call_context.get() or {}
+            config = context.get("usage_config")
+            captures = context.get("transport_attempts")
+            if isinstance(config, RoleConfig) and isinstance(captures, dict):
+                data = {}
+                if response is not None and response.is_stream_consumed:
+                    try:
+                        parsed = response.json()
+                        data = parsed if isinstance(parsed, dict) else {}
+                    except (ValueError, TypeError):
+                        pass
+                code = response.status_code if response is not None else None
+                captures.setdefault(_usage_capture_key(config), []).append(enrich_record({
+                    "observation_id": uuid.uuid4().hex, "provider": config.provider, "model": config.model,
+                    "endpoint_label": config.relay_endpoint or config.relay_profile or config.provider,
+                    "status": "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+                        if error or (code is not None and code >= 400) else "success",
+                    "http_status_code": code, "error_type": type(error).__name__ if error else None,
+                    "error_code": provider_error_code(data),
+                    "response_received": response is not None,
+                    "latency_ms": (time.monotonic_ns() - started) // 1_000_000,
+                    "observed_usage": observed_usage(data.get("usage")),
+                }))
 
 
 def _get_client(
@@ -1125,7 +1275,7 @@ def _get_client(
         _clients[key] = AsyncOpenAI(
             api_key=api_key,
             base_url=resolved_base_url,
-            http_client=httpx.AsyncClient(verify=verify_ssl),
+            http_client=_ObservedAsyncClient(verify=verify_ssl),
         )
     return _clients[key]
 
@@ -1152,6 +1302,99 @@ def role_relay_store() -> PostgresRoleRelayStore:
     if _role_relay_store is None:
         _role_relay_store = PostgresRoleRelayStore()
     return _role_relay_store
+
+
+async def _execute_durable_endpoint(role: str, name: str, config: RoleConfig, request, *, timeout_seconds: float | None = None, has_alternatives: bool = False):
+    """Reuse the role ledger for direct and pre-router legacy endpoints.
+
+    Expiry permits one normal business request to hold the recovery lease; no
+    background requests are generated. A single path's unavailable state store
+    cannot suppress the model request; an actual recorded stop still applies.
+    """
+    from src.agents.generation_model_routing import ModelEndpoint, endpoint_runtime_fingerprint
+
+    if not role:
+        return await request()
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    def remaining_timeout(limit: float) -> float:
+        return limit if deadline is None else max(0.001, min(limit, deadline - time.monotonic()))
+
+    endpoint = ModelEndpoint(config.provider, config.model, config.base_url, config.api_key,
+                             f"endpoint:{role}:{name}", name)
+    store = None
+    tracked = False
+    trial = False
+    generation = None
+    try:
+        store = role_relay_store()
+        async def prepare():
+            await store.synchronize_direct(
+                role, name, provider=config.provider, failure_domain=endpoint.failure_domain,
+                fingerprint=endpoint_runtime_fingerprint(endpoint, role=role),
+                qualified_initial=bool(config.provider == "relay" and config.relay_pool),
+                has_alternatives=has_alternatives,
+            )
+            return await store.admit(role, (name,))
+        # State bookkeeping gets a small part of the existing call budget;
+        # it must leave time for the single real provider on a slow database.
+        admission_timeout = min(0.2, float(timeout_seconds) / 10) if timeout_seconds is not None else 0.2
+        admitted, trial_name, generation = await asyncio.wait_for(prepare(), timeout=max(0.001, admission_timeout))
+    except Exception as exc:
+        if has_alternatives:
+            error = LLMTransportError("relay_unavailable", "model endpoint is unavailable")
+            error.model_request_not_started = True
+            raise error from None
+        logger.warning("model_endpoint_state_unavailable role=%s endpoint=%s error_type=%s",
+                       role, name, type(exc).__name__)
+    else:
+        if name not in admitted:
+            error = LLMTransportError("relay_unavailable", "model endpoint is unavailable")
+            error.model_request_not_started = True
+            raise error from None
+        tracked = True
+        trial = trial_name == name
+
+    async def settle(*, success: bool, failure_class: str | None = None, retry_after_seconds=None):
+        if not tracked:
+            return
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise asyncio.TimeoutError("settlement budget exhausted")
+            await asyncio.wait_for(store.record_direct_attempt(
+                role, name, success=success, failure_class=failure_class,
+                trial=trial, generation=generation,
+                retry_after_seconds=retry_after_seconds,
+                has_alternatives=has_alternatives,
+            ), timeout=remaining_timeout(0.5))
+        except Exception as exc:
+            # Settlement must not replace the actual provider outcome or lose a
+            # completed draft. A single path remains usable on state-store loss.
+            logger.error("model_endpoint_settlement_failed role=%s endpoint=%s error_type=%s",
+                         role, name, type(exc).__name__)
+
+    try:
+        if deadline is None:
+            result = await request()
+        else:
+            reserve = min(0.1, float(timeout_seconds) / 10)
+            result = await asyncio.wait_for(request(), timeout=max(0.001, deadline - time.monotonic() - reserve))
+    except asyncio.CancelledError:
+        if trial and generation is not None:
+            try:
+                await asyncio.shield(asyncio.wait_for(
+                    store.release_direct_trial(role, name, generation=generation), timeout=remaining_timeout(0.5),
+                ))
+            except Exception as exc:
+                logger.error("model_endpoint_release_failed role=%s endpoint=%s error_type=%s",
+                             role, name, type(exc).__name__)
+        raise
+    except Exception as exc:
+        failure = classify_failure(exc)
+        await settle(success=False, failure_class=failure.failure_class, retry_after_seconds=failure.retry_after_seconds)
+        raise
+    else:
+        await settle(success=True)
+        return result
 
 
 def pooled_endpoint_fingerprint(
@@ -1237,19 +1480,19 @@ async def _record_pooled_attempt(
             success=success,
             failure_class=failure_class,
             trial=bool(trial_name and trial_name == endpoint_name),
-            generation=generation if trial_name == endpoint_name else None,
+            generation=(generation if trial_name == endpoint_name
+                        else _pooled_generations.get().get(endpoint_name)),
+            retry_after_seconds=(classify_failure(exc).retry_after_seconds if exc is not None else None),
         )
     except Exception as record_exc:
-        logger.warning(
+        logger.error(
             "role_relay_record_failed role=%s endpoint=%s error_type=%s",
             role,
             endpoint_name,
             type(record_exc).__name__,
         )
-        raise LLMTransportError(
-            "relay_state_unavailable",
-            "relay state is unavailable",
-        ) from None
+        # Preserve the actual provider outcome and its P1 record. The next
+        # admission still requires the durable store and fails closed if absent.
 
 
 async def _record_pooled_attempt_on_hot_path(
@@ -1275,7 +1518,7 @@ async def _admit_pooled_endpoints(
     *,
     exclude_endpoints: frozenset[str] = frozenset(),
     allow_recovery: bool = True,
-) -> tuple[tuple[str, ...], str | None, int | None]:
+) -> tuple[tuple[str, ...], str | None, int | dict[str, int] | None]:
     fingerprints = {
         endpoint.name: pooled_endpoint_fingerprint(
             role, config.relay_profile, endpoint, config.model
@@ -1328,10 +1571,27 @@ def _role_config_for_endpoint(config: RoleConfig, endpoint: RelayEndpoint) -> Ro
     )
 
 
-def _relay_endpoint_candidates(config: RoleConfig) -> list[RelayEndpoint]:
+def _has_independent_relay_alternative(config: RoleConfig) -> bool:
+    """Inspect the full configured pool, before admission narrows candidates."""
+    from urllib.parse import urlsplit
+    endpoints = []
+    for endpoint in config.relay_pool:
+        try:
+            url = urlsplit(str(endpoint.base_url or "").strip())
+        except ValueError:
+            continue
+        key = str(endpoint.api_key or "").strip()
+        model = str(endpoint.model or config.model or "").strip()
+        if key and model and url.scheme in {"http", "https"} and url.hostname:
+            endpoints.append((url.hostname, key))
+    return any(
+        first[1] != second[1] and first[0] != second[0]
+        for index, first in enumerate(endpoints) for second in endpoints[index + 1:]
+    )
+
+
+def _relay_endpoint_candidates(config: RoleConfig, *, durable_admitted: bool = False) -> list[RelayEndpoint]:
     endpoints = list(config.relay_pool)
-    if len(endpoints) <= 1:
-        return endpoints
     now = time.monotonic()
     active: list[RelayEndpoint] = []
     for endpoint in endpoints:
@@ -1339,9 +1599,11 @@ def _relay_endpoint_candidates(config: RoleConfig) -> list[RelayEndpoint]:
             (config.relay_profile, endpoint.name),
             0.0,
         )
-        if cooldown_until <= now:
+        if durable_admitted or not _has_independent_relay_alternative(config) or cooldown_until <= now:
             active.append(endpoint)
-    candidates = active or endpoints
+    candidates = active
+    if not candidates:
+        return []
     if config.relay_profile in _PRIMARY_FIRST_RELAY_PROFILES:
         return candidates
     rotation_key = config.relay_profile
@@ -1360,6 +1622,8 @@ def _relay_pool_cooldown_seconds() -> float:
 
 
 def _mark_relay_endpoint_cooldown(config: RoleConfig, endpoint: RelayEndpoint) -> None:
+    if not _has_independent_relay_alternative(config):
+        return
     cooldown = _relay_pool_cooldown_seconds()
     if cooldown <= 0:
         return
@@ -1406,6 +1670,29 @@ def _join_endpoint(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
 
 
+def _usage_capture_key(config: RoleConfig) -> str:
+    return f"{config.provider}:{config.model}:{config.relay_endpoint or config.relay_profile}"
+
+
+def _capture_usage(config: RoleConfig, value: object, *, complete: bool = True) -> None:
+    captures = (_call_context.get() or {}).get("usage_capture")
+    if not isinstance(captures, dict):
+        return
+    key = _usage_capture_key(config)
+    prior = captures.setdefault(key, observed_usage(None))
+    prior["complete"] = complete
+    for field, count in observed_usage(value, config.wire_api).items():
+        if count is not None:
+            prior[field] = count
+
+
+def _captured_usage(config: RoleConfig) -> dict:
+    captures = (_call_context.get() or {}).get("usage_capture")
+    if not isinstance(captures, dict):
+        return observed_usage(None)
+    return dict(captures.get(_usage_capture_key(config)) or observed_usage(None))
+
+
 def _usage_value(usage: object, name: str) -> int:
     if isinstance(usage, dict):
         value = usage.get(name, 0)
@@ -1449,12 +1736,18 @@ async def _relay_post_json(
     headers: dict[str, str],
     payload: dict,
     retry_delays: tuple[float, ...] = _RELAY_RETRY_DELAYS_SECONDS,
+    observation_config: RoleConfig | None = None,
 ) -> dict:
     retry_statuses = {429, 500, 502, 503, 504}
     attempts = len(retry_delays) + 1
     last_exc: Exception | None = None
     async with httpx.AsyncClient(verify=get_settings().llm_verify_ssl) as client:
         for attempt in range(attempts):
+            observation_started = time.monotonic_ns()
+            observation_response = None
+            observation_error = None
+            observation_finished = None
+            observation_latency = None
             try:
                 response = await client.post(
                     url,
@@ -1462,6 +1755,9 @@ async def _relay_post_json(
                     json=payload,
                     timeout=_relay_request_timeout_seconds(),
                 )
+                observation_response = response
+                observation_finished = datetime.now(timezone.utc).isoformat()
+                observation_latency = (time.monotonic_ns() - observation_started) // 1_000_000
                 if (
                     response.status_code in retry_statuses
                     and attempt < attempts - 1
@@ -1477,11 +1773,44 @@ async def _relay_post_json(
                 httpx.RemoteProtocolError,
                 httpx.WriteError,
             ) as exc:
+                observation_error = exc
+                observation_finished = datetime.now(timezone.utc).isoformat()
+                observation_latency = (time.monotonic_ns() - observation_started) // 1_000_000
                 last_exc = exc
                 if attempt >= attempts - 1:
                     _last_relay_retry_count.set(attempt)
                     raise
                 await asyncio.sleep(retry_delays[attempt])
+            except BaseException as exc:
+                observation_error = exc
+                raise
+            finally:
+                captures = (_call_context.get() or {}).get("transport_attempts")
+                if observation_config is not None and isinstance(captures, dict):
+                    data = {}
+                    if observation_response is not None:
+                        try:
+                            parsed = observation_response.json()
+                            data = parsed if isinstance(parsed, dict) else {}
+                        except (ValueError, TypeError):
+                            pass
+                    status_code = observation_response.status_code if observation_response is not None else None
+                    call = enrich_record({
+                        "observation_id": uuid.uuid4().hex,
+                        "finished_at": observation_finished or datetime.now(timezone.utc).isoformat(),
+                        "provider": observation_config.provider, "model": observation_config.model,
+                        "endpoint_label": observation_config.relay_endpoint or observation_config.relay_profile,
+                        "status": "error" if status_code is not None and status_code >= 400 else "cancelled"
+                            if isinstance(observation_error, asyncio.CancelledError) else "error" if observation_error else "success",
+                        "http_status_code": status_code,
+                        "error_type": "HTTPStatusError" if status_code is not None and status_code >= 400
+                            else type(observation_error).__name__ if observation_error else None,
+                        "error_code": provider_error_code(data),
+                        "response_received": observation_response is not None,
+                        "latency_ms": observation_latency if observation_latency is not None else (time.monotonic_ns() - observation_started) // 1_000_000,
+                        "observed_usage": observed_usage(data.get("usage", data.get("usageMetadata")), observation_config.wire_api),
+                    })
+                    captures.setdefault(_usage_capture_key(observation_config), []).append(call)
     if last_exc is not None:
         raise last_exc
     raise LLMTransportError(
@@ -1505,15 +1834,18 @@ async def _call_speculative_ds_json(
     timeout_seconds: float,
     prompt_version: str,
     transport: httpx.AsyncBaseTransport | None = None,
+    observation_facts: dict | None = None,
+    key_agent: str = "writer",
 ) -> SpeculativeDSWriterResponse:
     """Run one zero-retry JSON request through the DS-only bulkhead."""
     settings = get_settings()
-    base_url = str(settings.speculative_ds_base_url or "").strip()
-    if not base_url:
-        base_url = _PROVIDER_BASE_URLS["deepseek"]
+    standby = writer_standby_config(settings)
+    base_url = standby.base_url
+    # Same endpoint record as the standby draft; repair only swaps the key.
+    request_key = _agent_key("repair", "backup") if key_agent == "repair" else standby.api_key
     started = time.monotonic_ns()
     payload: dict[str, object] = {
-        "model": settings.speculative_ds_model,
+        "model": standby.model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -1523,8 +1855,12 @@ async def _call_speculative_ds_json(
         "stream": False,
         "thinking": {"type": "disabled"},
     }
+    from src.agents.final_writer import writer_prompt_version
+    if key_agent == "writer" and writer_prompt_version() == "article":
+        # v0.15.1: the standby writes the same article as the primary; repairs stay JSON.
+        payload.pop("response_format")
     headers = {
-        "authorization": f"Bearer {settings.speculative_ds_api_key}",
+        "authorization": f"Bearer {request_key}",
         "content-type": "application/json",
     }
 
@@ -1537,13 +1873,26 @@ async def _call_speculative_ds_json(
                 timeout=None,
                 transport=transport,
             ) as client:
+                if observation_facts is not None:
+                    observation_facts["dispatched"] = True
                 response = await client.post(
                     _join_endpoint(base_url, "/chat/completions"),
                     headers=headers,
                     json=payload,
                 )
+                if observation_facts is not None:
+                    observation_facts.update(response_received=True, http_status=response.status_code)
+                    try:
+                        observed_data = response.json()
+                        if isinstance(observed_data, dict):
+                            observation_facts.update(usage=observed_usage(observed_data.get("usage")),
+                                                     error_code=provider_error_code(observed_data))
+                    except (ValueError, TypeError):
+                        pass
                 response.raise_for_status()
                 data = response.json()
+                if observation_facts is not None and isinstance(data, dict):
+                    observation_facts["usage"] = observed_usage(data.get("usage"))
                 if not isinstance(data, dict):
                     raise json.JSONDecodeError(
                         "DeepSeek response must be a JSON object", "", 0
@@ -1551,7 +1900,10 @@ async def _call_speculative_ds_json(
                 return data
 
     try:
-        data = await asyncio.wait_for(request_once(), timeout=timeout_seconds)
+        data = await _execute_durable_endpoint(
+            "writer", "deepseek-official-standby", standby, request_once,
+            timeout_seconds=timeout_seconds,
+        )
     except asyncio.TimeoutError as exc:
         raise httpx.ReadTimeout(
             f"speculative DS request exceeded {timeout_seconds:.1f}s"
@@ -1575,8 +1927,9 @@ async def _call_speculative_ds_json(
         token_in=_usage_value(usage, "prompt_tokens"),
         token_out=_usage_value(usage, "completion_tokens"),
         latency_ms=int(latency_ms),
-        model=str(settings.speculative_ds_model),
+        model=writer_standby_config(settings).model,
         prompt_version=prompt_version,
+        observed_usage=observed_usage(usage),
     )
 
 
@@ -1594,33 +1947,42 @@ async def call_speculative_ds_writer(
     """
     settings = get_settings()
     started = time.monotonic_ns()
+    facts: dict = {}
     try:
         response = await _call_speculative_ds_json(
             user,
             system=_ds_system_prompt(),
             temperature=temperature,
             timeout_seconds=float(settings.speculative_ds_timeout_seconds),
-            prompt_version=SPECULATIVE_DS_PROMPT_VERSION,
+            prompt_version=_ds_prompt_label(),
             transport=transport,
+            observation_facts=facts,
         )
     except asyncio.CancelledError:
         _record_direct_ds_attempt(
             status="cancelled",
             purpose="WRITER_STANDBY",
-            model=str(settings.speculative_ds_model),
+            model=writer_standby_config(settings).model,
             started=started,
             termination_reason="workflow_cancelled",
             error_type="CancelledError",
+            usage=facts.get("usage"), response_received=facts.get("response_received", False),
+            error_code=facts.get("error_code"),
+            dispatched=facts.get("dispatched", False),
         )
         raise
     except Exception as exc:
         _record_direct_ds_attempt(
             status="error",
             purpose="WRITER_STANDBY",
-            model=str(settings.speculative_ds_model),
+            model=writer_standby_config(settings).model,
             started=started,
             termination_reason=_classify_transport_error(exc)[1],
             error_type=exc.__class__.__name__,
+            http_status=facts.get("http_status", _http_status_code(exc)),
+            usage=facts.get("usage"), response_received=facts.get("response_received", False),
+            error_code=facts.get("error_code"),
+            dispatched=facts.get("dispatched", False),
         )
         raise
     _record_direct_ds_attempt(
@@ -1630,6 +1992,7 @@ async def call_speculative_ds_writer(
         started=started,
         token_in=response.token_in,
         token_out=response.token_out,
+        usage=response.observed_usage,
     )
     return response
 
@@ -1644,6 +2007,7 @@ async def call_speculative_ds_fragment_repair(
     """Run one bounded keyed-fragment repair on the independent DS client."""
     settings = get_settings()
     started = time.monotonic_ns()
+    facts: dict = {}
     try:
         response = await _call_speculative_ds_json(
             user,
@@ -1655,25 +2019,34 @@ async def call_speculative_ds_fragment_repair(
             ),
             prompt_version="flash_keyed_repair_v1",
             transport=transport,
+            observation_facts=facts,
+            key_agent="repair",
         )
     except asyncio.CancelledError:
         _record_direct_ds_attempt(
             status="cancelled",
             purpose="FRAGMENT_REPAIR",
-            model=str(settings.speculative_ds_model),
+            model=writer_standby_config(settings).model,
             started=started,
             termination_reason="workflow_cancelled",
             error_type="CancelledError",
+            usage=facts.get("usage"), response_received=facts.get("response_received", False),
+            error_code=facts.get("error_code"),
+            dispatched=facts.get("dispatched", False),
         )
         raise
     except Exception as exc:
         _record_direct_ds_attempt(
             status="error",
             purpose="FRAGMENT_REPAIR",
-            model=str(settings.speculative_ds_model),
+            model=writer_standby_config(settings).model,
             started=started,
             termination_reason=_classify_transport_error(exc)[1],
             error_type=exc.__class__.__name__,
+            http_status=facts.get("http_status", _http_status_code(exc)),
+            usage=facts.get("usage"), response_received=facts.get("response_received", False),
+            error_code=facts.get("error_code"),
+            dispatched=facts.get("dispatched", False),
         )
         raise
     _record_direct_ds_attempt(
@@ -1683,6 +2056,7 @@ async def call_speculative_ds_fragment_repair(
         started=started,
         token_in=response.token_in,
         token_out=response.token_out,
+        usage=response.observed_usage,
     )
     return response
 
@@ -1697,7 +2071,14 @@ def _record_direct_ds_attempt(
     error_type: str | None = None,
     token_in: int = 0,
     token_out: int = 0,
+    usage: dict | None = None,
+    http_status: int | None = None,
+    response_received: bool | None = None,
+    error_code: str | None = None,
+    dispatched: bool = True,
 ) -> dict[str, Any] | None:
+    if not dispatched:
+        return None
     context = _call_context.get() or {}
     return _record_llm_call({
         "status": status,
@@ -1707,6 +2088,10 @@ def _record_direct_ds_attempt(
         "safe_purpose": purpose,
         "provider": "deepseek",
         "model": model,
+        "endpoint_label": "deepseek-official-standby",
+        "observed_usage": usage or observed_usage(None),
+        "http_status_code": http_status,
+        "error_code": error_code,
         "latency_ms": (time.monotonic_ns() - started) // 1_000_000,
         "prompt_tokens": max(0, int(token_in or 0)),
         "completion_tokens": max(0, int(token_out or 0)),
@@ -1718,7 +2103,7 @@ def _record_direct_ds_attempt(
             "owning_publish_retry_round"
         ),
         "observation_call_id": context.get("observation_call_id"),
-        "response_received": status == "success",
+        "response_received": status == "success" if response_received is None else response_received,
         "termination_reason": termination_reason,
         "error_type": error_type,
     })
@@ -1872,6 +2257,7 @@ class _WriterRelaySSEStream(AsyncIterator[WriterStreamEvent]):
             json_mode=json_mode,
         )
         self._wire_api = config.wire_api
+        self._usage_config = config
         self._client = httpx.AsyncClient(
             verify=get_settings().llm_verify_ssl,
             timeout=None,
@@ -1931,6 +2317,12 @@ class _WriterRelaySSEStream(AsyncIterator[WriterStreamEvent]):
                     and parsed.get("type") == "message_stop"
                 ):
                     raise StopAsyncIteration
+                usage = parsed.get("usage")
+                if parsed.get("type") == "message_start":
+                    usage = (parsed.get("message") or {}).get("usage")
+                if usage is not None:
+                    _capture_usage(self._usage_config, usage, complete=(
+                        self._usage_config.wire_api == "openai_chat" or parsed.get("type") == "message_delta"))
                 event = _writer_stream_event(self._wire_api, parsed)
                 if self._wire_api == "anthropic_messages" and event.content_delta:
                     try:
@@ -2002,6 +2394,34 @@ class _ObservedWriterStream(AsyncIterator[WriterStreamEvent]):
         return confirmed
 
 
+def _route_planner_gemini_fields(config: RoleConfig) -> dict[str, object]:
+    """Gemini route-planner and writer requests carry reasoning_effort and a per-call timeout."""
+    context = _call_context.get() or {}
+    if config.provider == "gemini" and context.get("role") == "writer":
+        from src.model_routes import route_leg
+
+        params = route_leg("writer_gemini").params
+        effort = str(params.get("reasoning_effort") or "low")
+        if str(getattr(get_settings(), "writer_prompt_version", "") or "").strip() == "article":
+            effort = str(get_settings().writer_article_reasoning_effort or effort)
+        return {"extra_body": {"reasoning_effort": effort},
+                "timeout": float(params.get("timeout_seconds") or 60)}
+    if config.provider != "gemini" or context.get("role") != "route_planner":
+        return {}
+    effort = str(context.get("reasoning_effort") or "").strip()
+    if not effort:
+        effort = str(get_settings().route_planner_reasoning_effort or "low")
+    fields: dict[str, object] = {"extra_body": {"reasoning_effort": effort}}
+    timeout = context.get("route_planner_timeout_seconds")
+    if timeout is None:
+        timeout = get_settings().route_planner_timeout_seconds
+    try:
+        fields["timeout"] = max(0.1, float(timeout))
+    except (TypeError, ValueError):
+        pass
+    return fields
+
+
 async def _openai_chat_completion(
     config: RoleConfig,
     system: str,
@@ -2040,8 +2460,10 @@ async def _openai_chat_completion(
             headers=headers,
             payload=payload,
             retry_delays=_relay_retry_delays_for_config(config),
+            observation_config=config,
         )
         usage = data.get("usage") or {}
+        _capture_usage(config, usage)
         choices = data.get("choices") or []
         message = (choices[0].get("message") or {}) if choices else {}
         return (
@@ -2074,8 +2496,14 @@ async def _openai_chat_completion(
     opus_thinking = _opus_writer_thinking_fields(config)
     if opus_thinking:
         kwargs.setdefault("extra_body", {}).update(opus_thinking)
+    route_planner_fields = _route_planner_gemini_fields(config)
+    if route_planner_fields.get("extra_body"):
+        kwargs.setdefault("extra_body", {}).update(route_planner_fields["extra_body"])
+    if route_planner_fields.get("timeout") is not None:
+        kwargs["timeout"] = route_planner_fields["timeout"]
     response = await client.chat.completions.create(**kwargs)
     usage = response.usage
+    _capture_usage(config, usage)
     token_in = usage.prompt_tokens if usage else 0
     token_out = usage.completion_tokens if usage else 0
     return response.choices[0].message.content or "", token_in, token_out
@@ -2109,8 +2537,10 @@ async def _openai_responses(
         headers=headers,
         payload=payload,
         retry_delays=_relay_retry_delays_for_config(config),
+            observation_config=config,
     )
     usage = data.get("usage") or {}
+    _capture_usage(config, usage)
     token_in = _usage_value(usage, "input_tokens")
     token_out = _usage_value(usage, "output_tokens")
     return _response_output_text(data), token_in, token_out
@@ -2146,6 +2576,7 @@ async def _anthropic_messages(
         headers=headers,
         payload=payload,
         retry_delays=_relay_retry_delays_for_config(config),
+            observation_config=config,
     )
     chunks = [
         str(item.get("text") or "")
@@ -2153,6 +2584,7 @@ async def _anthropic_messages(
         if isinstance(item, dict) and item.get("type") == "text"
     ]
     usage = data.get("usage") or {}
+    _capture_usage(config, usage)
     return (
         "\n".join(chunk for chunk in chunks if chunk),
         int(usage.get("input_tokens") or 0),
@@ -2174,6 +2606,12 @@ async def _gemini_native(
     }
     if json_mode:
         generation_config["responseMimeType"] = "application/json"
+    context = _call_context.get() or {}
+    if context.get("role") == "route_planner":
+        effort = str(context.get("reasoning_effort") or "").strip()
+        if not effort:
+            effort = str(get_settings().route_planner_reasoning_effort or "low")
+        generation_config["thinkingConfig"] = {"thinkingLevel": effort}
     payload = {
         "systemInstruction": {
             "parts": [{"text": system}],
@@ -2200,6 +2638,7 @@ async def _gemini_native(
         headers=headers,
         payload=payload,
         retry_delays=_relay_retry_delays_for_config(config),
+            observation_config=config,
     )
     parts = []
     for candidate in data.get("candidates", []) or []:
@@ -2208,6 +2647,7 @@ async def _gemini_native(
             if isinstance(part, dict) and isinstance(part.get("text"), str):
                 parts.append(part["text"])
     usage = data.get("usageMetadata") or {}
+    _capture_usage(config, usage)
     return (
         "\n".join(parts),
         int(usage.get("promptTokenCount") or 0),
@@ -2224,6 +2664,7 @@ async def _execute_by_wire_api(
     json_mode: bool,
     max_tokens: int | None = None,
 ) -> tuple[str, int, int]:
+    config = _with_agent_key(config)
     if config.wire_api == "openai_chat":
         _mark_provider_transport_started()
         return await _openai_chat_completion(
@@ -2262,6 +2703,26 @@ async def _execute_by_wire_api(
             json_mode=json_mode,
         )
     raise ValueError(f"Unsupported wire API {config.wire_api!r}")
+
+
+def _agent_key(agent: str, slot: str) -> str:
+    from src.model_routes import resolve_open_source_leg
+
+    resolved = resolve_open_source_leg(get_settings(), agent, slot)
+    if not resolved.api_key:
+        raise ValueError(f"No API key for {agent}. Set {agent.upper()}_API_KEY or global key in .env")
+    return resolved.api_key
+
+
+def _with_agent_key(config: RoleConfig) -> RoleConfig:
+    """Send a repair request with the repair key when configured."""
+    if (_call_context.get() or {}).get("key_agent") != "repair":
+        return config
+    from src.model_routes import route_leg
+
+    if config.provider != "relay" or config.relay_endpoint != route_leg("repair").endpoint_id:
+        return config
+    return replace(config, api_key=_agent_key("repair", "primary"))
 
 
 def _mark_provider_transport_started() -> None:
@@ -2323,14 +2784,23 @@ async def _execute_with_relay_hedge(
             if index:
                 await asyncio.sleep(hedge_delay_seconds * index)
             attempt_t0 = time.monotonic_ns()
-            started = True
-            text, token_in, token_out = await _execute_relay_endpoint_attempt(
-                selected,
-                system,
-                user,
-                temperature=temperature,
-                json_mode=json_mode,
-                hard_timeout_seconds=attempt_timeout_seconds,
+            async def request():
+                nonlocal started
+                started = True
+                return await _execute_relay_endpoint_attempt(
+                    selected, system, user, temperature=temperature, json_mode=json_mode,
+                    hard_timeout_seconds=attempt_timeout_seconds,
+                )
+            if role not in POOLED_ROLES:
+                text, token_in, token_out = await _execute_durable_endpoint(role, endpoint.name, selected, request,
+                    has_alternatives=_has_independent_relay_alternative(config))
+            else:
+                text, token_in, token_out = await request()
+            _record_attempt(
+                status="success", role=role or "unknown", provider=config.provider,
+                config=selected, latency_ms=(time.monotonic_ns() - attempt_t0) // 1_000_000,
+                token_in=token_in, token_out=token_out, failover_attempt_index=index_offset + index,
+                response_received=True,
             )
             return (
                 "success",
@@ -2363,6 +2833,8 @@ async def _execute_with_relay_hedge(
                 )
             raise
         except Exception as exc:
+            if getattr(exc, "model_request_not_started", False):
+                return ("error", index_offset + index, selected, "", 0, 0, exc)
             latency_ms = (time.monotonic_ns() - attempt_t0) // 1_000_000
             response_received, termination_reason, _ = _classify_transport_error(exc)
             _record_attempt(
@@ -2445,14 +2917,14 @@ async def _execute_with_relay_pool(
     max_tokens: int | None = None,
 ) -> tuple[str, int, int, RoleConfig]:
     if config.provider != "relay" or not config.relay_pool:
-        text, token_in, token_out = await _execute_by_wire_api(
-            config,
-            system,
-            user,
-            temperature=temperature,
-            json_mode=json_mode,
-            max_tokens=max_tokens,
-        )
+        async def request():
+            return await _execute_by_wire_api(
+                config, system, user, temperature=temperature, json_mode=json_mode,
+                max_tokens=max_tokens,
+            )
+        # A backup leg keeps its own health record, apart from the primary's.
+        name = str((_call_context.get() or {}).get("direct_endpoint_name") or role)
+        text, token_in, token_out = await _execute_durable_endpoint(role, name, config, request)
         return text, token_in, token_out, config
 
     if role == "writer" and bool(
@@ -2485,15 +2957,17 @@ async def _execute_with_relay_pool(
                     hard_timeout_seconds=timeout_seconds,
                 )
             except asyncio.CancelledError:
+                standby_event = current_llm_call_context().get("writer_standby_ready_cancel_event")
+                standby_cancelled = standby_event is not None and standby_event.is_set()
                 pending = _record_attempt(
-                    status="error",
+                    status="cancelled" if standby_cancelled else "error",
                     role=role or "writer",
                     provider=config.provider,
                     config=selected_config,
                     latency_ms=(time.monotonic_ns() - attempt_t0) // 1_000_000,
                     response_received=False,
                     finish_reason=None,
-                    termination_reason="router_cancel_pending",
+                    termination_reason="standby_ready" if standby_cancelled else "router_cancel_pending",
                     error_type="CancelledError",
                     ttfb_ms=None,
                 )
@@ -2539,8 +3013,10 @@ async def _execute_with_relay_pool(
                     async for event in stream:
                         yield event
                 except asyncio.CancelledError:
+                    standby_event = current_llm_call_context().get("writer_standby_ready_cancel_event")
+                    standby_cancelled = standby_event is not None and standby_event.is_set()
                     pending = _record_attempt(
-                        status="error",
+                        status="cancelled" if standby_cancelled else "error",
                         role=role or "writer",
                         provider=config.provider,
                         config=selected_config,
@@ -2549,7 +3025,7 @@ async def _execute_with_relay_pool(
                         ) // 1_000_000,
                         response_received=False,
                         finish_reason=None,
-                        termination_reason="router_cancel_pending",
+                        termination_reason="standby_ready" if standby_cancelled else "router_cancel_pending",
                         error_type="CancelledError",
                         ttfb_ms=None,
                     )
@@ -2577,6 +3053,21 @@ async def _execute_with_relay_pool(
                     raise
 
             return _ObservedWriterStream(observed_stream(), stream)
+
+        def record_wire_invalid(selected_config: RoleConfig, latency_ms: int) -> None:
+            _record_attempt(
+                status="error",
+                role=role or "writer",
+                provider=config.provider,
+                config=selected_config,
+                latency_ms=latency_ms,
+                response_received=True,
+                finish_reason=None,
+                termination_reason="wire_invalid",
+                error_type="WIRE_INVALID",
+                http_status_code=200,
+                ttfb_ms=None,
+            )
 
         (
             text_value,
@@ -2608,6 +3099,7 @@ async def _execute_with_relay_pool(
             stall_deadline_seconds=float(
                 getattr(settings, "writer_stream_stall_deadline_seconds", 10.0)
             ),
+            on_wire_invalid=record_wire_invalid,
         )
         _last_endpoint_failover_count.set(failover_index)
         _last_failed_endpoint_label.set(failed_endpoint)
@@ -2638,6 +3130,7 @@ async def _execute_with_relay_pool(
             )
 
     trial_token = None
+    generations_token = None
     trial_name: str | None = None
     original_config = config
     if role in POOLED_ROLES and config.provider == "relay" and config.relay_pool:
@@ -2676,6 +3169,10 @@ async def _execute_with_relay_pool(
                 "relay pool has no candidate endpoints",
             )
         config = _with_admitted_relay_pool(config, admitted)
+        generations_token = _pooled_generations.set(
+            trial_generation if isinstance(trial_generation, dict) else
+            ({admitted[0]: trial_generation} if len(admitted) == 1 and trial_generation is not None else {})
+        )
         trial_token = _pooled_trial.set(
             (role, trial_name, int(trial_generation))
             if trial_name and trial_generation is not None
@@ -2731,6 +3228,8 @@ async def _execute_with_relay_pool(
     finally:
         if trial_token is not None:
             _pooled_trial.reset(trial_token)
+        if generations_token is not None:
+            _pooled_generations.reset(generations_token)
 
 
 async def _execute_review_half_open_second_hop(
@@ -2784,7 +3283,11 @@ async def _execute_review_half_open_second_hop(
             "relay pool has no healthy CLOSED failover endpoint",
         )
     admitted_config = _with_admitted_relay_pool(config, admitted)
-    selected = _relay_endpoint_candidates(admitted_config)[0]
+    _pooled_generations.set(
+        _generation if isinstance(_generation, dict) else
+        ({admitted[0]: _generation} if len(admitted) == 1 and _generation is not None else {})
+    )
+    selected = _relay_endpoint_candidates(admitted_config, durable_admitted=True)[0]
     second_config = _with_admitted_relay_pool(config, (selected.name,))
     _last_endpoint_failover_count.set(1)
     _last_failed_endpoint_label.set(failed_endpoint)
@@ -2818,7 +3321,9 @@ async def _execute_with_relay_pool_candidates(
     role: str = "",
     hard_timeout_seconds: float | None = None,
 ) -> tuple[str, int, int, RoleConfig]:
-    candidates = _relay_endpoint_candidates(config)
+    # Persistent admission is authoritative for pooled recovery. A stale local
+    # cooldown must not suppress the exclusively leased HALF_OPEN request.
+    candidates = _relay_endpoint_candidates(config, durable_admitted=role in POOLED_ROLES)
     attempt_timeout_seconds = _relay_pool_attempt_timeout_seconds(
         config,
         role=role,
@@ -2852,6 +3357,10 @@ async def _execute_with_relay_pool_candidates(
                 attempt_timeout_seconds=endpoint_hard_timeout_seconds,
             )
     configured_primary = config.relay_pool[0]
+    if not candidates:
+        error = LLMTransportError("relay_unavailable", "relay pool has no candidate endpoints")
+        error.model_request_not_started = True
+        raise error
     configured_primary_available = bool(
         candidates
         and candidates[0].name == configured_primary.name
@@ -2897,14 +3406,16 @@ async def _execute_with_relay_pool_candidates(
             with llm_call_context(
                 relay_request_timeout_seconds=attempt_timeout_seconds,
             ):
-                text, token_in, token_out = await _execute_relay_endpoint_attempt(
-                    selected_config,
-                    system,
-                    user,
-                    temperature=temperature,
-                    json_mode=json_mode,
-                    hard_timeout_seconds=endpoint_hard_timeout_seconds,
-                )
+                async def request():
+                    return await _execute_relay_endpoint_attempt(
+                        selected_config, system, user, temperature=temperature,
+                        json_mode=json_mode, hard_timeout_seconds=endpoint_hard_timeout_seconds,
+                    )
+                if role not in POOLED_ROLES:
+                    text, token_in, token_out = await _execute_durable_endpoint(role, endpoint.name, selected_config, request,
+                        has_alternatives=_has_independent_relay_alternative(config))
+                else:
+                    text, token_in, token_out = await request()
             _last_endpoint_failover_count.set(index)
             # Preserve prior failed endpoint for the success record.
             _last_failed_endpoint_label.set(previous_label)
@@ -2915,6 +3426,8 @@ async def _execute_with_relay_pool_candidates(
         except Exception as exc:
             latency_ms = (time.monotonic_ns() - attempt_t0) // 1_000_000
             last_exc = exc
+            if getattr(exc, "model_request_not_started", False):
+                continue
             response_received, termination_reason, _ = _classify_transport_error(exc)
             _record_attempt(
                 status="error",
@@ -3015,6 +3528,9 @@ async def _do_chat(
         **current_context,
         "role": role,
         "observation_call_id": observation_call_id,
+        "usage_capture": {},
+        "transport_attempts": {},
+        "usage_config": role_config,
     })
     t0 = time.monotonic_ns()
     router_observation_tracker: dict[str, Any] = {
@@ -3055,22 +3571,14 @@ async def _do_chat(
         latency_ms = (time.monotonic_ns() - t0) // 1_000_000
         failover_attempt_index = int(_last_endpoint_failover_count.get() or 0)
         failover_from = _last_failed_endpoint_label.get()
-        _record_attempt(
-            status="success",
-            role=role,
-            provider=provider,
-            config=used_config,
-            latency_ms=latency_ms,
-            token_in=token_in,
-            token_out=token_out,
-            failover_attempt_index=failover_attempt_index,
-            failover_from=failover_from,
-            response_received=True,
-            finish_reason=None,
-            termination_reason=None,
-            error_type=None,
-            ttfb_ms=None,
-        )
+        if not any(r.get("observation_call_id") == observation_call_id and r.get("status") == "success"
+                   and r.get("relay_endpoint") == used_config.relay_endpoint for r in (_call_records.get() or [])):
+            _record_attempt(
+                status="success", role=role, provider=provider, config=used_config,
+                latency_ms=latency_ms, token_in=token_in, token_out=token_out,
+                failover_attempt_index=failover_attempt_index, failover_from=failover_from,
+                response_received=True,
+            )
         meta = {
             "provider": provider,
             "relay_profile": used_config.relay_profile,
@@ -3086,9 +3594,14 @@ async def _do_chat(
     except asyncio.CancelledError:
         latency_ms = (time.monotonic_ns() - t0) // 1_000_000
         cancelled_at = datetime.now(timezone.utc).isoformat()
+        standby_ready = current_llm_call_context().get("writer_standby_ready_cancel_event")
+        cancellation_reason = (
+            "standby_ready" if standby_ready is not None and standby_ready.is_set()
+            else "workflow_cancelled"
+        )
         resolved = _resolve_router_pending_cancellations(
             router_observation_tracker,
-            termination_reason="workflow_cancelled",
+            termination_reason=cancellation_reason,
         )
         records = _call_records.get() or []
         already_recorded = any(
@@ -3101,7 +3614,7 @@ async def _do_chat(
         ) > 0
         if transport_started and not resolved and not already_recorded:
             _record_attempt(
-                status="error",
+                status="cancelled",
                 role=role,
                 provider=provider,
                 config=used_config,
@@ -3109,7 +3622,7 @@ async def _do_chat(
                 failover_attempt_index=int(_last_endpoint_failover_count.get() or 0),
                 response_received=False,
                 finish_reason=None,
-                termination_reason="workflow_cancelled",
+                termination_reason=cancellation_reason,
                 error_type="CancelledError",
                 cancelled_at=cancelled_at,
                 ttfb_ms=None,
@@ -3124,7 +3637,7 @@ async def _do_chat(
                 else "transport_timeout"
             ),
         )
-        if role_config.provider != "relay" or not role_config.relay_pool:
+        if (role_config.provider != "relay" or not role_config.relay_pool) and not getattr(exc, "model_request_not_started", False):
             latency_ms = (time.monotonic_ns() - t0) // 1_000_000
             response_received, termination_reason, _ = _classify_transport_error(exc)
             _record_attempt(
@@ -3179,6 +3692,7 @@ async def chat_with_usage(
     temperature: float = 0.3,
     json_mode: bool = False,
     max_tokens: int | None = None,
+    role_config_override: RoleConfig | None = None,
 ) -> tuple[str, dict]:
     """Like chat() but also returns usage metadata.
 
@@ -3193,4 +3707,5 @@ async def chat_with_usage(
         temperature=temperature,
         json_mode=json_mode,
         max_tokens=max_tokens,
+        role_config_override=role_config_override,
     )

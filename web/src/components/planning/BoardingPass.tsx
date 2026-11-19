@@ -1,9 +1,9 @@
-import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 import { Plane } from "lucide-react";
 
 interface BoardingPassProps {
   city: string;
-  formData: TripFormData | null;
+  formData: TripSubmitRequest | null;
   jobId?: string;
 }
 

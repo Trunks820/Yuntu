@@ -264,5 +264,3 @@ export const MobileDepartureStep: React.FC<MobileDepartureStepProps> = ({
     </>
   );
 };
-
-

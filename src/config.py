@@ -1,7 +1,11 @@
+import re
+import math
 from functools import lru_cache
 
-from pydantic import model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 _FROZEN_WRITER_STREAM_ATTEMPT_CAP_SECONDS = 60.0
@@ -10,9 +14,53 @@ _MAX_LLM_RECOVERY_PROBE_TIMEOUT_SECONDS = 45.0
 
 
 class Settings(BaseSettings):
-    app_version: str = "0.9.9.10"
+    # D1 migration must precede enabling this ingestion-only fold.
+    place_same_amap_fold_enabled: bool = False
+    app_version: str = "0.15.1-oss"
     database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/yuntu_travel"
+    # Global open-source LLM fallback keys (one key is enough to run locally).
     gemini_api_key: str = ""
+    deepseek_api_key: str = ""
+    openai_api_key: str = ""
+    # Optional per-role overrides (take precedence over global keys).
+    selector_provider: str = ""
+    selector_model: str = ""
+    selector_api_key: str = ""
+    selector_base_url: str = ""
+    selector_ds_api_key: str = ""
+    selector_openai_api_key: str = ""
+    route_planner_provider: str = ""
+    route_planner_model: str = ""
+    route_planner_api_key: str = ""
+    route_planner_base_url: str = ""
+    route_planner_gemini_api_key: str = ""
+    route_planner_backup_api_key: str = ""
+    route_planner_gemini_base_url: str = ""
+    route_planner_gemini_model: str = ""
+    writer_provider: str = ""
+    writer_model: str = ""
+    writer_api_key: str = ""
+    writer_base_url: str = ""
+    writer_ds_api_key: str = ""
+    writer_gemini_api_key: str = ""
+    # "default" (uses WRITER_* / global key) or "gemini" (explicit writer_gemini leg).
+    writer_primary: str = "default"
+    writer_gemini_base_url: str = ""
+    writer_gemini_model: str = ""
+    repair_provider: str = ""
+    repair_model: str = ""
+    repair_api_key: str = ""
+    repair_base_url: str = ""
+    repair_ds_api_key: str = ""
+    export_image_api_base_url: str = ""
+    export_image_api_key: str = ""
+    export_image_model: str = "gpt-image-1"
+    export_image_openai_api_key: str = ""
+    extract_provider: str = "deepseek"
+    extract_model: str = "deepseek-chat"
+    extract_api_key: str = ""
+    extract_base_url: str = ""
+    extract_ds_api_key: str = ""
     tikhub_api_token: str = ""
     tikhub_base_url: str = "https://api.tikhub.io"
     tikhub_rps: float = 5.0
@@ -25,6 +73,9 @@ class Settings(BaseSettings):
     trip_job_timeout_seconds: int = 180
     trip_stale_sweep_interval_seconds: int = 30
     trip_worker_enabled: bool = True
+    # v0.12+ generation policy enabled by default for open-source delivery metadata & route diagnostics.
+    v012_trip_creation_enabled: bool = True
+    v012_trip_worker_enabled: bool = True
     projection_publisher_enabled: bool = False
     projection_rabbitmq_url: str = ""
     projection_exchange_name: str = "yuntu.admin.trip-projection"
@@ -46,18 +97,9 @@ class Settings(BaseSettings):
     export_share_image_timeout_seconds: int = 420
     export_pdf_daily_ip_limit: int = 5
     export_share_image_daily_ip_limit: int = 100
-    export_image_api_base_url: str = ""
-    export_image_api_key: str = ""
-    export_image_model: str = "gpt-image-2"
+    # The image model, address and parameters are the export_image leg of
+    # src/model_routes.py; this is the limit for one share-image call.
     export_image_timeout_seconds: float = 360.0
-    export_image_api_mode: str = "chat_completions"
-    export_image_size: str = "1024x1536"
-    export_image_quality: str = "standard"
-    export_image_style: str = "vivid"
-    export_image_response_format: str = "b64_json"
-    export_image_provider_pool: str = ""
-    export_image_provider_max_attempts: int = 2
-    export_image_provider_cooldown_seconds: float = 600.0
     public_api_ip_allowlist: str = "127.0.0.1,::1"
     public_api_trust_proxy_headers: bool = False
     crawl_worker_enabled: bool = True
@@ -93,6 +135,8 @@ class Settings(BaseSettings):
     llm_recovery_probe_timeout_seconds: float = 30.0
 
     # Route Planning / v0.6 data pipeline.
+    # Urban commute targets are advisory until the later optimization phase.
+    route_urban_commute_limit_enabled: bool = False
     route_daily_commute_budget_normal: int = 90
     route_daily_commute_budget_relaxed: int = 60
     route_daily_commute_budget_compact: int = 120
@@ -102,6 +146,8 @@ class Settings(BaseSettings):
     route_single_leg_max_cycling: int = 35
     route_estimate_road_factor: float = 1.5
     commute_walk_switch_max_meters: int = 800
+    # Transit-only query trigger. Straight-line proximity is never walking proof.
+    commute_transit_walk_proof_max_meters: int = 1200
     commute_daily_budget_factor_driving: float = 1.0
     commute_daily_budget_factor_transit: float = 1.5
     commute_daily_budget_factor_walking: float = 1.0
@@ -134,21 +180,27 @@ class Settings(BaseSettings):
     # v0.9.9.6 optional plan-level packing/tips. Flag off keeps Result Schema 2.1
     # and omits the new fields; enable only after BFF 2.2 compatibility.
     result_schema_22_enabled: bool = False
+    # v0.15.1: per-stop schedule.exact_start with exact_time_source "planned".
+    result_planned_time_enabled: bool = True
+    # v0.15.1 Writer prompt: "article" (one guide with a heading per stop),
+    # "timeline", or "v6".
+    writer_prompt_version: str = "article"
+    # Article mode only: the 11-17 replay settings the article was judged on.
+    writer_article_temperature: float = 1.0
+    writer_article_reasoning_effort: str = "medium"
     amap_poi_detail_enabled: bool = False
     amap_poi_detail_timeout: float = 5.0
 
     redis_url: str = ""
 
-    # Per-role LLM governance.
-    # *_api_key falls back to gemini_api_key when empty (gemini provider only).
+    # Selector, route planner, writer, repair, image and extract routes come
+    # from src/model_routes.py. The relay profiles below serve only the roles
+    # no order reaches today (intent, grouping) and the closed review; they are
+    # kept so that code still runs in tests, and carry no value on the server.
     relay_gpt_base_url: str = ""
     relay_gpt_api_key: str = ""
     relay_gpt_wire_api: str = "openai_responses"
     relay_gpt_pool: str = ""
-    relay_gpt_extract_base_url: str = ""
-    relay_gpt_extract_api_key: str = ""
-    relay_gpt_extract_wire_api: str = "openai_responses"
-    relay_gpt_extract_pool: str = ""
     relay_gpt_grouping_base_url: str = ""
     relay_gpt_grouping_api_key: str = ""
     relay_gpt_grouping_wire_api: str = "openai_responses"
@@ -157,42 +209,14 @@ class Settings(BaseSettings):
     relay_gpt_review_api_key: str = ""
     relay_gpt_review_wire_api: str = "openai_responses"
     relay_gpt_review_pool: str = ""
-    relay_claude_base_url: str = ""
-    relay_claude_api_key: str = ""
-    relay_claude_wire_api: str = "anthropic_messages"
-    relay_claude_pool: str = ""
-    relay_claude_newapi_base_url: str = ""
-    relay_claude_newapi_api_key: str = ""
-    relay_claude_newapi_wire_api: str = "openai_chat"
-    relay_claude_newapi_pool: str = ""
-    relay_claude_opus_base_url: str = ""
-    relay_claude_opus_api_key: str = ""
-    relay_claude_opus_wire_api: str = "openai_chat"
-    relay_claude_opus_pool: str = ""
-    relay_claude_sonnet_backup_base_url: str = ""
-    relay_claude_sonnet_backup_api_key: str = ""
-    relay_claude_sonnet_backup_wire_api: str = "openai_chat"
-    relay_claude_sonnet_backup_pool: str = ""
-    relay_gemini_base_url: str = ""
-    relay_gemini_api_key: str = ""
-    relay_gemini_wire_api: str = "openai_chat"
-    relay_gemini_pool: str = ""
     relay_pool_cooldown_seconds: float = 120.0
 
-    intent_provider: str = "relay"
-    intent_relay_profile: str = "gpt"
-    intent_model: str = "gpt-5.5"
+    intent_provider: str = "gemini"
+    intent_relay_profile: str = ""
+    intent_model: str = "gemini-2.5-flash"
     intent_api_key: str = ""
+    intent_base_url: str = ""
 
-    extract_provider: str = "deepseek"
-    extract_relay_profile: str = "gpt"
-    extract_model: str = "deepseek-v4-flash"
-    extract_api_key: str = ""
-
-    writer_provider: str = "relay"
-    writer_relay_profile: str = "claude_opus"
-    writer_model: str = "claude-opus-4-6"
-    writer_api_key: str = ""
     writer_stream_probe_enabled: bool = False
     writer_stream_first_token_deadline_seconds: float = 20.0
     writer_stream_stall_deadline_seconds: float = 10.0
@@ -206,7 +230,7 @@ class Settings(BaseSettings):
     # PostgreSQL endpoint leases are the Writer capacity authority. Zero removes
     # the obsolete process-local bottleneck.
     writer_llm_concurrency: int = 0
-    writer_relay_routing_enabled: bool = True
+    writer_relay_routing_enabled: bool = False
     writer_temperature: float = 1.0
     writer_retry_temperature: float = 0.8
     writer_repair_temperature: float = 0.7
@@ -215,17 +239,16 @@ class Settings(BaseSettings):
     writer_parse_failure_raw_excerpt_enabled: bool = False
     writer_parse_failure_raw_excerpt_chars: int = 1000
 
-    # v0.9.6 out-of-pool DeepSeek official-API standby role.
+    # v0.9.6 DeepSeek official standby. Account, model and key are the
+    # writer backup leg of src/model_routes.py.
     speculative_ds_standby_enabled: bool = False
-    speculative_ds_model: str = "deepseek-v4-flash"
-    speculative_ds_api_key: str = ""
-    speculative_ds_base_url: str = ""
     speculative_ds_timeout_seconds: float = 60.0
 
-    review_provider: str = "relay"
-    review_relay_profile: str = "gpt_review"
-    review_model: str = "gpt-5.5"
+    review_provider: str = "gemini"
+    review_relay_profile: str = ""
+    review_model: str = "gemini-2.5-flash"
     review_api_key: str = ""
+    review_base_url: str = ""
     review_plan_concurrency_enabled: bool = True
     review_llm_concurrency: int = 2
     # v0.8.13 restores the proven v0.8.11.1 low-risk initial Review fast path.
@@ -234,6 +257,9 @@ class Settings(BaseSettings):
     # v0.9.5 delivery policies are independent from Provider routing. They stay
     # rollout-gated until BFF and Web consumers are deployed together.
     review_unavailable_degraded_enabled: bool = False
+    # v0.15 W32 (R29): false closes LLM Review for v0.12 orders. No review
+    # model is called; the code gates alone decide detailed or basic.
+    llm_review_enabled: bool = False
     safe_plan_writer_fallback_enabled: bool = False
     safe_plan_review_fallback_enabled: bool = False
 
@@ -242,51 +268,127 @@ class Settings(BaseSettings):
     qwen_review_api_key: str = ""
     qwen_review_model: str = "Qwen3.8-27B"
 
-    grouping_provider: str = "relay"
-    grouping_relay_profile: str = "gpt_grouping"
-    grouping_model: str = "gpt-5.5"
+    grouping_provider: str = "gemini"
+    grouping_relay_profile: str = ""
+    grouping_model: str = "gemini-2.5-flash"
     grouping_api_key: str = ""
+    grouping_base_url: str = ""
     grouping_temperature: float = 0.3
     grouping_wall_timeout_seconds: float = 8.0
 
     # POI_SELECTOR is integrated into the single-plan production workflow and remains bounded by the existing trip deadline.
     selector_route_v2_enabled: bool = False
+    # Zero disables only the candidate-count cap; wall/provider budgets remain.
+    route_v2_max_trials: int = Field(default=0, ge=0)
     accommodation_route_coupling_enabled: bool = False
-    selector_provider: str = "relay"
-    selector_relay_profile: str = "gpt_grouping"
-    selector_model: str = "gpt-5.5"
-    selector_api_key: str = ""
     selector_temperature: float = 0.3
 
-    # v0.14 route planner. Off: the existing selector route stays in charge.
-    # An empty key falls back to GEMINI_API_KEY inside resolve_role_config.
-    route_planner_provider: str = "gemini"
-    route_planner_relay_profile: str = ""
-    route_planner_model: str = "gemini-2.5-flash"
-    route_planner_api_key: str = ""
+    # v0.14 route planner. Account, model, thinking level and output cap are
+    # the route_planner legs of src/model_routes.py.
     route_planner_temperature: float = 0.3
     route_planner_timeout_seconds: float = 50.0
-    route_planner_max_tokens: int = 16000
-    route_planner_reasoning_effort: str = "low"
+    # City days are not a hard commute failure until this cap. Excursion days
+    # keep the existing day_policy limit. See route_feasibility daily gate.
     route_planner_urban_commute_cap_minutes: int = 150
+    # v0.14.4 relaxed pace. First-candidate U1 values; replay may override.
+    route_planner_relaxed_sight_hours: float = 5.0
+    route_planner_relaxed_day_end: str = "17:30"
+    route_planner_relaxed_return_plain: str = "20:30"
+    route_planner_relaxed_return_night: str = "21:30"
+    route_planner_relaxed_urban_commute_cap_minutes: int = 120
+    # Non-driving days only. Transit slower than this also quotes a taxi
+    # (driving minutes + 5). The taxi replaces transit when it is strictly
+    # under route_planner_taxi_ratio of that transit time.
     route_planner_taxi_when_transit_over_minutes: int = 40
     route_planner_taxi_ratio: float = 0.5
-    route_planner_enabled: bool = False
+    # v0.14 / v0.15.1 route planner enabled by default for open-source deployments.
+    route_planner_enabled: bool = True
+    # Cap for one model route, also limited by the writer/review reserve.
     route_planner_deadline_seconds: float = 70.0
+    # Amap wall clock for the model route. It starts when scheduling starts,
+    # after the model call, and is not the backup route's 60s budget.
+    # Hotel-area lookup, when enabled, spends this same clock before scheduling.
     route_planner_amap_time_budget_seconds: float = 25.0
+    # Off: the model still picks a business_area lodging, and the area fallback
+    # is unchanged. On: code picks a hotel cluster around the routed days.
     route_planner_hotel_lodging_enabled: bool = False
     route_planner_hotel_lodging_radius_meters: int = 3000
     route_planner_hotel_lodging_pages: int = 2
     route_planner_hotel_lodging_timeout_seconds: float = 3.0
     route_planner_hotel_lodging_cache_ttl_seconds: int = 7 * 24 * 60 * 60
     route_planner_hotel_lodging_min_hotels: int = 5
+    # v0.14.2 package U2. Off: hotel lodging is still chosen after the route.
+    # On only changes the planner when hotel lodging is also on. Code then
+    # picks one lodging from the candidate center before the prompt, and
+    # keeps it unless the routed center drifts farther than drift_km.
     route_planner_lodging_first_enabled: bool = False
     route_planner_lodging_first_top_count: int = 12
     route_planner_lodging_first_drift_km: float = 3.0
-    # Off: lodging copy stays on the previous path. On still has no priced API.
+    # v0.14.2 package V. Off until a caller opts in. This layer only looks up
+    # prices; lodging copy and the budget stay on their current path.
+    rollinggo_enabled: bool = False
+    rollinggo_base_url: str = "https://mcp.rollinggo.cn/mcp"
+    rollinggo_token_file: str = "~/.hotel-cli/token.json"
+    rollinggo_access_token: str = ""
+    rollinggo_timeout_seconds: float = 4.0
+    rollinggo_radius_meters: int = 2000
+    rollinggo_widen_radius_meters: int = 4000
+    rollinggo_economy_star_min: float = 0.0
+    rollinggo_economy_star_max: float = 2.5
+    rollinggo_mid_star_min: float = 3.0
+    rollinggo_mid_star_max: float = 4.0
+    rollinggo_high_star_min: float = 4.5
+    rollinggo_high_star_max: float = 5.0
+    rollinggo_price_high_ratio: float = 2.5
+    rollinggo_price_low_ratio: float = 0.4
+    rollinggo_economy_markup: float = 1.05
+    rollinggo_mid_markup: float = 1.05
+    rollinggo_high_markup: float = 1.15
+    rollinggo_cache_ttl_seconds: int = 24 * 60 * 60
+    rollinggo_failure_ttl_seconds: int = 10 * 60
+    rollinggo_token_warn_days: int = 14
+    # v0.14.2 package W. Off: lodging copy, budget, gate and writer prompts
+    # stay on the previous path. On: code writes the lodging paragraph.
     lodging_section_v2_enabled: bool = False
     lodging_price_wait_seconds: float = 5.0
     lodging_checkin_offset_days: int = 14
+
+    # Review routing. Review is closed (R29); these stay so it can be reopened
+    # and carry no value on the server.
+    v012_command_failure_domain: str = "backup-account"
+    v012_review_glm_base_url: str = ""
+    v012_review_glm_api_key: str = ""
+    v012_review_glm_model: str = "zai-org/GLM-5.3"
+    v012_review_luna_base_url: str = ""
+    v012_review_luna_api_key: str = ""
+    v012_review_luna_model: str = "gpt-5.6-luna"
+    v012_official_ds_base_url: str = "https://api.deepseek.com"
+    v012_official_ds_api_key: str = ""
+    v012_official_ds_model: str = "deepseek-chat"
+    v012_official_ds_failure_domain: str = "deepseek-official-account"
+
+    v015_review_primary: str = "command-glm"
+    v015_review_backup: str = "official-ds"
+    v015_review_backup_delay_seconds: float | None = 25.0
+    v015_command_ds41_flash_model: str = "deepseek/deepseek-v4.1-flash"
+
+    @field_validator("v015_review_backup_delay_seconds", mode="before")
+    @classmethod
+    def _optional_positive_delay(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("configured delay must be a finite positive number")
+        return value
+
+    @field_validator("v015_review_primary", "v015_review_backup")
+    @classmethod
+    def _v015_candidate(cls, value):
+        value = value.strip()
+        if value not in {"command-luna", "command-glm", "command-ds41-flash", "official-ds"}:
+            raise ValueError("unknown v0.15 model candidate")
+        return value
 
     @model_validator(mode="after")
     def _validate_commute_mode_settings(self) -> "Settings":
@@ -331,10 +433,10 @@ class Settings(BaseSettings):
             )
         if (
             self.speculative_ds_standby_enabled
-            and not self.speculative_ds_api_key.strip()
+            and not self.writer_ds_api_key.strip()
         ):
             raise ValueError(
-                "SPECULATIVE_DS_API_KEY is required when "
+                "WRITER_DS_API_KEY is required when "
                 "SPECULATIVE_DS_STANDBY_ENABLED is true"
             )
         if self.trip_stale_sweep_interval_seconds != 30:
@@ -375,6 +477,15 @@ class Settings(BaseSettings):
             "route_planner_hotel_lodging_min_hotels",
             "route_planner_lodging_first_top_count",
             "route_planner_lodging_first_drift_km",
+            "rollinggo_timeout_seconds",
+            "rollinggo_radius_meters",
+            "rollinggo_widen_radius_meters",
+            "rollinggo_economy_markup",
+            "rollinggo_mid_markup",
+            "rollinggo_high_markup",
+            "rollinggo_cache_ttl_seconds",
+            "rollinggo_failure_ttl_seconds",
+            "rollinggo_token_warn_days",
             "lodging_price_wait_seconds",
             "export_pdf_city_photo_timeout_seconds",
             "amap_poi_detail_timeout",
@@ -391,10 +502,32 @@ class Settings(BaseSettings):
         for field_name in positive_fields:
             if float(getattr(self, field_name)) <= 0:
                 raise ValueError(f"{field_name} must be positive")
+        if int(self.lodging_checkin_offset_days) < 0:
+            raise ValueError("LODGING_CHECKIN_OFFSET_DAYS must not be negative")
         if self.export_pdf_city_photo_timeout_seconds > 5.0:
             raise ValueError(
                 "EXPORT_PDF_CITY_PHOTO_TIMEOUT_SECONDS must not exceed 5 seconds"
             )
+        if int(self.route_planner_urban_commute_cap_minutes) <= 0:
+            raise ValueError("ROUTE_PLANNER_URBAN_COMMUTE_CAP_MINUTES must be positive")
+        if float(self.route_planner_relaxed_sight_hours) <= 0:
+            raise ValueError("ROUTE_PLANNER_RELAXED_SIGHT_HOURS must be positive")
+        if int(self.route_planner_relaxed_urban_commute_cap_minutes) <= 0:
+            raise ValueError(
+                "ROUTE_PLANNER_RELAXED_URBAN_COMMUTE_CAP_MINUTES must be positive"
+            )
+        for field_name in (
+            "route_planner_relaxed_day_end",
+            "route_planner_relaxed_return_plain",
+            "route_planner_relaxed_return_night",
+        ):
+            clock = str(getattr(self, field_name) or "").strip()
+            if _HHMM.fullmatch(clock) is None:
+                raise ValueError(f"{field_name.upper()} must be HH:MM")
+        if int(self.route_planner_taxi_when_transit_over_minutes) <= 0:
+            raise ValueError("ROUTE_PLANNER_TAXI_WHEN_TRANSIT_OVER_MINUTES must be positive")
+        if not 0 < float(self.route_planner_taxi_ratio) <= 1:
+            raise ValueError("ROUTE_PLANNER_TAXI_RATIO must be > 0 and <= 1")
 
         non_negative_fields = (
             "route_single_leg_max",
@@ -402,27 +535,64 @@ class Settings(BaseSettings):
             "route_single_leg_max_walking",
             "route_single_leg_max_cycling",
             "commute_walk_switch_max_meters",
+            "commute_transit_walk_proof_max_meters",
         )
         for field_name in non_negative_fields:
             if int(getattr(self, field_name)) < 0:
                 raise ValueError(f"{field_name} must be non-negative")
-        if int(self.lodging_checkin_offset_days) < 0:
-            raise ValueError("LODGING_CHECKIN_OFFSET_DAYS must not be negative")
-        if int(self.route_planner_max_tokens) < 256:
-            raise ValueError("ROUTE_PLANNER_MAX_TOKENS must be at least 256")
-        if int(self.route_planner_urban_commute_cap_minutes) <= 0:
-            raise ValueError("ROUTE_PLANNER_URBAN_COMMUTE_CAP_MINUTES must be positive")
-        if int(self.route_planner_taxi_when_transit_over_minutes) <= 0:
+        if int(self.rollinggo_widen_radius_meters) < int(self.rollinggo_radius_meters):
             raise ValueError(
-                "ROUTE_PLANNER_TAXI_WHEN_TRANSIT_OVER_MINUTES must be positive"
+                "rollinggo_widen_radius_meters must be >= rollinggo_radius_meters"
             )
-        if not 0 < float(self.route_planner_taxi_ratio) <= 1:
-            raise ValueError("ROUTE_PLANNER_TAXI_RATIO must be > 0 and <= 1")
-        if self.route_planner_reasoning_effort not in {"minimal", "low", "medium", "high"}:
-            raise ValueError(
-                "ROUTE_PLANNER_REASONING_EFFORT must be minimal, low, medium, or high"
-            )
+        if not 0 < float(self.rollinggo_price_low_ratio) < 1:
+            raise ValueError("rollinggo_price_low_ratio must be > 0 and < 1")
+        if float(self.rollinggo_price_high_ratio) <= 1:
+            raise ValueError("rollinggo_price_high_ratio must be > 1")
+        star_pairs = (
+            ("rollinggo_economy_star_min", "rollinggo_economy_star_max"),
+            ("rollinggo_mid_star_min", "rollinggo_mid_star_max"),
+            ("rollinggo_high_star_min", "rollinggo_high_star_max"),
+        )
+        for low_name, high_name in star_pairs:
+            low = float(getattr(self, low_name))
+            high = float(getattr(self, high_name))
+            if low < 0 or high > 5 or low > high:
+                raise ValueError(
+                    f"{low_name} must be between 0 and {high_name}, "
+                    f"and {high_name} must be <= 5"
+                )
+        # A failover pair on one account or one key is not a backup. Refuse
+        # to start instead of finding out during an outage.
+        from src.model_routes import resolve_open_source_leg, validate_model_routes
+
+        validate_model_routes(self)
+        if not str(self.writer_model or "").strip():
+            leg_key = "writer_gemini" if self.writer_primary_gemini else "writer"
+            self.writer_model = resolve_open_source_leg(self, leg_key).model
         return self
+
+    # Read from the route table so one place decides them.
+    @property
+    def writer_primary_gemini(self) -> bool:
+        return str(self.writer_primary or "").strip().lower() == "gemini"
+
+    @property
+    def writer_standby_grace_seconds(self) -> float | None:
+        from src.model_routes import agent_route
+        return agent_route("writer_gemini" if self.writer_primary_gemini else "writer").switch_seconds
+
+    @property
+    def route_planner_max_tokens(self) -> int:
+        from src.model_routes import route_leg
+        return int(route_leg("route_planner").params["max_tokens"])
+
+    @property
+    def route_planner_reasoning_effort(self) -> str:
+        from src.model_routes import route_leg
+        return str(route_leg("route_planner").params["reasoning_effort"])
+
+    # Internal reference accounting only; never affects routing or admission.
+    model_call_prices_json: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

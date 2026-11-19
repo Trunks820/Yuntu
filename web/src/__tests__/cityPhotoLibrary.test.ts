@@ -3,7 +3,9 @@ import {
   cityImageList,
   cityNameOfImage,
 } from "@/components/input/RotatingBackground";
-import { SUPPORTED_CITIES } from "@/constants/preferences";
+import { CITY_NAME_TO_FOLDER } from "@/utils/cityPhotos";
+
+const SUPPORTED_CITIES = Object.keys(CITY_NAME_TO_FOLDER);
 
 const CITY_FOLDERS = [
   ["北京", "beijing"],

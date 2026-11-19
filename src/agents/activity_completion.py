@@ -11,7 +11,7 @@ from src.agents.evidence_strength import (
     DeterministicActionContract,
     StructuredEvidencePayload,
 )
-from src.agents.poi_fragments import replace_fragment_text
+from src.agents.poi_fragments import replace_fragment_body
 from src.agents.route_planning import (
     _is_day_heading_line,
     _parse_day_heading_number,
@@ -327,7 +327,7 @@ def deterministic_activity_completion(
                             "reason": reason,
                         })
                         continue
-                    replaced = replace_fragment_text(
+                    replaced = replace_fragment_body(
                         candidate,
                         plan_index=plan_index,
                         day=day,

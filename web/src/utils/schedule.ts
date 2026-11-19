@@ -22,6 +22,7 @@ const EXACT_TIME_SOURCES: ReadonlySet<string> = new Set<ExactTimeSource>([
   "event",
   "transport",
   "verified_venue_rule",
+  "planned",
 ]);
 
 const HHMM_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
@@ -33,7 +34,7 @@ export function periodLabel(period: string | null | undefined): string {
 }
 
 export interface GovernedExactTime {
-  /** "14:30" / "14:30 - 16:00" / "16:00 前" 之类的展示文本 */
+  /** "14:30 - 16:00" / "14:30 起" / "16:00 前" / "约 09:45" 之类的展示文本 */
   text: string;
   source: ExactTimeSource;
 }
@@ -41,6 +42,7 @@ export interface GovernedExactTime {
 /**
  * 仅当 exact_time_source 为受治理来源且 exact_* 是合法 HH:MM 时返回展示文本，
  * 其余情况一律返回 null（疑似时间文本不得显示成确定时间）。
+ * - planned：按行程推算的参考时间，只看 exact_start，展示"约 HH:MM"（不加"起"，不显示区间）。
  */
 export function governedExactTime(
   schedule: PlaceScheduleInfo | null | undefined,
@@ -50,6 +52,11 @@ export function governedExactTime(
   if (!source || !EXACT_TIME_SOURCES.has(source)) return null;
 
   const start = schedule.exact_start && HHMM_RE.test(schedule.exact_start) ? schedule.exact_start : null;
+  if (source === "planned") {
+    if (!start) return null;
+    return { text: `约 ${start}`, source: "planned" };
+  }
+
   const end = schedule.exact_end && HHMM_RE.test(schedule.exact_end) ? schedule.exact_end : null;
   if (!start && !end) return null;
 
@@ -71,6 +78,8 @@ export function exactTimeSourceLabel(source: ExactTimeSource): string {
       return "交通";
     case "verified_venue_rule":
       return "场馆规则";
+    case "planned":
+      return "参考";
   }
 }
 

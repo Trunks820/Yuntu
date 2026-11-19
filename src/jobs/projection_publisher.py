@@ -247,7 +247,9 @@ class ProjectionOutboxPublisher:
             content_type="application/json",
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             type=str(event["event_type"]),
-            headers={"schema_version": SCHEMA_VERSION},
+            # The outbox row owns its schema version.  Replays must preserve it
+            # instead of being relabelled with the publisher's current version.
+            headers={"schema_version": str(event["schema_version"])},
         )
         confirmed = await self._exchange.publish(
             message,

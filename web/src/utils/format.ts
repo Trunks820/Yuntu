@@ -61,8 +61,21 @@ const TAG_BLACKLIST = new Set([
   "scenic_spot", "entertainment", "landmark",
 ]);
 
+/**
+ * 与 yuntu-travel export/public_text.py 的 _UNKNOWN_SNAKE_CASE_PATTERN 同一规则：
+ * 带下划线的内部代码（如 historic_district）一律不展示。
+ * 只是前端兜底，结果 API 的 tags 仍会带出原始 place_type。
+ * 用捕获组代替后顾断言，兼容不支持 lookbehind 的旧版 Safari。
+ */
+const SNAKE_CASE_CODE_RE =
+  /(^|[^A-Za-z0-9])(?:_+[a-z0-9]+(?:_[a-z0-9]+)*|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?![A-Za-z0-9])/gi;
+const TAG_EDGE_RE = /^[\s/|·,，;；:=：]+|[\s/|·,，;；:=：]+$/g;
+
 export function cleanTags(tags: string[]): string[] {
-  return tags.filter((t) => !TAG_BLACKLIST.has(t.toLowerCase()));
+  return tags
+    .filter((t) => !TAG_BLACKLIST.has(t.toLowerCase()))
+    .map((t) => t.replace(SNAKE_CASE_CODE_RE, "$1").replace(TAG_EDGE_RE, ""))
+    .filter(Boolean);
 }
 
 const SUMMARY_TAIL_RE = /[，,]\s*适合用于对比方案.*$/;

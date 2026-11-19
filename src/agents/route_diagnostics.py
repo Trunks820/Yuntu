@@ -273,7 +273,7 @@ def build_route_observation(
                 if metrics.route_policy_version == "selector-route-v2" else None
             ),
             iteration_limit=(
-                int(getattr(route_planning.get_settings(), "route_v2_max_trials", 0) or 0) or None
+                int(route_planning.get_settings().route_v2_max_trials) or None
                 if metrics.route_policy_version == "selector-route-v2" else None
             ),
             elapsed_ms=max(0, int(elapsed_ms)) if elapsed_ms is not None else None,
@@ -366,14 +366,8 @@ def build_route_observation(
             "accepted_action": metrics.route_v2_accepted_action or None,
             "rounds": int(metrics.route_v2_repair_rounds),
         },
-        "coverage": [
-            dict(row)
-            for row in list(getattr(metrics, "route_v2_coverage_report", []) or [])[:24]
-        ],
-        "repair_trace": [
-            dict(row)
-            for row in list(getattr(metrics, "route_v2_repair_trace", []) or [])[:24]
-        ],
+        "coverage": [dict(row) for row in list(metrics.route_v2_coverage_report)[:24]],
+        "repair_trace": [dict(row) for row in list(metrics.route_v2_repair_trace)[:24]],
     }
     if _json_size(replay) > REPLAY_MAX_BYTES:
         diagnostics.evidence_state = "PARTIAL"
@@ -391,5 +385,3 @@ def build_route_observation(
         diagnostics.evidence_state = "PARTIAL"
         diagnostics.truncated = True
     return diagnostics, replay
-
-

@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { submitTrip, ApiRequestError } from "@/services/api";
 import { useTripStore } from "@/stores/tripStore";
 import { useTripTaskStore } from "@/stores/tripTaskStore";
-import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 import type { TripResult } from "@/types/trip";
 import {
   clearPendingSubmission,
@@ -21,7 +21,7 @@ function shouldShowSafeDeliveryNotice(
   );
 }
 
-function findRetryInput(): TripFormData | null {
+function findRetryInput(): TripSubmitRequest | null {
   return (
     useTripStore.getState().formData ??
     getPendingSubmission()?.trip_request ??

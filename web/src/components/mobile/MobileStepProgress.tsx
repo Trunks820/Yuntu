@@ -35,5 +35,3 @@ export const MobileStepProgress: React.FC<MobileStepProgressProps> = ({
     </div>
   );
 };
-
-

@@ -23,5 +23,3 @@ from src.agents.route_planner.prompt import (
     _visit_hint,
     candidate_block,
 )
-
-

@@ -587,6 +587,7 @@ CREATE TABLE travel_place_summary (
     avg_price           NUMERIC(8,2),
     opening_hours       VARCHAR(200),
     top_reasons         JSONB       NOT NULL DEFAULT '[]'::JSONB,
+    cleaned_evidence    JSONB,
     warnings            JSONB       NOT NULL DEFAULT '[]'::JSONB,
     hot_score           NUMERIC(10,2) NOT NULL DEFAULT 0,
     quality_score       NUMERIC(3,1) NOT NULL DEFAULT 0
@@ -710,6 +711,83 @@ CREATE TABLE travel_trip_job (
         CHECK (jsonb_typeof(request_field_provenance) = 'object'),
     request_user_supplied_json JSONB NOT NULL DEFAULT '{}'::JSONB
         CHECK (jsonb_typeof(request_user_supplied_json) = 'object'),
+    generation_policy_version VARCHAR(16) NOT NULL DEFAULT 'legacy'
+        CONSTRAINT travel_trip_job_generation_policy_check
+        CHECK (generation_policy_version IN ('legacy', 'v0.12')),
+    delivery_json JSONB
+        CONSTRAINT travel_trip_job_delivery_json_check CHECK ((
+            (generation_policy_version = 'legacy' AND delivery_json IS NULL)
+            OR (
+                generation_policy_version = 'v0.12'
+                AND jsonb_typeof(delivery_json) = 'object'
+                AND delivery_json ?& ARRAY[
+                    'schema_version', 'outcome', 'review_state',
+                    'reason_code', 'selector_source'
+                ]
+                AND delivery_json ->> 'schema_version' = '1.0'
+                AND delivery_json ->> 'outcome' IN (
+                    'PENDING', 'DETAILED', 'BASIC', 'NO_ROUTE', 'FAILED'
+                )
+                AND delivery_json ->> 'review_state' IN (
+                    'NOT_RUN', 'CODE_ONLY', 'MODEL_PASSED', 'UNAVAILABLE',
+                    'ISSUES_UNRESOLVED'
+                )
+                AND delivery_json ->> 'selector_source' IN (
+                    'LLM', 'DETERMINISTIC_FALLBACK', 'NOT_RUN'
+                )
+                AND CASE delivery_json ->> 'outcome'
+                    WHEN 'PENDING' THEN
+                        delivery_json ->> 'review_state' = 'NOT_RUN'
+                        AND delivery_json -> 'reason_code' = 'null'::jsonb
+                    WHEN 'DETAILED' THEN
+                        delivery_json ->> 'review_state' IN ('CODE_ONLY', 'MODEL_PASSED')
+                        AND delivery_json -> 'reason_code' = 'null'::jsonb
+                    WHEN 'BASIC' THEN
+                        (delivery_json ->> 'reason_code' = 'REVIEW_UNAVAILABLE'
+                            AND delivery_json ->> 'review_state' = 'UNAVAILABLE')
+                        OR (delivery_json ->> 'reason_code' = 'REVIEW_ISSUES_UNRESOLVED'
+                            AND delivery_json ->> 'review_state' = 'ISSUES_UNRESOLVED')
+                        OR (delivery_json ->> 'reason_code' = 'WRITER_UNAVAILABLE'
+                            AND delivery_json ->> 'review_state' = 'NOT_RUN')
+                    WHEN 'NO_ROUTE' THEN
+                        delivery_json ->> 'review_state' = 'NOT_RUN'
+                        AND delivery_json ->> 'reason_code' IN (
+                            'NO_CANDIDATES', 'SEARCH_BUDGET_EXHAUSTED',
+                            'CONSTRAINT_CONFLICT', 'ROUTE_DATA_UNAVAILABLE',
+                            'NO_USABLE_ROUTE'
+                        )
+                    WHEN 'FAILED' THEN delivery_json ->> 'reason_code' IS NOT NULL
+                    ELSE FALSE
+                END
+            )
+        ) IS TRUE),
+    route_diagnostics JSONB
+        CONSTRAINT travel_trip_job_route_diagnostics_check CHECK ((
+            route_diagnostics IS NULL
+            OR (
+                generation_policy_version = 'v0.12'
+                AND jsonb_typeof(route_diagnostics) = 'object'
+                AND route_diagnostics ?& ARRAY[
+                    'schema_version', 'evidence_state', 'stop_reason',
+                    'candidate_count', 'eliminated_counts', 'search',
+                    'violations', 'truncated', 'replay_available'
+                ]
+                AND route_diagnostics ->> 'schema_version' = '1.0'
+                AND octet_length(route_diagnostics::text) <= 16384
+            )
+        ) IS TRUE),
+    route_replay_data JSONB,
+    route_replay_expires_at TIMESTAMPTZ,
+    CONSTRAINT travel_trip_job_route_replay_check CHECK ((
+        (route_replay_data IS NULL AND route_replay_expires_at IS NULL)
+        OR (
+            generation_policy_version = 'v0.12'
+            AND jsonb_typeof(route_replay_data) = 'object'
+            AND octet_length(route_replay_data::text) <= 262144
+            AND route_replay_expires_at IS NOT NULL
+            AND route_replay_expires_at <= created_time + INTERVAL '7 days'
+        )
+    ) IS TRUE),
     created_time    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     started_time    TIMESTAMPTZ,
     finished_time   TIMESTAMPTZ,
@@ -722,6 +800,8 @@ CREATE INDEX idx_trip_job_user_display_name ON travel_trip_job (user_display_nam
 CREATE INDEX idx_trip_job_created ON travel_trip_job (created_time);
 CREATE INDEX idx_trip_job_normalized_hash ON travel_trip_job (normalized_query_hash);
 CREATE INDEX idx_trip_job_result_record ON travel_trip_job (result_record_id);
+CREATE INDEX idx_trip_job_route_replay_expiry ON travel_trip_job (route_replay_expires_at)
+    WHERE route_replay_data IS NOT NULL;
 
 CREATE TRIGGER trg_trip_job_updated
     BEFORE UPDATE ON travel_trip_job
@@ -789,7 +869,8 @@ CREATE TABLE trip_projection_outbox (
     event_type         VARCHAR(64)  NOT NULL
         CHECK (event_type = 'TRIP_PROJECTION_COMMITTED'),
     schema_version     VARCHAR(16)  NOT NULL
-        CHECK (schema_version IN ('1.0', '1.1')),
+        CONSTRAINT trip_projection_outbox_schema_version_check
+        CHECK (schema_version IN ('1.0', '1.1', '1.2')),
     aggregate_type     VARCHAR(32)  NOT NULL CHECK (aggregate_type = 'TRIP_JOB'),
     aggregate_id       VARCHAR(160) NOT NULL,
     aggregate_version  BIGINT       NOT NULL CHECK (aggregate_version >= 1),
@@ -1471,8 +1552,10 @@ COMMENT ON TABLE travel_writer_dispatch IS 'v0.9.4.2 prompt-free durable Writer 
 CREATE TABLE travel_role_relay_endpoint_state (
     role                            VARCHAR(16) NOT NULL
         CONSTRAINT travel_role_relay_endpoint_state_role_check
-        CHECK (role IN ('review', 'grouping', 'selector')),
+        CHECK (role IN ('writer', 'review', 'grouping', 'selector', 'intent', 'extract', 'route_planner')),
     endpoint_name                   VARCHAR(64) NOT NULL,
+    provider                        VARCHAR(64) NOT NULL DEFAULT 'unknown',
+    failure_domain                  VARCHAR(128) NOT NULL DEFAULT '',
     configured                      BOOLEAN NOT NULL DEFAULT TRUE,
     participation                   VARCHAR(16) NOT NULL DEFAULT 'ACTIVE'
         CHECK (participation IN ('ACTIVE', 'CANARY', 'DISABLED')),
@@ -1501,6 +1584,17 @@ CREATE TABLE travel_role_relay_endpoint_state (
     active_operation_id             UUID,
     state_generation                BIGINT NOT NULL DEFAULT 0
         CHECK (state_generation >= 0),
+    last_success_at                 TIMESTAMPTZ,
+    last_failure_at                 TIMESTAMPTZ,
+    last_failure_code               VARCHAR(80),
+    last_probe_at                   TIMESTAMPTZ,
+    last_probe_status               VARCHAR(16)
+        CHECK (last_probe_status IS NULL OR last_probe_status IN ('SUCCESS', 'FAILED', 'RUNNING')),
+    incident_id                     UUID,
+    incident_scope                  VARCHAR(16),
+    incident_domain                 VARCHAR(160),
+    incident_started_at             TIMESTAMPTZ,
+    incident_resolved_at            TIMESTAMPTZ,
     created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (role, endpoint_name),
@@ -1533,6 +1627,12 @@ CREATE UNIQUE INDEX uq_role_relay_single_half_open
 CREATE INDEX idx_role_relay_probe_lease
     ON travel_role_relay_endpoint_state (role, probe_lease_expires_at)
     WHERE circuit_state = 'HALF_OPEN';
+CREATE INDEX idx_role_relay_failure_domain_incident
+    ON travel_role_relay_endpoint_state (failure_domain, incident_id)
+    WHERE incident_id IS NOT NULL AND incident_resolved_at IS NULL;
+CREATE INDEX idx_role_relay_incident_scope_domain
+    ON travel_role_relay_endpoint_state (incident_scope, incident_domain)
+    WHERE incident_id IS NOT NULL AND incident_resolved_at IS NULL;
 
 CREATE TABLE travel_llm_endpoint_recovery_operation (
     operation_id        UUID PRIMARY KEY,
@@ -1661,3 +1761,44 @@ CREATE CONSTRAINT TRIGGER trg_validate_canonical_place_gallery_count
 
 COMMENT ON TABLE travel_canonical_place_image IS
     'Public WebP variants for lazy Canonical POI detail galleries; no raw source URLs or private master keys';
+
+-- D1 additions only; existing schema drift is intentionally retained.
+ALTER TABLE travel_place ADD COLUMN IF NOT EXISTS merged_into_place_id BIGINT
+    REFERENCES travel_place(id);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conrelid = 'travel_place'::regclass AND conname = 'ck_place_merge_self') THEN
+        ALTER TABLE travel_place ADD CONSTRAINT ck_place_merge_self
+            CHECK (merged_into_place_id IS NULL OR merged_into_place_id <> id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_place_merge_target ON travel_place(merged_into_place_id)
+    WHERE merged_into_place_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS travel_place_merge_log (
+    id BIGSERIAL PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    merge_kind TEXT NOT NULL CHECK (merge_kind = 'same_city_amap'),
+    city TEXT NOT NULL,
+    amap_poi_id TEXT NOT NULL CHECK (amap_poi_id <> ''),
+    survivor_id BIGINT NOT NULL REFERENCES travel_place(id),
+    loser_id BIGINT NOT NULL REFERENCES travel_place(id),
+    status TEXT NOT NULL CHECK (status IN ('pending_review','applied','reverted','do_not_merge')),
+    reason TEXT NOT NULL,
+    before_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    moved_rows JSONB NOT NULL DEFAULT '{}'::jsonb,
+    deleted_rows JSONB NOT NULL DEFAULT '{}'::jsonb,
+    alias_intents JSONB NOT NULL DEFAULT '[]'::jsonb,
+    materialized_alias_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    redirected_children JSONB NOT NULL DEFAULT '[]'::jsonb,
+    evidence_rewash_required BOOLEAN NOT NULL DEFAULT FALSE,
+    applied_at TIMESTAMPTZ,
+    reverted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (survivor_id <> loser_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_place_merge_applied
+    ON travel_place_merge_log(merge_kind,loser_id) WHERE status = 'applied';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_place_merge_pending
+    ON travel_place_merge_log(merge_kind,loser_id) WHERE status = 'pending_review';

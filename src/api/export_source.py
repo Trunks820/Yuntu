@@ -117,6 +117,13 @@ def build_export_source_from_trip_result(
             ],
         },
     }
+    if projected.get("schema_version") == "2.3":
+        source["result"]["generation_policy_version"] = projected[
+            "generation_policy_version"
+        ]
+        if result.delivery is None:
+            raise ValueError("schema 2.3 export requires delivery metadata")
+        source["result"]["delivery"] = result.delivery.model_dump(mode="json")
     canonical, digest = _source_hash(source)
     return ExportSource(
         export_version=export_version,

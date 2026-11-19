@@ -75,5 +75,3 @@ export const MobileAvoidModal: React.FC<MobileAvoidModalProps> = ({ onClose }) =
     </MobileSheet>
   );
 };
-
-

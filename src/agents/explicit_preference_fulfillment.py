@@ -1583,7 +1583,10 @@ def build_body_review_context(*, trip_request, route_plans, plans,
     for index, plan in enumerate(plans, 1):
         if not fragment_registry_is_intact(plan):
             raise ValueError("body review requires an intact fragment registry")
-        sources[f"plan:{index}"] = plan.plan_text
+        # The task-list prompt already omits the code-written lodging block; the
+        # consistency check must too, or Review flags code hotels and prices.
+        from src.agents.yuntu_review import _without_code_lodging_section
+        sources[f"plan:{index}"] = _without_code_lodging_section(plan)
         sources[f"summary:{index}"] = plan.summary
         route = route_plans[index - 1] if index <= len(route_plans) else None
         from src.agents.route_experience_facts import route_experience_facts
@@ -1593,6 +1596,8 @@ def build_body_review_context(*, trip_request, route_plans, plans,
         sources[f"route:{index}"] = route.model_dump_json(exclude={
             "day_groups": {"__all__": {
                 "commute_legs": {"__all__": {"encoded_polyline"}},
+                # v0.15.1 stored clock; Review's material stays as before.
+                "timeline": True,
             }},
         }) if route else ""
         requirements.append({"id": f"consistency:{index}", "kind": "consistency",

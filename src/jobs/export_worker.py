@@ -22,6 +22,8 @@ from src.export.city_background import (
     build_city_background_client,
 )
 from src.export.city_photo import CityPhotoResolver, build_city_photo_resolver
+from src.export.model_call_observation import image_call_sink
+from src.jobs.model_call_store import persist_export_call
 from src.export.pdf_renderer import PdfRenderError, render_pdf_artifact
 from src.export.share_image_renderer import (
     ShareImageRenderError,
@@ -218,6 +220,22 @@ class ExportWorker:
             record.artifact_type,
         )
         target: _RenderTarget | None = None
+        observation_loop = asyncio.get_running_loop()
+        observation_writes = []
+
+        async def save_observation(call):
+            try:
+                await asyncio.wait_for(persist_export_call(record.artifact_id, call), timeout=0.2)
+            except Exception:
+                logger.warning("export model call observation unavailable")
+
+        def observation_sink(call):
+            # to_thread inherits this context. A timed-out renderer can still
+            # finish a paid call later; keep that fact without changing its work.
+            if not observation_loop.is_closed():
+                observation_writes.append(asyncio.run_coroutine_threadsafe(save_observation(call), observation_loop))
+
+        observation_token = image_call_sink.set(observation_sink)
         try:
             source = await self._source_builder(record.result_record_id, record.artifact_type)
             if source is None:
@@ -307,6 +325,10 @@ class ExportWorker:
                 error_code=_generic_render_error_code(record.artifact_type),
                 error_message=SAFE_FAILURE_MESSAGE,
             )
+        finally:
+            image_call_sink.reset(observation_token)
+            if observation_writes:
+                await asyncio.wait([asyncio.wrap_future(f) for f in tuple(observation_writes)], timeout=0.2)
 
     def _render_to_staging(
         self,

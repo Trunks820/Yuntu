@@ -10,12 +10,18 @@ from typing import Any, Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.llm import project_persisted_llm_usage_for_stage
+from src.agents.llm import project_persisted_llm_usage_for_stage, public_llm_role_purpose
 from src.pipeline.db import get_session_factory
+from src.jobs.generation_delivery import (
+    ExecutionObservation,
+    GenerationDelivery,
+    RouteDiagnostics,
+    validate_delivery_for_job,
+)
 
 
 EVENT_TYPE = "TRIP_PROJECTION_COMMITTED"
-EVENT_SCHEMA_VERSION = "1.1"
+EVENT_SCHEMA_VERSION = "1.2"
 AGGREGATE_TYPE = "TRIP_JOB"
 MAX_CHANGED_STEPS = 500
 
@@ -60,8 +66,13 @@ STEP_PAYLOAD_FIELDS = frozenset(
         "source_updated_at",
     }
 )
-OPTIONAL_JOB_PAYLOAD_FIELDS = frozenset({"failure_observation"})
-OPTIONAL_STEP_PAYLOAD_FIELDS = frozenset({"llm_usage"})
+OPTIONAL_JOB_PAYLOAD_FIELDS = frozenset({
+    "failure_observation",
+    "generation_policy_version",
+    "delivery",
+    "route_diagnostics",
+})
+OPTIONAL_STEP_PAYLOAD_FIELDS = frozenset({"llm_usage", "execution_observation"})
 FORBIDDEN_PAYLOAD_KEYS = frozenset(
     {
         "email",
@@ -240,19 +251,23 @@ def _validated_llm_usage(value: Any) -> dict[str, Any]:
             or call["publish_retry_round"] < 0
         ):
             raise ValueError("llm call numeric fields are invalid")
-        provider = call.get("provider")
-        model = call.get("model")
+        copied = dict(call)
+        copied["role"], copied["purpose"] = public_llm_role_purpose(
+            copied.get("role"), copied.get("purpose")
+        )
+        provider = copied.get("provider")
+        model = copied.get("model")
         if (
             not isinstance(provider, str)
             or not 1 <= len(provider) <= 40
             or not isinstance(model, str)
             or not 1 <= len(model) <= 120
-            or call.get("role") not in _LLM_ROLES
-            or call.get("purpose") not in _LLM_PURPOSES
-            or call.get("status") not in _LLM_STATUSES
+            or copied.get("role") not in _LLM_ROLES
+            or copied.get("purpose") not in _LLM_PURPOSES
+            or copied.get("status") not in _LLM_STATUSES
         ):
             raise ValueError("llm call safe fields are invalid")
-        copied_calls.append(dict(call))
+        copied_calls.append(copied)
     return {**value, "calls": copied_calls}
 
 
@@ -568,7 +583,8 @@ def _duration_ms(
 
 def validate_projection_event(event: dict[str, Any]) -> None:
     """Enforce application invariants and the payload privacy allowlist."""
-    if event.get("schema_version") not in {"1.0", "1.1"}:
+    schema_version = event.get("schema_version")
+    if schema_version not in {"1.0", "1.1", "1.2"}:
         raise ValueError("projection schema version is unsupported")
     payload = event.get("payload")
     if not isinstance(payload, dict) or set(payload) != {"job", "changed_steps"}:
@@ -583,6 +599,31 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         raise ValueError("projection job payload is not allowlisted")
     if "failure_observation" in job:
         _validated_failure_observation(job["failure_observation"])
+    v012_fields = {"generation_policy_version", "delivery", "route_diagnostics"}
+    if schema_version in {"1.0", "1.1"} and v012_fields.intersection(job):
+        raise ValueError("projection 1.0/1.1 cannot contain v0.12 job fields")
+    if schema_version == "1.2":
+        if job.get("generation_policy_version") != "v0.12" or "delivery" not in job:
+            raise ValueError("projection 1.2 v0.12 job requires policy and delivery")
+        projected_delivery = GenerationDelivery.model_validate(job["delivery"])
+        validate_delivery_for_job(
+            projected_delivery,
+            status=str(job.get("status") or ""),
+            result_type=job.get("result_type"),
+            result_record_id=job.get("result_record_id"),
+            published_variant=(
+                "normal" if projected_delivery.outcome == "DETAILED"
+                else "safe" if projected_delivery.outcome == "BASIC"
+                else None
+            ),
+            delivery_status=(
+                "NORMAL" if projected_delivery.outcome == "DETAILED"
+                else "DEGRADED" if projected_delivery.outcome == "BASIC"
+                else None
+            ),
+        )
+        if "route_diagnostics" in job:
+            RouteDiagnostics.model_validate(job["route_diagnostics"])
     if not isinstance(steps, list) or len(steps) > MAX_CHANGED_STEPS:
         raise ValueError("projection changed_steps exceeds the contract bound")
     if event.get("aggregate_id") != job.get("job_id"):
@@ -600,6 +641,10 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             raise ValueError("projection step belongs to another job")
         if "llm_usage" in step:
             _validated_llm_usage(step["llm_usage"])
+        if "execution_observation" in step:
+            if schema_version != "1.2":
+                raise ValueError("execution_observation requires projection 1.2")
+            ExecutionObservation.model_validate(step["execution_observation"])
     safe_error = job.get("safe_error")
     if job.get("error_code") is None:
         if safe_error is not None:
@@ -671,6 +716,32 @@ def _project_job_snapshot_row(row: Any) -> dict[str, Any]:
         projected["failure_observation"] = _validated_failure_observation(
             failure_observation
         )
+    policy = row.get("generation_policy_version") or "legacy"
+    if policy == "v0.12":
+        raw_delivery = _json_object(row.get("delivery_json"))
+        delivery = GenerationDelivery.model_validate(raw_delivery)
+        validate_delivery_for_job(
+            delivery,
+            status=str(row["status"]),
+            result_type=row["result_type"],
+            result_record_id=row["result_record_id"],
+            published_variant=row.get("published_variant"),
+            delivery_status=row.get("delivery_status"),
+        )
+        projected["generation_policy_version"] = "v0.12"
+        projected["delivery"] = delivery.model_dump(mode="json")
+        raw_diagnostics = row.get("route_diagnostics")
+        if raw_diagnostics is not None:
+            diagnostics = RouteDiagnostics.model_validate(
+                _json_object(raw_diagnostics)
+            )
+            expires_at = row.get("route_replay_expires_at")
+            if expires_at is not None:
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at <= datetime.now(timezone.utc):
+                    diagnostics.replay_available = False
+            projected["route_diagnostics"] = diagnostics.model_dump(mode="json")
     return projected
 
 
@@ -685,6 +756,10 @@ _JOB_SNAPSHOT_SELECT = """
         j.current_stage,
         j.result_type,
         j.result_record_id,
+        j.generation_policy_version,
+        j.delivery_json,
+        j.route_diagnostics,
+        j.route_replay_expires_at,
         CASE
             WHEN MAX(p.quality_metrics ->> 'generator') IN (
                 'opus', 'ds_flash', 'safe'
@@ -693,6 +768,8 @@ _JOB_SNAPSHOT_SELECT = """
                 THEN 'safe'
             ELSE NULL
         END AS generator,
+        MAX(p.quality_metrics ->> 'published_variant') AS published_variant,
+        MAX(p.quality_metrics ->> 'delivery_status') AS delivery_status,
         j.guide_result_state,
         j.error_code,
         j.created_time,
@@ -750,6 +827,7 @@ async def _step_snapshots(
     *,
     job_id: str,
     step_ids: list[int],
+    include_v012: bool = False,
 ) -> list[dict[str, Any]]:
     if not step_ids:
         return []
@@ -774,11 +852,11 @@ async def _step_snapshots(
     for row in rows:
         if str(row["job_id"]) != job_id:
             raise ValueError("changed step belongs to another job")
-        snapshots.append(_project_step_snapshot_row(row))
+        snapshots.append(_project_step_snapshot_row(row, include_v012=include_v012))
     return snapshots
 
 
-def _project_step_snapshot_row(row: Any) -> dict[str, Any]:
+def _project_step_snapshot_row(row: Any, *, include_v012: bool = False) -> dict[str, Any]:
     projected = {
         "source_step_id": int(row["id"]),
         "job_id": str(row["job_id"]),
@@ -829,6 +907,10 @@ def _project_step_snapshot_row(row: Any) -> dict[str, Any]:
                     "selection_fallback_reason": reason,
                 })
         projected["llm_usage"] = usage
+    if include_v012 and metadata.get("execution_observation") is not None:
+        projected["execution_observation"] = ExecutionObservation.model_validate(
+            metadata["execution_observation"]
+        ).model_dump(mode="json")
     return projected
 
 
@@ -905,13 +987,16 @@ async def get_trip_step_snapshot_page(
             await session.execute(
                 text(
                     """
-                    SELECT id, job_id, projection_version, stage, status,
-                           attempt, publish_retry_round, started_time,
-                           finished_time, latency_ms, metadata, updated_time
-                    FROM travel_trip_job_step
-                    WHERE id > :after_id
-                      AND id <= :snapshot_max_id
-                    ORDER BY id ASC
+                    SELECT step.id, step.job_id, step.projection_version,
+                           step.stage, step.status, step.attempt,
+                           step.publish_retry_round, step.started_time,
+                           step.finished_time, step.latency_ms, step.metadata,
+                           step.updated_time, job.generation_policy_version
+                    FROM travel_trip_job_step AS step
+                    JOIN travel_trip_job AS job ON job.job_id = step.job_id
+                    WHERE step.id > :after_id
+                      AND step.id <= :snapshot_max_id
+                    ORDER BY step.id ASC
                     LIMIT :fetch_limit
                     """
                 ),
@@ -924,7 +1009,13 @@ async def get_trip_step_snapshot_page(
         ).mappings().all()
     has_more = len(rows) > limit
     visible = rows[:limit]
-    items = [_project_step_snapshot_row(row) for row in visible]
+    items = [
+        _project_step_snapshot_row(
+            row,
+            include_v012=row.get("generation_policy_version") == "v0.12",
+        )
+        for row in visible
+    ]
     return {
         "snapshot_max_id": effective_max,
         "next_after_id": items[-1]["source_step_id"] if has_more else None,
@@ -980,6 +1071,7 @@ async def emit_trip_projection_commit(
         session,
         job_id=job_id,
         step_ids=step_ids,
+        include_v012=job.get("generation_policy_version") == "v0.12",
     )
     allocation = (
         await session.execute(
@@ -997,7 +1089,11 @@ async def emit_trip_projection_commit(
     event = {
         "event_id": str(uuid.uuid4()),
         "event_type": EVENT_TYPE,
-        "schema_version": EVENT_SCHEMA_VERSION,
+        "schema_version": (
+            EVENT_SCHEMA_VERSION
+            if job.get("generation_policy_version") == "v0.12"
+            else "1.1"
+        ),
         "outbox_sequence": int(allocation["head_sequence"]),
         "aggregate_type": AGGREGATE_TYPE,
         "aggregate_id": job_id,

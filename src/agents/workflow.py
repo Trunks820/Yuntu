@@ -21,7 +21,9 @@ from src.agents import (
     llm,
     poi_alias,
     poi_selection,
+    route_planner,
     route_planning,
+    route_diagnostics,
 )
 from src.agents.amap_poi_detail import (
     AmapPoiDetailResult,
@@ -30,6 +32,15 @@ from src.agents.amap_poi_detail import (
     await_amap_poi_detail_at_writer_barrier,
     settle_amap_poi_detail_task,
     start_amap_poi_detail_task,
+)
+from src.agents.lodging_section import (
+    LodgingPriceTaskHandle,
+    await_lodging_price_at_writer_barrier,
+    build_lodging_display,
+    lodging_writer_context,
+    render_lodging_display_text,
+    settle_lodging_price_task,
+    start_lodging_price_for_trip,
 )
 from src.agents.composition_blueprint import (
     build_base_composition_blueprints,
@@ -40,6 +51,7 @@ from src.agents.evidence_strength import (
     StructuredEvidencePayload,
     build_structured_evidence_payload,
 )
+from src.agents.generation_model_routing import SharedCallBudget
 from src.agents.pretrip_advice import (
     PreTripAdvicePayload,
     build_pretrip_advice_payload,
@@ -67,6 +79,7 @@ from src.agents.route_notices import (
     TRANSPORT_STATIC_FALLBACK_NOTICE,
 )
 from src.agents.schema import (
+    AccommodationAnchor,
     AccommodationSuggestion,
     CandidatePlace,
     PlanOutput,
@@ -106,6 +119,319 @@ from src.pipeline.db import get_session_factory
 
 logger = logging.getLogger(__name__)
 WORKFLOW_HARD_TIMEOUT_SECONDS = 180.0
+_ROUTE_PLANNER_TRACE_LIMIT = 8
+_ROUTE_PLANNER_TRACE_TEXT = 180
+
+
+def _clip_route_planner_text(value: object) -> str:
+    text = " ".join(str(value).split())
+    if len(text) > _ROUTE_PLANNER_TRACE_TEXT:
+        return text[:_ROUTE_PLANNER_TRACE_TEXT]
+    return text
+
+
+def _route_planner_call_row(call) -> dict:
+    return {
+        "index": int(getattr(call, "index", 0) or 0),
+        "repaired": bool(getattr(call, "repaired", False)),
+        "json_retry": bool(getattr(call, "json_retry", False)),
+        "latency_ms": int(getattr(call, "latency_ms", 0) or 0),
+        "prompt_tokens": int(getattr(call, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(call, "completion_tokens", 0) or 0),
+        "provider": str(getattr(call, "provider", "") or ""),
+        "model": str(getattr(call, "model", "") or ""),
+        "backup_reason": str(getattr(call, "backup_reason", "") or ""),
+    }
+
+
+def _route_planner_stage_trace(*, source: str, reason: str, result) -> dict:
+    issues: list[str] = []
+    adjustments: list[str] = []
+    calls: list[dict] = []
+    call_count = 0
+    schedule_ms = 0
+    elapsed_ms = 0
+    amap_calls = 0
+    estimated_legs = 0
+    lodging_rests = 0
+    sight_extends = 0
+    if result is not None:
+        issues = [
+            _clip_route_planner_text(item)
+            for item in list(getattr(result, "issues", None) or [])[:_ROUTE_PLANNER_TRACE_LIMIT]
+        ]
+        adjustments = [
+            _clip_route_planner_text(item)
+            for item in list(getattr(result, "adjustments", None) or [])[:_ROUTE_PLANNER_TRACE_LIMIT]
+        ]
+        raw_calls = list(getattr(result, "calls", None) or [])
+        call_count = len(raw_calls)
+        calls = [
+            _route_planner_call_row(call)
+            for call in raw_calls[:_ROUTE_PLANNER_TRACE_LIMIT]
+        ]
+        schedule_ms = int(getattr(result, "schedule_ms", 0) or 0)
+        elapsed_ms = int(getattr(result, "elapsed_ms", 0) or 0)
+        amap_calls = int(getattr(result, "amap_call_count", 0) or 0)
+        estimated_legs = int(getattr(result, "estimated_leg_count", 0) or 0)
+        lodging_rests = int(getattr(result, "lodging_rest_count", 0) or 0)
+        sight_extends = int(getattr(result, "sight_extend_count", 0) or 0)
+        kept_first_draft = bool(getattr(result, "kept_first_draft", False))
+        lodging_first = str(getattr(result, "lodging_first", "") or "off")
+    else:
+        kept_first_draft = False
+        lodging_first = "off"
+    failure_kind, failure_status = _route_planner_failure_record(result)
+    return {
+        "route_source": source,
+        "route_planner_fallback_reason": reason,
+        "route_planner_failure_kind": failure_kind,
+        "route_planner_failure_status": failure_status,
+        "route_planner_issues": issues,
+        "route_planner_adjustments": adjustments,
+        "route_planner_call_count": call_count,
+        "route_planner_calls": calls,
+        "route_planner_schedule_ms": schedule_ms,
+        "route_planner_elapsed_ms": elapsed_ms,
+        "route_planner_amap_call_count": amap_calls,
+        "route_planner_estimated_leg_count": estimated_legs,
+        "route_planner_lodging_rest_count": lodging_rests,
+        "route_planner_sight_extend_count": sight_extends,
+        "route_planner_kept_first_draft": kept_first_draft,
+        "route_planner_lodging_first": lodging_first,
+    }
+
+
+def _model_route_budget_ready(plan: RoutePlan, request: TripRequest) -> bool:
+    """True when the model route's locked facts survive the pre-adopt check.
+
+    This runs while the backup route is still going. A failed check keeps
+    that backup. The same ``resolve_route_budgets`` result is what the later
+    v2 gate would otherwise turn into ``NO_USABLE_ROUTE``.
+    """
+    results = itinerary_budget.resolve_route_budgets([plan], request)
+    if len(results) != 1:
+        return False
+    days = results[0].days
+    return (
+        len(days) == int(request.days)
+        and len(plan.day_groups) == int(request.days)
+        and all(day.status == "within_budget" for day in days)
+    )
+
+
+def _route_planner_usable(result, days: int) -> bool:
+    plan = getattr(result, "plan", None) if result is not None else None
+    groups = getattr(plan, "day_groups", None) if plan is not None else None
+    return bool(
+        result is not None
+        and getattr(result, "qualified", False)
+        and plan is not None
+        and int(days) > 0
+        and len(groups or []) == int(days)
+    )
+
+
+def _log_route_planner_outcome(*, source: str, reason: str, result) -> None:
+    """One line when the model route finishes. No prompt and no secret."""
+    qualified = False
+    call_count = 0
+    schedule_ms = 0
+    elapsed_ms = 0
+    amap_calls = 0
+    estimated_legs = 0
+    lodging_rests = 0
+    sight_extends = 0
+    if result is not None:
+        qualified = bool(getattr(result, "qualified", False))
+        call_count = len(list(getattr(result, "calls", None) or []))
+        schedule_ms = int(getattr(result, "schedule_ms", 0) or 0)
+        elapsed_ms = int(getattr(result, "elapsed_ms", 0) or 0)
+        amap_calls = int(getattr(result, "amap_call_count", 0) or 0)
+        estimated_legs = int(getattr(result, "estimated_leg_count", 0) or 0)
+        lodging_rests = int(getattr(result, "lodging_rest_count", 0) or 0)
+        sight_extends = int(getattr(result, "sight_extend_count", 0) or 0)
+    logger.info(
+        "route_planner outcome source=%s reason=%s qualified=%s calls=%s "
+        "schedule_ms=%s elapsed_ms=%s amap_calls=%s estimated_legs=%s "
+        "lodging_rests=%s sight_extends=%s",
+        source,
+        reason,
+        qualified,
+        call_count,
+        schedule_ms,
+        elapsed_ms,
+        amap_calls,
+        estimated_legs,
+        lodging_rests,
+        sight_extends,
+    )
+
+
+def _route_planner_failure_record(result) -> tuple[str, int | None]:
+    if result is None:
+        return "", None
+    kind = str(getattr(result, "failure_kind", "") or "").strip()
+    raw_status = getattr(result, "failure_status", None)
+    if isinstance(raw_status, bool) or not isinstance(raw_status, int):
+        return kind, None
+    return kind, raw_status
+
+
+def _route_planner_fallback_reason(result) -> str:
+    if result is None:
+        return "model_error"
+    # Timeout keeps the reason it had before failure kinds existed.
+    # Bad output is a model-output problem. Quota, rate limits, server
+    # errors and other call failures share model_unavailable. Issue text
+    # still classifies results that do not carry a kind.
+    kind, _status = _route_planner_failure_record(result)
+    if kind == "timeout":
+        return "timeout"
+    if kind == "bad_output":
+        return "model_bad_output"
+    if kind:
+        return "model_unavailable"
+    issues = [str(item) for item in (getattr(result, "issues", None) or [])]
+    if any(item.startswith("交给现有路线格式失败") for item in issues):
+        return "emit_failed"
+    text = " ".join(issues)
+    if "TimeoutError" in text or "超时" in text:
+        return "timeout"
+    return "unqualified"
+
+
+async def _retrieve_route_task(task: asyncio.Task) -> None:
+    """Wait out a child task without adopting its cancellation."""
+    await asyncio.wait({task})
+    if task.cancelled():
+        return
+    task.exception()
+
+
+async def _drain_route_task(task: asyncio.Task | None) -> None:
+    """Cancel one route task and retrieve its outcome.
+
+    ``asyncio.wait`` does not turn a cancelled child into a cancelled trip.
+    Cancelling this trip still propagates, and a shielded retrieve keeps the
+    child from running on after that.
+    """
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await _retrieve_route_task(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+        await asyncio.shield(_retrieve_route_task(task))
+        raise
+
+
+async def _await_route_planner(task: asyncio.Task, deadline_monotonic: float):
+    """Return the planner result, or a fallback reason once the deadline hits.
+
+    A result that is already finished is kept. A task still running at the
+    deadline is cancelled and is not left in the background.
+    """
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining > 0:
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+        if task not in done:
+            await _drain_route_task(task)
+    else:
+        await _drain_route_task(task)
+    if task.cancelled():
+        return None, "deadline"
+    error = task.exception()
+    if error is not None:
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            return None, "timeout"
+        return None, "model_error"
+    return task.result(), ""
+
+
+def _planner_user_lodging_anchor(
+    trip_request: TripRequest,
+    accommodation: AccommodationSuggestion | None,
+    accommodation_context,
+) -> AccommodationAnchor | None:
+    """User lodging for the model route. Automatic picks stay with the planner.
+
+    A fixed resolver anchor keeps its own point / area precision. With the
+    selector v2 path off, ``resolve_accommodation`` returns a suggestion only;
+    a user-supplied lodging is then a point, matching the non-coupling context.
+    """
+    from src.agents.route_feasibility import valid_coordinate
+
+    if accommodation_context is not None:
+        if accommodation_context.state == "fixed" and accommodation_context.anchors:
+            candidate = accommodation_context.anchors[0]
+            suggestion = candidate.suggestion
+            if (
+                suggestion is not None
+                and suggestion.source == "user_specified"
+                and valid_coordinate(suggestion.latitude, suggestion.longitude)
+            ):
+                return candidate
+        return None
+    if (
+        accommodation is not None
+        and accommodation.source == "user_specified"
+        and valid_coordinate(accommodation.latitude, accommodation.longitude)
+    ):
+        return AccommodationAnchor(
+            suggestion=accommodation,
+            location_precision="point" if trip_request.accommodation else "area",
+        )
+    return None
+
+
+async def _run_route_planner(
+    trip_request: TripRequest,
+    retrieval,
+    *,
+    settings,
+    lodging_anchor: AccommodationAnchor | None = None,
+):
+    """One model route. Its Amap provider is created inside ``plan_route``."""
+    citycode = None
+    if settings.commute_mode_enabled:
+        try:
+            citycode = await route_planning._load_citycode(
+                trip_request.to_city or "",
+                {
+                    place.adcode
+                    for place in retrieval.candidates
+                    if getattr(place, "adcode", None)
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Amap transit citycode unavailable; transit legs will use estimates",
+                exc_info=True,
+            )
+            citycode = None
+
+    def provider_factory():
+        return route_planning.AmapRouteProvider(
+            time_budget_ms=max(
+                0,
+                int(round(float(settings.route_planner_amap_time_budget_seconds) * 1000)),
+            ),
+        )
+
+    async with get_session_factory()() as session:
+        return await route_planner.plan_route(
+            trip_request,
+            retrieval,
+            session=session,
+            provider_factory=provider_factory,
+            settings=settings,
+            citycode=citycode,
+            lodging_anchor=lodging_anchor,
+        )
 
 
 class StructuredTripRequestRequiredError(ValueError):
@@ -324,6 +650,7 @@ def _build_publish_retry_feedback(
         route_plans=route_plans,
         attachment_auth_map=pipeline.attachment_auth_map,
         accommodation=pipeline.accommodation,
+        body_semantics_by_review=pipeline.generation_policy_version == "v0.12",
     ).findings
     decision_reasons = set(signal.decision.reasons)
     selected = [
@@ -482,6 +809,7 @@ async def run_trip_workflow(
     on_writer_output: WriterOutputCallback | None = None,
     must_include_resolution: MustIncludeResolution | None = None,
     workflow_deadline_monotonic: float | None = None,
+    generation_policy_version: str = "legacy",
 ) -> WorkflowResult:
     if trip_request is None:
         # Keep the legacy Intent Parser implementation for a future product
@@ -502,6 +830,7 @@ async def run_trip_workflow(
     stage_timing_token = start_stage_timing_observation()
     cost_prefetches: list[IntercityCostPrefetch] = []
     amap_handles: list[AmapPoiDetailTaskHandle] = []
+    lodging_price_handles: list[LodgingPriceTaskHandle] = []
     try:
         with llm.llm_call_context(
             workflow_deadline_monotonic=workflow_deadline_monotonic,
@@ -518,8 +847,10 @@ async def run_trip_workflow(
                     must_include_resolution=must_include_resolution,
                     llm_records=llm_records,
                     workflow_deadline_monotonic=workflow_deadline_monotonic,
+                    generation_policy_version=generation_policy_version,
                     cost_prefetches=cost_prefetches,
                     amap_handles=amap_handles,
+                    lodging_price_handles=lodging_price_handles,
                 ),
                 timeout=remaining_seconds,
             )
@@ -538,6 +869,8 @@ async def run_trip_workflow(
     finally:
         for handle in amap_handles:
             await settle_amap_poi_detail_task(handle)
+        for handle in lodging_price_handles:
+            await settle_lodging_price_task(handle)
         for prefetch in cost_prefetches:
             await cancel_intercity_cost_prefetch(prefetch)
         stop_stage_timing_observation(stage_timing_token)
@@ -558,6 +891,8 @@ async def _run_trip_workflow_inner(
     workflow_deadline_monotonic: float | None = None,
     cost_prefetches: list[IntercityCostPrefetch] | None = None,
     amap_handles: list[AmapPoiDetailTaskHandle] | None = None,
+    lodging_price_handles: list[LodgingPriceTaskHandle] | None = None,
+    generation_policy_version: str = "legacy",
 ) -> WorkflowResult:
     """Full pipeline: parse -> retrieve -> route -> write/review -> persist.
 
@@ -631,16 +966,16 @@ async def _run_trip_workflow_inner(
         cost_prefetches.append(cost_intercity_prefetch)
 
     logger.info("[2/5] Data Retrieval ...")
+    must_include_place_ids = _workflow_must_include_place_ids(
+        trip_request,
+        must_include_resolution,
+    )
     retrieval = await _run_observed_step(
         "DATA_RETRIEVAL",
         lambda: data_retrieval.query(
             trip_request,
             recent_place_id_sets=recent_place_id_sets,
-            must_include_place_ids=(
-                must_include_resolution.matched_place_ids
-                if must_include_resolution is not None
-                else None
-            ),
+            must_include_place_ids=must_include_place_ids,
         ),
         on_stage=on_stage,
         on_stage_event=on_stage_event,
@@ -661,11 +996,12 @@ async def _run_trip_workflow_inner(
     settings = get_settings()
     transport: TransportSuggestion | None = None
     accommodation_context = None
-    coupling_enabled = bool(getattr(settings, "selector_route_v2_enabled", False) and getattr(settings, "accommodation_route_coupling_enabled", False))
+    v2_enabled = bool(getattr(settings, "selector_route_v2_enabled", False))
+    coupling_enabled = bool(v2_enabled and getattr(settings, "accommodation_route_coupling_enabled", False))
     async with get_session_factory()() as session:
-        resolver = (accommodation_resolver.resolve_accommodation_context if coupling_enabled
-                    else accommodation_resolver.resolve_accommodation)
-        accommodation_coro = resolver(trip_request, retrieval, session)
+        accommodation_coro = (accommodation_resolver.resolve_accommodation_context(
+            trip_request, retrieval, session, coupling_enabled=coupling_enabled) if v2_enabled
+            else accommodation_resolver.resolve_accommodation(trip_request, retrieval, session))
         if settings.intercity_transport_enabled:
             shared_outbound = (
                 cost_intercity_prefetch.outbound_task
@@ -682,7 +1018,7 @@ async def _run_trip_workflow_inner(
             )
         else:
             accommodation = await accommodation_coro
-    if coupling_enabled:
+    if v2_enabled:
         accommodation_context = accommodation
         accommodation = (accommodation_context.anchors[0].suggestion
                          if accommodation_context.state == "fixed" else None)
@@ -698,6 +1034,46 @@ async def _run_trip_workflow_inner(
         else None
     )
 
+    # The model route starts before selection so it overlaps the backup
+    # selector and route. plan_route creates its own Amap provider later.
+    route_planner_trace: dict = {}
+    route_source = "fallback"
+    route_planner_logged = False
+    planner_task: asyncio.Task | None = None
+    planner_deadline = time.monotonic()
+    if bool(getattr(settings, "route_planner_enabled", False)):
+        planner_deadline = min(
+            time.monotonic() + float(settings.route_planner_deadline_seconds),
+            float(workflow_deadline_monotonic)
+            - route_planning._ROUTE_WORKFLOW_RESERVE_SECONDS,
+        )
+        if planner_deadline <= time.monotonic():
+            route_planner_trace.update(
+                _route_planner_stage_trace(
+                    source="fallback",
+                    reason="deadline",
+                    result=None,
+                )
+            )
+            _log_route_planner_outcome(
+                source="fallback", reason="deadline", result=None
+            )
+            route_planner_logged = True
+        else:
+            planner_task = asyncio.create_task(
+                _run_route_planner(
+                    trip_request,
+                    retrieval,
+                    settings=settings,
+                    lodging_anchor=_planner_user_lodging_anchor(
+                        trip_request,
+                        accommodation,
+                        accommodation_context,
+                    ),
+                ),
+                name="route-planner",
+            )
+
     logger.info("[3/6] POI Selection ...")
     selection_pool = route_planning._route_planning_candidate_pool(
         retrieval,
@@ -710,11 +1086,7 @@ async def _run_trip_workflow_inner(
         trip_request,
         selection_pool,
         accommodation=accommodation,
-        must_include_place_ids=(
-            must_include_resolution.matched_place_ids
-            if must_include_resolution is not None
-            else None
-        ),
+        must_include_place_ids=must_include_place_ids,
     )
     poi_selection_metrics = poi_selection.PoiSelectionMetrics()
     selection_result = None
@@ -724,80 +1096,164 @@ async def _run_trip_workflow_inner(
         execution = await poi_selection.select_pois(
             selector_input,
             workflow_deadline_monotonic=workflow_deadline_monotonic,
+            generation_policy_version=generation_policy_version,
         )
         poi_selection_metrics = execution.metrics
         selection_result = execution.result
         return execution.result
 
-    selection_result = await _run_observed_step(
-        "POI_SELECTION",
-        run_poi_selection,
-        on_stage=on_stage,
-        on_stage_event=on_stage_event,
-        metadata=poi_selection_metrics.to_stage_metadata(),
-        finish_metadata=lambda: poi_selection_metrics.to_stage_metadata(),
+    try:
+        selection_result = await _run_observed_step(
+            "POI_SELECTION",
+            run_poi_selection,
+            on_stage=on_stage,
+            on_stage_event=on_stage_event,
+            metadata=poi_selection_metrics.to_stage_metadata(),
+            finish_metadata=lambda: poi_selection_metrics.to_stage_metadata(),
+        )
+    except BaseException:
+        if planner_task is not None and not route_planner_logged:
+            _log_route_planner_outcome(
+                source="cancelled", reason="cancelled", result=None
+            )
+            route_planner_logged = True
+        await _drain_route_task(planner_task)
+        raise
+    v012_execution_metrics = (
+        {
+            "generation_policy_version": "v0.12",
+            "poi_selection": poi_selection_metrics.to_stage_metadata(),
+        }
+        if generation_policy_version == "v0.12"
+        else {}
     )
 
     logger.info("[4/6] Route Planning ...")
     route_metrics = route_planning.RoutePlanningMetrics()
+    route_started_at = time.monotonic()
+    route_diagnostic_summary: dict | None = None
+    route_replay_data: dict | None = None
+
+    def observe_route(
+        plans: list[RoutePlan], error: BaseException | None = None
+    ) -> None:
+        nonlocal route_diagnostic_summary, route_replay_data
+        if generation_policy_version != "v0.12":
+            return
+        try:
+            summary, replay = route_diagnostics.build_route_observation(
+                request=trip_request,
+                selector_input=selector_input,
+                retrieval=retrieval,
+                plans=plans,
+                metrics=route_metrics,
+                elapsed_ms=max(0, int((time.monotonic() - route_started_at) * 1000)),
+                error=error,
+                accommodation=accommodation,
+            )
+            route_diagnostic_summary = summary.model_dump(mode="json")
+            route_replay_data = replay or None
+        except Exception:
+            # Diagnostics are auxiliary.  Their failure cannot rewrite route
+            # output, ordering, or the terminal business result.
+            logger.warning("route diagnostics projection failed", exc_info=True)
+            route_diagnostic_summary = route_diagnostics.RouteDiagnostics(
+                evidence_state="UNAVAILABLE",
+                stop_reason="ERROR",
+                candidate_count=None,
+                search=route_diagnostics.RouteSearchObservation(),
+                truncated=False,
+                replay_available=False,
+            ).model_dump(mode="json")
+            route_replay_data = None
 
     async def run_route_planning():
-        if bool(getattr(settings, "route_planner_enabled", False)):
-            try:
-                from src.agents import route_planner
-                from src.agents.schema import AccommodationAnchor
+        nonlocal route_source, route_planner_logged
 
-                lodging_anchor = None
-                if accommodation is not None:
-                    lodging_anchor = AccommodationAnchor(
-                        suggestion=accommodation,
-                        location_precision="point",
-                    )
-                planner_result = await route_planner.plan_route(
+        async def _plan_backup():
+            try:
+                route_signature = inspect.signature(
+                    route_planning.plan_routes
+                ).parameters
+            except (TypeError, ValueError):
+                route_signature = {}
+            kwargs = {}
+            if "metrics" in route_signature:
+                kwargs["metrics"] = route_metrics
+            if "selection" in route_signature:
+                kwargs["selection"] = selection_result
+            elif "target_plan_count" in route_signature:
+                # Narrow compatibility for injected historical route doubles. The
+                # production planner exposes ``selection`` and never takes this branch.
+                kwargs["target_plan_count"] = 1
+            if accommodation_context is not None:
+                kwargs["accommodation_context"] = accommodation_context
+            if "accommodation_source" in route_signature:
+                kwargs["accommodation_source"] = accommodation.source if accommodation is not None else "auto_recommended"
+            if "accommodation_coord" in route_signature:
+                kwargs["accommodation_coord"] = accommodation_coord
+            if "workflow_deadline_monotonic" in route_signature:
+                kwargs["workflow_deadline_monotonic"] = workflow_deadline_monotonic
+            if "selector_input" in route_signature:
+                kwargs["selector_input"] = selector_input
+            if kwargs:
+                return await route_planning.plan_routes(
                     trip_request,
                     retrieval,
-                    lodging_anchor=lodging_anchor,
-                    settings=settings,
+                    **kwargs,
                 )
-                if _route_planner_usable(planner_result, trip_request.days):
-                    logger.info("route planner qualified; using model route")
-                    return [planner_result.plan]
-                logger.warning(
-                    "route planner not usable reason=%s; using selector route",
-                    getattr(planner_result, "reason", ""),
-                )
-            except Exception:
-                logger.exception("route planner failed; using selector route")
+            return await route_planning.plan_routes(trip_request, retrieval)
+
+        if planner_task is None:
+            return await _plan_backup()
+
+        backup_task = asyncio.create_task(_plan_backup(), name="route-backup")
         try:
-            route_signature = inspect.signature(
-                route_planning.plan_routes
-            ).parameters
-        except (TypeError, ValueError):
-            route_signature = {}
-        kwargs = {}
-        if "metrics" in route_signature:
-            kwargs["metrics"] = route_metrics
-        if "selection" in route_signature:
-            kwargs["selection"] = selection_result
-        elif "target_plan_count" in route_signature:
-            # Narrow compatibility for injected historical route doubles. The
-            # production planner exposes ``selection`` and never takes this branch.
-            kwargs["target_plan_count"] = 1
-        if accommodation_context is not None:
-            kwargs["accommodation_context"] = accommodation_context
-        if "accommodation_source" in route_signature:
-            kwargs["accommodation_source"] = accommodation.source if accommodation is not None else "auto_recommended"
-        if "accommodation_coord" in route_signature:
-            kwargs["accommodation_coord"] = accommodation_coord
-        if "workflow_deadline_monotonic" in route_signature:
-            kwargs["workflow_deadline_monotonic"] = workflow_deadline_monotonic
-        if kwargs:
-            return await route_planning.plan_routes(
-                trip_request,
-                retrieval,
-                **kwargs,
+            result, reason = await _await_route_planner(
+                planner_task,
+                planner_deadline,
             )
-        return await route_planning.plan_routes(trip_request, retrieval)
+            if reason == "" and _route_planner_usable(result, trip_request.days):
+                if _model_route_budget_ready(result.plan, trip_request):
+                    route_source = "model"
+                    route_planner_trace.clear()
+                    route_planner_trace.update(
+                        _route_planner_stage_trace(
+                            source="model",
+                            reason="",
+                            result=result,
+                        )
+                    )
+                    _log_route_planner_outcome(
+                        source="model", reason="", result=result
+                    )
+                    route_planner_logged = True
+                    return [result.plan]
+                reason = "budget_mismatch"
+            if reason == "":
+                reason = _route_planner_fallback_reason(result)
+            route_source = "fallback"
+            route_planner_trace.clear()
+            route_planner_trace.update(
+                _route_planner_stage_trace(
+                    source="fallback",
+                    reason=reason,
+                    result=result,
+                )
+            )
+            _log_route_planner_outcome(
+                source="fallback", reason=reason, result=result
+            )
+            route_planner_logged = True
+            return await backup_task
+        finally:
+            if planner_task is not None and not route_planner_logged:
+                _log_route_planner_outcome(
+                    source="cancelled", reason="cancelled", result=None
+                )
+                route_planner_logged = True
+            await _drain_route_task(backup_task)
+            await _drain_route_task(planner_task)
 
     try:
         route_plans = await _run_observed_step(
@@ -809,6 +1265,7 @@ async def _run_trip_workflow_inner(
             finish_metadata=lambda: (
                 route_metrics.to_dict()
                 | route_metrics.route_quality_stage_metadata()
+                | route_planner_trace
             ),
         )
         usable_route_plans = [
@@ -820,13 +1277,17 @@ async def _run_trip_workflow_inner(
                 "Route Planning produced no usable day groups; refusing "
                 "unconstrained generation"
             )
+            observe_route(route_plans)
             return WorkflowResult(
                 trip_request=trip_request,
                 plans=[],
                 result_type="NO_USABLE_ROUTE",
                 review_notes=NO_USABLE_ROUTE_NOTICE,
+                quality_metrics=v012_execution_metrics,
                 route_plans=route_plans,
                 record_id=None,
+                route_diagnostics=route_diagnostic_summary,
+                route_replay_data=route_replay_data,
             )
         if len(usable_route_plans) != 1 or len(route_plans) != 1:
             raise RuntimeError("POI selection must produce exactly one usable route")
@@ -841,17 +1302,35 @@ async def _run_trip_workflow_inner(
                 "shortened itinerary publication",
                 trip_request.days,
             )
+            observe_route(route_plans)
             return WorkflowResult(
                 trip_request=trip_request,
                 plans=[],
                 result_type="NO_USABLE_ROUTE",
                 review_notes=NO_USABLE_ROUTE_NOTICE,
+                quality_metrics=v012_execution_metrics,
                 route_plans=route_plans,
                 record_id=None,
+                route_diagnostics=route_diagnostic_summary,
+                route_replay_data=route_replay_data,
             )
         route_plans = complete_day_route_plans
+        observe_route(route_plans)
         route_metrics.plan_count = 1
-        if coupling_enabled:
+        if route_source == "model":
+            locked = route_plans[0]
+            anchor = locked.accommodation_anchor
+            if anchor is not None and anchor.suggestion is not None:
+                accommodation = anchor.suggestion
+                accommodation_coord = (accommodation.latitude, accommodation.longitude)
+            if (
+                accommodation_context is not None
+                and accommodation_context.state == "user_unresolved"
+                and getattr(accommodation, "source", None) != "user_specified"
+                and ACCOMMODATION_FALLBACK_NOTICE not in route_notices
+            ):
+                route_notices.append(ACCOMMODATION_FALLBACK_NOTICE)
+        elif coupling_enabled:
             locked = route_plans[0]
             accommodation = locked.accommodation_anchor.suggestion if locked.accommodation_anchor else None
             accommodation_coord = (accommodation.latitude, accommodation.longitude) if accommodation else None
@@ -861,13 +1340,18 @@ async def _run_trip_workflow_inner(
         route_planning.SelectedRoutePreciseConflictError,
     ) as exc:
         logger.warning("Route Planning found no usable route", exc_info=True)
+        observe_route([], exc)
         return WorkflowResult(
             trip_request=trip_request,
             plans=[],
             result_type="NO_USABLE_ROUTE",
             review_notes=(ACCOMMODATION_UNRESOLVED_NOTICE if accommodation_context is not None
-                and accommodation_context.state == "user_unresolved" else NO_USABLE_ROUTE_NOTICE),
-            quality_metrics=(
+                and accommodation_context.state == "user_unresolved" else ("全天活动需要独立一天，与其他必去地点无法在当前天数或时间窗内同时安排；请增加天数或调整时间窗。"
+                    if any(code in {"full_day_conflict", "window_conflict"} for code in getattr(exc,"violations",()))
+                    or any(code in {"full_day_conflict", "window_conflict"} for day in getattr(exc,"day_groups",())
+                           if day.day_feasibility for code in day.day_feasibility.violations)
+                    else NO_USABLE_ROUTE_NOTICE)),
+            quality_metrics=v012_execution_metrics | (
                 {**({"accommodation_failure_code": "ACCOMMODATION_UNRESOLVED"
                     if accommodation_context.state == "user_unresolved" else "ROUTE_SEARCH_EXHAUSTED"}
                     if accommodation_context is not None else {}),
@@ -879,10 +1363,24 @@ async def _run_trip_workflow_inner(
             ),
             route_plans=[],
             record_id=None,
+            route_diagnostics=route_diagnostic_summary,
+            route_replay_data=route_replay_data,
         )
     except Exception:
         logger.exception("Route Planning failed")
         raise
+    finally:
+        await _drain_route_task(planner_task)
+
+    if lodging_price_handles is None:
+        lodging_price_handles = []
+    lodging_price_handle = start_lodging_price_for_trip(
+        trip_request=trip_request,
+        accommodation=accommodation,
+        settings=settings,
+    )
+    if lodging_price_handle is not None:
+        lodging_price_handles.append(lodging_price_handle)
 
     pre_route_selection_quality = route_metrics.route_quality_metrics()
     post_budget_route_quality: dict[str, Any] = {}
@@ -916,7 +1414,11 @@ async def _run_trip_workflow_inner(
                 for result in budget_results
             ):
                 return WorkflowResult(trip_request=trip_request, plans=[], result_type="NO_USABLE_ROUTE",
-                    review_notes=NO_USABLE_ROUTE_NOTICE, route_plans=route_plans, record_id=None)
+                    review_notes=NO_USABLE_ROUTE_NOTICE,
+                    quality_metrics=v012_execution_metrics,
+                    route_plans=route_plans, record_id=None,
+                    route_diagnostics=route_diagnostic_summary,
+                    route_replay_data=route_replay_data)
         resolved_pairs = [
             (route_plan, budget_result)
             for route_plan, budget_result in zip(route_plans, budget_results)
@@ -951,8 +1453,11 @@ async def _run_trip_workflow_inner(
                 plans=[],
                 result_type="NO_USABLE_ROUTE",
                 review_notes=NO_USABLE_ROUTE_NOTICE,
+                quality_metrics=v012_execution_metrics,
                 route_plans=route_plans,
                 record_id=None,
+                route_diagnostics=route_diagnostic_summary,
+                route_replay_data=route_replay_data,
             )
         route_plans = [route_plan for route_plan, _ in complete_budget_route_pairs]
         budget_results = [
@@ -964,8 +1469,11 @@ async def _run_trip_workflow_inner(
                 plans=[],
                 result_type="NO_USABLE_ROUTE",
                 review_notes=NO_USABLE_ROUTE_NOTICE,
+                quality_metrics=v012_execution_metrics,
                 route_plans=[],
                 record_id=None,
+                route_diagnostics=route_diagnostic_summary,
+                route_replay_data=route_replay_data,
             )
         if len(route_plans) != 1:
             raise RuntimeError("budget resolution must preserve one locked route")
@@ -1022,6 +1530,15 @@ async def _run_trip_workflow_inner(
     plans: list[PlanOutput] = []
     publish_result = None
     publish_retry_feedback: list[dict] = []
+    review_call_budget = (
+        SharedCallBudget(
+            deadline_monotonic=workflow_deadline_monotonic,
+            max_calls=5,
+            reserve_seconds=10.0,
+        )
+        if generation_policy_version == "v0.12"
+        else None
+    )
 
     while True:
         pipeline = WriteReviewPublishPipeline(
@@ -1048,10 +1565,20 @@ async def _run_trip_workflow_inner(
             workflow_deadline_monotonic=workflow_deadline_monotonic,
             residual_reserve_seconds=20.0,
             speculative_initial_generation=(publish_retry_count == 0),
-            require_selected_route_lock=True,
+            require_selected_route_lock=not (
+                route_source == "model"
+                and all(plan.membership_ledger is None for plan in route_plans)
+            ),
+            generation_policy_version=generation_policy_version,
+            review_call_budget=review_call_budget,
         )
         try:
-            plans, review_notes, publish_result, generation_metrics = await pipeline.run()
+            with lodging_writer_context(
+                enabled=bool(getattr(settings, "lodging_section_v2_enabled", False)),
+                handle=lodging_price_handle,
+                mid_markup=float(getattr(settings, "rollinggo_mid_markup", 1.05)),
+            ):
+                plans, review_notes, publish_result, generation_metrics = await pipeline.run()
             fragment_repair_call_count = int(
                 getattr(pipeline, "fragment_repair_call_count", fragment_repair_call_count)
                 or fragment_repair_call_count
@@ -1159,19 +1686,8 @@ async def _run_trip_workflow_inner(
     generation_metrics.setdefault("review_required_for_complete_body", False)
     generation_metrics.setdefault("review_ran", bool(generation_metrics.get("review_ran")))
     generation_metrics["workflow_deadline_seconds"] = 180
-    plans = _apply_preference_evidence(
-        plans, route_plans, trip_request, generation_metrics
-    )
-    _attach_lodging_displays(plans, route_plans, trip_request, settings)
-    _record_route_diagnostics(
-        generation_metrics,
-        trip_request=trip_request,
-        selector_input=selector_input,
-        retrieval=retrieval,
-        route_plans=route_plans,
-        route_metrics=route_metrics,
-        accommodation=accommodation,
-    )
+    if generation_policy_version == "v0.12":
+        generation_metrics["generation_policy_version"] = "v0.12"
     if publish_result is None:
         raise RuntimeError("pipeline completed without publish_result")
     if route_plans:
@@ -1197,8 +1713,11 @@ async def _run_trip_workflow_inner(
             plans=[],
             result_type="NO_USABLE_ROUTE",
             review_notes=NO_USABLE_ROUTE_NOTICE,
+            quality_metrics=v012_execution_metrics,
             route_plans=route_plans,
             record_id=None,
+            route_diagnostics=route_diagnostic_summary,
+            route_replay_data=route_replay_data,
         )
     if route_notices:
         review_notes = "\n".join([*route_notices, review_notes]).strip()
@@ -1231,6 +1750,8 @@ async def _run_trip_workflow_inner(
         plans=plans,
         review_notes=review_notes,
         route_plans=route_plans,
+        route_diagnostics=route_diagnostic_summary,
+        route_replay_data=route_replay_data,
         delivery_metadata=delivery_metadata,
         quality_metrics=build_quality_metrics(
             user_text=user_text,
@@ -1241,7 +1762,9 @@ async def _run_trip_workflow_inner(
             **generation_metrics,
             **publish_result.to_metrics(),
             "publish_retry_count": publish_retry_count,
-            "route_planning": route_metrics.to_dict(),
+            "route_planning": route_metrics.to_dict() | (
+                dict(route_planner_trace) if route_planner_trace else {}
+            ),
             **route_quality_metrics,
             "poi_selection": poi_selection_metrics.to_dict(),
             **llm.summarize_llm_call_records(llm_records or []),
@@ -1253,6 +1776,11 @@ async def _run_trip_workflow_inner(
         },
         weather_display=weather_advisory_payload.display_payload(),
     )
+    if lodging_price_handle is not None:
+        result.lodging_price_result = await await_lodging_price_at_writer_barrier(
+            lodging_price_handle
+        )
+    attach_lodging_displays(result, trip_request, settings)
     result.cost_estimate_snapshots = list(
         await resolve_workflow_cost_snapshots(
             result,
@@ -1281,122 +1809,53 @@ async def _run_trip_workflow_inner(
     return result
 
 
-def _route_planner_usable(result, days: int) -> bool:
-    plan = getattr(result, "plan", None) if result is not None else None
-    groups = getattr(plan, "day_groups", None) if plan is not None else None
-    return bool(
-        result is not None
-        and getattr(result, "qualified", False)
-        and plan is not None
-        and int(days) > 0
-        and len(groups or []) == int(days)
-    )
+def attach_lodging_displays(
+    result: WorkflowResult,
+    trip_request: TripRequest,
+    settings: object,
+) -> None:
+    """Attach lodging display after the writer barrier, one copy per plan."""
 
-
-def _apply_preference_evidence(plans, route_plans, trip_request, generation_metrics):
-    """Record preference evidence and splice fixed notices. Failures stay local."""
-    from src.agents.explicit_preference_fulfillment import (
-        evaluate_explicit_preference_fulfillment,
-    )
-    from src.agents.preference_notices import apply_preference_notices
-    from src.agents.preferences import normalize_preferences
-
-    updated = []
-    for index, plan in enumerate(plans):
-        route = route_plans[index] if index < len(route_plans) else None
-        try:
-            updated.append(apply_preference_notices(plan, route, trip_request))
-        except Exception:
-            logger.warning("preference notices skipped", exc_info=True)
-            updated.append(plan)
-    try:
-        normalized = normalize_preferences(trip_request.preferences)
-        generation_metrics["preference_dimensions"] = sorted(
-            normalized.scoring_dimensions
-        )
-        generation_metrics["preference_family"] = bool(
-            normalized.family_arrangement
-        )
-    except Exception:
-        logger.warning("preference normalize skipped", exc_info=True)
-    try:
-        report = evaluate_explicit_preference_fulfillment(
-            trip_request=trip_request,
-            route_plans=route_plans,
-            plans=updated,
-        )
-        payload = report.to_dict()
-        generation_metrics["explicit_preference_fulfillment"] = {
-            "dimensions": list(payload.get("dimensions") or [])[:12],
-            "finding_count": len(payload.get("findings") or []),
-            "decision_count": len(payload.get("route_decisions") or []),
-        }
-    except Exception:
-        logger.warning("explicit preference fulfillment skipped", exc_info=True)
-    return updated
-
-
-def _attach_lodging_displays(plans, route_plans, trip_request, settings) -> None:
-    """Build lodging copy without a priced hotel API."""
     if not bool(getattr(settings, "lodging_section_v2_enabled", False)):
         return
-    from src.agents.lodging_section import (
-        build_lodging_display,
-        render_lodging_display_text,
-    )
-
-    for index, plan in enumerate(plans):
+    try:
+        mid_markup = float(getattr(settings, "rollinggo_mid_markup", 1.05))
+    except (TypeError, ValueError):
+        mid_markup = 1.05
+    prices = result.lodging_price_result
+    for index, plan in enumerate(result.plans):
         accommodation = plan.accommodation
         if accommodation is None:
             continue
-        route_plan = route_plans[index] if index < len(route_plans) else None
+        display = None
         try:
+            route_plan = result.route_plans[index]
             display = build_lodging_display(
                 accommodation=accommodation,
                 route_plan=route_plan,
                 trip_request=trip_request,
-                prices=None,
-                nearby_hotel_names=getattr(
-                    route_plan, "nearby_lodging_hotel_names", None
-                ),
+                prices=prices,
+                nearby_hotel_names=route_plan.nearby_lodging_hotel_names,
+                mid_markup=mid_markup,
             )
         except Exception:
-            logger.warning("lodging display build failed", exc_info=True)
-            continue
+            logger.warning(
+                "lodging display build failed; continuing without display"
+            )
+            display = None
         plan.accommodation = accommodation.model_copy(update={"display": display})
+        if display is None:
+            continue
+        section = plan.code_lodging_section or ""
+        if not section:
+            continue
         try:
-            plan.code_lodging_section = render_lodging_display_text(
-                plan.accommodation, display
-            )
+            rendered = render_lodging_display_text(plan.accommodation, display) + "\n\n"
         except Exception:
-            logger.warning("lodging display text failed", exc_info=True)
-
-
-def _record_route_diagnostics(
-    generation_metrics,
-    *,
-    trip_request,
-    selector_input,
-    retrieval,
-    route_plans,
-    route_metrics,
-    accommodation,
-) -> None:
-    from src.agents import route_diagnostics
-
-    try:
-        summary, _replay = route_diagnostics.build_route_observation(
-            request=trip_request,
-            selector_input=selector_input,
-            retrieval=retrieval,
-            plans=route_plans,
-            metrics=route_metrics,
-            elapsed_ms=None,
-            accommodation=accommodation,
-        )
-        generation_metrics["route_diagnostics"] = summary.model_dump(mode="json")
-    except Exception:
-        logger.warning("route diagnostics skipped", exc_info=True)
+            logger.warning("lodging display text render failed during consistency check")
+            continue
+        if rendered != section:
+            logger.warning("lodging display text does not match code lodging section")
 
 
 def _must_include_anchor_active() -> bool:
@@ -1405,6 +1864,25 @@ def _must_include_anchor_active() -> bool:
         getattr(settings, "place_demand_enabled", False)
         and getattr(settings, "must_include_anchor_enabled", False)
     )
+
+
+def _workflow_must_include_place_ids(
+    trip_request: TripRequest,
+    resolution: MustIncludeResolution | None,
+) -> list[int]:
+    """One must-go set for Retrieval, Selector and Route.
+
+    Without an active anchor resolution the Selector already treats the
+    request's place ids as must-go. Retrieval has to pin the same ids, or the
+    route sees them as ordinary picks it may trade away.
+    """
+    if resolution is not None:
+        return list(resolution.matched_place_ids)
+    return [
+        item.place_id
+        for item in trip_request.must_include
+        if item.place_id is not None
+    ]
 
 
 def _time_preferences_metrics(trip_request: TripRequest) -> dict:

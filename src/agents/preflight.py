@@ -328,6 +328,7 @@ def run_predispatch_handlers(
                 transport=plan_out.transport,
                 packing_checklist=plan_out.packing_checklist,
                 travel_tips=plan_out.travel_tips,
+                code_lodging_section=plan_out.code_lodging_section,
             )
         updated.append(plan_out)
 

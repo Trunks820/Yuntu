@@ -13,6 +13,12 @@ from typing import Any, Literal
 from pydantic import ValidationError
 
 from src.agents import llm
+from src.agents.generation_model_routing import (
+    ModelEndpoint,
+    SharedCallBudget,
+    project_execution_observation,
+    route_selector,
+)
 from src.agents.schema import (
     CandidatePlace,
     PoiPreferenceTag,
@@ -26,6 +32,8 @@ from src.agents.schema import (
 )
 from src.config import get_settings
 from src.agents.pace import detect_pace_mode, generation_base_mode
+from src.agents.preferences import CULTURE, scoring_dimension_ids, order_preference_candidates
+from src.agents.preferences import candidate_matches_dimension as explicit_candidate_matches_dimension
 from src.agents.route_feasibility import build_visit_profile, day_slot_limit
 from src.agents.evidence_strength import selector_experience_lines
 from src.agents.schema import (
@@ -44,6 +52,7 @@ ORDINARY_PLACES_PER_DAY = 5
 SELECTOR_MAX_SECONDS = 15.0
 ROUTE_WORKFLOW_RESERVE_SECONDS = 110.0
 ROUTE_MIN_EXECUTION_SECONDS = 20.0
+V012_FINALIZATION_RESERVE_SECONDS = 10.0
 
 SelectionSource = Literal["LLM", "DETERMINISTIC_FALLBACK"]
 SelectionFallbackReason = Literal[
@@ -86,16 +95,26 @@ class PoiSelectionMetrics:
     ordinary_selected_count: int = 0
     must_include_selected_count: int = 0
     validation_failures: list[str] = field(default_factory=list)
+    execution_observation: dict[str, Any] | None = None
+    adopted_call_sequence: int | None = None
+    culture_coverage: dict[str, Any] = field(default_factory=dict)
+    route_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("execution_observation", None)
+        payload.pop("adopted_call_sequence", None)
+        return payload
 
     def to_stage_metadata(self) -> dict[str, Any]:
-        return {
+        payload = {
             "poi_selection": self.to_dict(),
             "selection_source": self.selection_source,
             "selection_fallback_reason": self.selection_fallback_reason,
         }
+        if self.execution_observation is not None:
+            payload["execution_observation"] = self.execution_observation
+        return payload
 
 
 @dataclass(frozen=True)
@@ -135,24 +154,8 @@ def _unique_positive_ids(values: Sequence[int]) -> list[int]:
 
 
 def _preference_match(candidate: CandidatePlace, preferences: Sequence[str]) -> bool:
-    preference_terms = {
-        str(preference).strip().casefold()
-        for preference in preferences
-        if str(preference).strip()
-    }
-    if not preference_terms:
-        return False
-    candidate_terms = {
-        candidate.name.strip().casefold(),
-        candidate.place_type.strip().casefold(),
-        *(str(tag).strip().casefold() for tag in candidate.category_tags),
-    }
-    return any(
-        preference in candidate_term or candidate_term in preference
-        for preference in preference_terms
-        for candidate_term in candidate_terms
-        if candidate_term
-    )
+    return any(explicit_candidate_matches_dimension(candidate, dim)
+               for dim in scoring_dimension_ids(preferences))
 
 
 def _candidate_contract(
@@ -229,6 +232,10 @@ def build_poi_selection_input(
         qualified_ordinary_count=len(ordinary_ids),
         target_count=target_count,
     )
+    if v2:
+        ordinary_ids = [p.place_id for p in order_preference_candidates(
+            [candidates_by_id[pid] for pid in ordinary_ids], trip_request,
+            initial_candidates=[candidates_by_id[pid] for pid in must_ids])]
     input_ordinary_ids = ordinary_ids[:input_count]
     eligible_ids = [*input_ordinary_ids, *must_ids]
 
@@ -254,7 +261,8 @@ def build_poi_selection_input(
                 **_candidate_contract(candidates_by_id[pid], must_include=pid in must_id_set,
                                       preferences=trip_request.preferences).model_dump(),
                 latitude=candidates_by_id[pid].latitude, longitude=candidates_by_id[pid].longitude,
-                adcode=candidates_by_id[pid].adcode, visit_profile=build_visit_profile(candidates_by_id[pid]),
+                adcode=candidates_by_id[pid].adcode, visit_profile=build_visit_profile(candidates_by_id[pid]).model_dump(include={
+                    "place_id", "visit_minutes", "basis", "source", "confidence", "uncertainty_minutes", "singleton_eligible", "policy_version"}),
                 experience=selector_experience_lines(candidates_by_id[pid]),
             ) for pid in eligible_ids],
         )
@@ -346,6 +354,42 @@ def validate_poi_selection_result(
     return result
 
 
+def _culture_coverage(selector_input: PoiSelectionInput, selected_ids: Sequence[int]) -> dict[str, Any]:
+    if (selector_input.schema_version != "1.1"
+            or CULTURE not in scoring_dimension_ids(selector_input.request.preferences)):
+        return {"status": "NOT_REQUESTED", "required": False, "match_place_ids": []}
+    matches = [c.place_id for c in selector_input.candidates
+               if explicit_candidate_matches_dimension(c, CULTURE)]
+    chosen = [pid for pid in matches if pid in set(selected_ids)]
+    if chosen:
+        status = "COVERED"
+    elif not matches:
+        status = "NO_ELIGIBLE_MATCH"
+    elif selector_input.constraints.ordinary_max_count == 0:
+        status = "NO_ORDINARY_CAPACITY"
+    else:
+        status = "MISSING"
+    # Compatibility observation only; ordinary culture is no longer admission.
+    return {"status": status, "required": False,
+            "match_place_ids": matches, "selected_match_ids": chosen}
+
+
+def _selector_prompt_input(selector_input: PoiSelectionInput) -> dict[str, Any]:
+    payload = selector_input.model_dump(mode="json")
+    if selector_input.schema_version == "1.1":
+        payload["preference_contribution_minutes"] = {
+            str(c.place_id): {dim: c.visit_profile.visit_minutes
+                if explicit_candidate_matches_dimension(c, dim) else 0
+                for dim in scoring_dimension_ids(selector_input.request.preferences)}
+            for c in selector_input.candidates}
+        payload["preference_matches"] = {
+            dim: [c.place_id for c in selector_input.candidates
+                  if explicit_candidate_matches_dimension(c, dim)]
+            for dim in scoring_dimension_ids(selector_input.request.preferences)
+        }
+    return payload
+
+
 def build_deterministic_fallback(
     selector_input: PoiSelectionInput,
 ) -> PoiSelectionResult:
@@ -357,12 +401,7 @@ def build_deterministic_fallback(
         for place_id in selector_input.constraints.eligible_place_ids
         if place_id not in must_id_set
     ]
-    if selector_input.schema_version == "1.1":
-        by_id = {c.place_id: c for c in selector_input.candidates}
-        ordinary_ids.sort(key=lambda pid: (
-            "PREFERENCE_MATCH" not in by_id[pid].allowed_preference_tags,
-            by_id[pid].visit_profile.visit_minutes if selector_input.request.pace == "relaxed" else 0,
-        ))
+    # Preserve the same multi-preference order supplied to the Selector.
     ordinary_ids = ordinary_ids[:selector_input.constraints.ordinary_target_count]
     result_type = PoiSelectionResultV11 if selector_input.schema_version == "1.1" else PoiSelectionResult
     fallback = result_type(
@@ -401,6 +440,7 @@ def _system_prompt(schema_version: str = "1.0") -> str:
             "singleton_eligible 仅是允许独占一天的资格，具体分天由 Route 决定。"
             "只能选择 eligible_place_ids，必须包含全部 must_include_place_ids；"
             "普通数量必须在 ordinary_min_count 与 ordinary_max_count 之间（含边界）。"
+            "preference_matches 是统一的候选偏好身份依据，preference_contribution_minutes 是候选预计贡献，不是最终活动满足证明。优先补充当前组合较少体现的用户选择，同一真实活动可同时符合多项；夜景仍须落实晚间安排。不能通过无关游览、增加点数或名义时长制造达标。按整趟主要游览内容符合用户选择排序，兼顾节奏、负荷和交通；不能靠一个匹配景点代表整趟达标。普通偏好允许有依据的权衡，不是每类至少一个的硬配额。"
             "place_id 必须唯一，preference_tags 只能取对应 allowed_preference_tags。"
             "不输出分天、日期、时段、交通、事实、评分、理由或额外字段。"
             '严格输出 {"schema_version":"1.1","selected":[{"place_id":101,"preference_tags":[]}]}。'
@@ -430,11 +470,50 @@ async def _call_selector_model(
     ):
         return await llm.chat_with_usage(
             _system_prompt(selector_input.schema_version),
-            json.dumps(selector_input.model_dump(mode="json"), ensure_ascii=False),
+            json.dumps(_selector_prompt_input(selector_input), ensure_ascii=False),
             role="selector",
             temperature=float(settings.selector_temperature),
             json_mode=True,
         )
+
+
+async def _call_v012_selector_model(
+    selector_input: PoiSelectionInput,
+    *,
+    budget: SharedCallBudget,
+) -> tuple[str, dict[str, Any]]:
+    settings = get_settings()
+    from src.agents.generation_model_routing import table_endpoint
+    from src.model_routes import agent_route
+    primary = table_endpoint(settings, agent="selector", slot="primary")
+    backup = table_endpoint(settings, agent="selector", slot="backup")
+    result_type = (
+        PoiSelectionResultV11
+        if selector_input.schema_version == "1.1"
+        else PoiSelectionResult
+    )
+
+    def validate_candidate(raw: str) -> None:
+        parsed = result_type.model_validate(json.loads(raw))
+        validate_poi_selection_result(parsed, selector_input)
+
+    response = await route_selector(
+        enforce_runtime=True,
+        primary=primary,
+        official_ds=backup,
+        system=_system_prompt(selector_input.schema_version),
+        user=json.dumps(_selector_prompt_input(selector_input), ensure_ascii=False),
+        budget=budget,
+        max_tokens=1600,
+        temperature=float(settings.selector_temperature),
+        content_validator=validate_candidate,
+        backup_delay_seconds=agent_route("selector").switch_seconds,
+    )
+    return response.text, {
+        "provider": response.endpoint.provider,
+        "model": response.endpoint.model,
+        "call_sequence": response.call_sequence,
+    }
 
 
 def _unpack_call_result(
@@ -454,6 +533,8 @@ def _record_usage(metrics: PoiSelectionMetrics, usage: dict[str, Any]) -> None:
     metrics.prompt_tokens = int(usage.get("token_input", 0) or 0)
     metrics.completion_tokens = int(usage.get("token_output", 0) or 0)
     metrics.total_tokens = metrics.prompt_tokens + metrics.completion_tokens
+    sequence = usage.get("call_sequence")
+    metrics.adopted_call_sequence = int(sequence) if sequence is not None else None
 
 
 def _finish_metrics(
@@ -467,6 +548,7 @@ def _finish_metrics(
         item.place_id in must_ids for item in result.selected
     )
     metrics.ordinary_selected_count = metrics.selected_count - metrics.must_include_selected_count
+    metrics.culture_coverage = _culture_coverage(selector_input, [item.place_id for item in result.selected])
 
 
 async def _cancel_and_wait(task: asyncio.Future[Any]) -> None:
@@ -480,22 +562,57 @@ async def select_pois(
     *,
     workflow_deadline_monotonic: float,
     call: SelectorCall | None = None,
+    generation_policy_version: str = "legacy",
     monotonic: Callable[[], float] = time.monotonic,
 ) -> PoiSelectionExecution:
     """Attempt exactly one bounded call and otherwise return the whole fallback."""
     fallback = build_deterministic_fallback(selector_input)
     metrics = PoiSelectionMetrics()
-    budget = selector_budget_seconds(
-        workflow_deadline_monotonic=float(workflow_deadline_monotonic),
-        monotonic_now=float(monotonic()),
+    now = float(monotonic())
+    budget = (
+        max(0.0, min(
+            SELECTOR_MAX_SECONDS,
+            float(workflow_deadline_monotonic) - now - V012_FINALIZATION_RESERVE_SECONDS,
+        ))
+        if generation_policy_version == "v0.12"
+        else selector_budget_seconds(
+            workflow_deadline_monotonic=float(workflow_deadline_monotonic),
+            monotonic_now=now,
+        )
     )
     metrics.selector_budget_seconds = budget
     if budget <= 0.0 or not selector_input.candidates:
+        if generation_policy_version == "v0.12":
+            metrics.execution_observation = project_execution_observation(
+                [],
+                role="selector",
+                purpose="POI_SELECTOR",
+                state=(
+                    "NOT_ATTEMPTED" if not selector_input.candidates
+                    else "CALL_REJECTED"
+                ),
+                reason_code=(
+                    "NO_CANDIDATES" if not selector_input.candidates
+                    else "DEADLINE_EXHAUSTED"
+                ),
+            ).model_dump(mode="json")
         _finish_metrics(metrics, fallback, selector_input)
         return PoiSelectionExecution(fallback, metrics)
 
     metrics.attempted = True
-    caller = call or _call_selector_model
+    shared_budget: SharedCallBudget | None = None
+    if call is not None:
+        caller = call
+    elif generation_policy_version == "v0.12":
+        shared_budget = SharedCallBudget(
+            deadline_monotonic=float(monotonic()) + budget,
+            max_calls=2,
+        )
+
+        async def caller(value):
+            return await _call_v012_selector_model(value, budget=shared_budget)
+    else:
+        caller = _call_selector_model
     task: asyncio.Future[Any] | None = None
     started = monotonic()
     try:
@@ -506,6 +623,17 @@ async def select_pois(
             await _cancel_and_wait(task)
         metrics.selection_fallback_reason = "TIMEOUT"
         metrics.validation_failures = ["selector_timeout"]
+        if shared_budget is not None:
+            metrics.execution_observation = project_execution_observation(
+                shared_budget.calls,
+                role="selector",
+                purpose="POI_SELECTOR",
+                state=("FALLBACK_USED" if shared_budget.calls else "CALL_REJECTED"),
+                reason_code=(
+                    shared_budget.calls[-1].get("error_code")
+                    if shared_budget.calls else "DEADLINE_EXHAUSTED"
+                ),
+            ).model_dump(mode="json")
         logger.warning("POI_SELECTOR timed out; using deterministic fallback")
         _finish_metrics(metrics, fallback, selector_input)
         return PoiSelectionExecution(fallback, metrics)
@@ -518,6 +646,17 @@ async def select_pois(
             await _cancel_and_wait(task)
         metrics.selection_fallback_reason = "CALL_FAILED"
         metrics.validation_failures = [f"selector_call_failed:{type(exc).__name__}"]
+        if shared_budget is not None:
+            metrics.execution_observation = project_execution_observation(
+                shared_budget.calls,
+                role="selector",
+                purpose="POI_SELECTOR",
+                state=("FALLBACK_USED" if shared_budget.calls else "CALL_REJECTED"),
+                reason_code=(
+                    shared_budget.calls[-1].get("error_code")
+                    if shared_budget.calls else "CONFIG_UNAVAILABLE"
+                ),
+            ).model_dump(mode="json")
         logger.warning(
             "POI_SELECTOR call failed; using deterministic fallback (%s)",
             type(exc).__name__,
@@ -525,6 +664,8 @@ async def select_pois(
         _finish_metrics(metrics, fallback, selector_input)
         return PoiSelectionExecution(fallback, metrics)
     finally:
+        if shared_budget is not None:
+            metrics.route_calls = list(shared_budget.calls)
         if metrics.latency_ms <= 0:
             metrics.latency_ms = max(0, int((monotonic() - started) * 1000))
 
@@ -539,11 +680,27 @@ async def select_pois(
             if isinstance(exc, PoiSelectionValidationError)
             else [f"invalid_call_output:{type(exc).__name__}"]
         )
+        if shared_budget is not None:
+            metrics.execution_observation = project_execution_observation(
+                shared_budget.calls,
+                role="selector",
+                purpose="POI_SELECTOR",
+                state="FALLBACK_USED",
+                reason_code="SCHEMA_INVALID",
+            ).model_dump(mode="json")
         _finish_metrics(metrics, fallback, selector_input)
         return PoiSelectionExecution(fallback, metrics)
 
     metrics.succeeded = True
     metrics.selection_source = "LLM"
     metrics.selection_fallback_reason = None
+    if shared_budget is not None:
+        metrics.execution_observation = project_execution_observation(
+            shared_budget.calls,
+            role="selector",
+            purpose="POI_SELECTOR",
+            state="MODEL_SUCCEEDED",
+            adopted_call_sequence=metrics.adopted_call_sequence,
+        ).model_dump(mode="json")
     _finish_metrics(metrics, selected, selector_input)
     return PoiSelectionExecution(selected, metrics)

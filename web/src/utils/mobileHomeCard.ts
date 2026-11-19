@@ -35,10 +35,8 @@ export function selectMobileHomeCard(
 
 /** 已完成任务去详情页；生成中或失败的任务去等待页（等待页已有重试入口） */
 export function mobileHomeCardTarget(task: StoredTripTask): string {
-  if (task.status === "ready" && task.resultRecordId) {
+  if ((task.status === "ready" || task.status === "no_route") && task.resultRecordId) {
     return `/result/${task.resultRecordId}?job_id=${task.jobId}`;
   }
   return `/planning/${task.jobId}`;
 }
-
-

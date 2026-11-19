@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import copy
 import hashlib
 import json
-import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -111,7 +112,149 @@ class GenerationIssue(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+BODY_REVIEW_OUTPUT_EXAMPLE = {
+    "issues": [{"category": "REPAIR",
+        "reason": "unsupported_fact_expansion", "plan_index": None, "day": None,
+        "place_id": None, "names": [], "snippet": "待定位的正文原句",
+        "evidence": "问题及授权依据", "tags": [], "side_effects": []}],
+    "overall_notes": "整体审核意见",
+    "body_assessments": [{"id": "逐项复制 requirement.id", "status": "supported",
+        "reason": "核对了哪些正文与安排，是否发现矛盾",
+        "evidence": [{"id": "本次证据编号"}]}],
+    "issue_resolutions": [{"id": "逐项复制 previous_issues.id", "status": "still_present",
+        "reason": "原问题当前状态", "evidence": [{"id": "本次全文证据编号"}]}],
+}
+
+
+class BodyReviewReceipt(BaseModel):
+    """Internal result bound by the program to one complete review input."""
+
+    snapshot: str
+    assessments: dict[str, dict[str, Any]]
+    activities: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    issue_resolutions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class SemanticReviewIssues(list):
+    """Preserve the existing issue-list API while carrying mandatory assessments."""
+
+    def __init__(self, issues, body_review: BodyReviewReceipt):
+        super().__init__(issues)
+        self.body_review = body_review
+
+
+def body_review_snapshot(context: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+def review_issue_id(issue: GenerationIssue) -> str:
+    return body_review_snapshot(issue.model_dump(mode="json"))[:24]
+
+
+def materialize_body_review_actions(data: dict[str, Any], issue_policy) -> dict[str, Any]:
+    """Use the existing issue policy for disposition; do not alter model judgments.
+
+    Only the complete-body Review path uses this adapter. Legacy schema checks
+    and deterministic gate actions remain unchanged.
+    """
+    prepared = copy.deepcopy(data)
+    rows = prepared.get("issues")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue  # The existing strict parser reports malformed issues.
+            row.pop("publish_action", None)
+            issue = issue_policy(row)
+            if issue is not None:
+                row["publish_action"] = issue.publish_action
+    return prepared
+
+
+def validate_body_review(data: dict[str, Any], context: dict[str, Any]) -> BodyReviewReceipt:
+    """Validate completeness/evidence, never infer meaning from keywords.
+
+    A valid receipt is evidence of what Review assessed, not proof of model accuracy.
+    The caller must retain deterministic fact, membership and budget gates.
+    v0.13 closeout: only consistency is asked; any legacy ``activities`` field
+    in a model return is ignored rather than allowed to void the receipt.
+    """
+    data = copy.deepcopy(data)  # Never rewrite saved model returns or caller data.
+    expected = {item["id"]: item for item in context["requirements"]}
+    sources = context["sources"]
+    rows = data.get("body_assessments")
+    if not isinstance(rows, list):
+        raise ValueError("body_assessments missing: body has not been evaluated")
+    checked = {}
+
+    def evidence_refs(row, allowed, field="evidence"):
+        refs = row.get(field)
+        if not isinstance(refs, list):
+            raise ValueError("evidence must be a list")
+        resolved = []
+        for ref in refs:
+            if isinstance(ref, dict) and "id" in ref:
+                if set(ref) != {"id"} or not isinstance(ref["id"], str):
+                    raise ValueError("evidence id cannot override source or quote")
+                unit = context.get("evidence_index", {}).get(ref["id"])
+                if not isinstance(unit, dict):
+                    raise ValueError("unknown or stale evidence id")
+                source, start, end = unit.get("source"), unit.get("start"), unit.get("end")
+                if (source not in sources or type(start) is not int or type(end) is not int
+                        or not 0 <= start < end <= len(sources[source])):
+                    raise ValueError("invalid current evidence index")
+                ref = {"source": source, "quote": sources[source][start:end]}
+            if not isinstance(ref, dict) or ref.get("source") not in allowed:
+                raise ValueError("evidence belongs to another requirement")
+            quote = ref.get("quote")
+            if not isinstance(quote, str) or not quote.strip() or quote not in sources[ref["source"]]:
+                raise ValueError("evidence quote is absent from current source")
+            resolved.append(ref)
+        row[field] = resolved
+        return resolved
+
+    for row in rows:
+        if not isinstance(row, dict) or row.get("id") not in expected or row["id"] in checked:
+            raise ValueError("unknown or duplicate assessment")
+        requirement = expected[row["id"]]
+        status = row.get("status")
+        if status not in {"supported", "missing", "unknown"}:
+            raise ValueError("invalid assessment status")
+        if not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            raise ValueError("assessment requires an explanation")
+        refs = evidence_refs(row, requirement["sources"])
+        if status != "unknown" and not refs:
+            raise ValueError("decisive assessment requires current evidence")
+        if requirement["kind"] == "consistency" and status == "missing":
+            distinct = {(ref["source"], ref["quote"]) for ref in refs}
+            if len(distinct) < 2 or not any(ref["source"].startswith(("plan:", "summary:")) for ref in refs):
+                raise ValueError("contradiction requires both conflicting passages, including current prose")
+        checked[row["id"]] = row
+    if checked.keys() != expected.keys():
+        raise ValueError("mandatory body assessment omitted")
+    prior = {item["id"]: item for item in context.get("previous_issues", [])}
+    resolutions = data.get("issue_resolutions")
+    if not isinstance(resolutions, list):
+        raise ValueError("issue_resolutions missing")
+    closed = {}
+    for row in resolutions:
+        if not isinstance(row, dict) or row.get("id") not in prior or row["id"] in closed:
+            raise ValueError("unknown or duplicate previous issue")
+        if row.get("status") not in {"resolved", "still_present", "incorrect"}:
+            raise ValueError("invalid previous issue resolution")
+        if not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            raise ValueError("previous issue requires explicit explanation")
+        if not evidence_refs(row, prior[row["id"]]["sources"]):
+            raise ValueError("previous issue closure requires current evidence")
+        closed[row["id"]] = row
+    if closed.keys() != prior.keys():
+        raise ValueError("previous issue disappeared without explicit resolution")
+    return BodyReviewReceipt(snapshot=body_review_snapshot(context), assessments=checked,
+        issue_resolutions=closed)
+
+
 class IssueTaxonomyResult(BaseModel):
+    body_review: BodyReviewReceipt | None = None
     issues: list[GenerationIssue] = Field(default_factory=list)
     repair_target_plan_indexes: list[int] = Field(default_factory=list)
     fail_closed_reasons: list[str] = Field(default_factory=list)
@@ -445,6 +588,14 @@ def _budget_issues(
             elif (
                 day.commute_minutes > day.budget_minutes
                 and day.status != "relaxed_exception"
+                # Locked routes were already checked before Writer. A v2 day
+                # re-ran the old feasibility rules. A model day was accepted by
+                # the new planner. Either way, the soft daily budget must not
+                # become a hard limit again while validating prose.
+                and not (
+                    day.status == "within_budget"
+                    and day.reason in {"locked_route_v2", "locked_model_route"}
+                )
             ):
                 issues.append(GenerationIssue(
                     source="deterministic",
@@ -459,9 +610,11 @@ def _budget_issues(
     return issues
 
 
-def _evidence_text(retrieval: RetrievalResult) -> str:
+def _evidence_text(retrieval: RetrievalResult, *, place_id: int | None = None) -> str:
     chunks: list[str] = []
     for candidate in retrieval.candidates:
+        if place_id is None or place_id not in {candidate.place_id, candidate.canonical_place_id}:
+            continue
         chunks.append(candidate.name)
         for raw in [*candidate.top_reasons, *candidate.warnings]:
             if isinstance(raw, dict):
@@ -474,7 +627,6 @@ def _unsupported_fact_issues(
     retrieval: RetrievalResult,
     attachment_auth_map: FoodAttachmentAuthMap | None = None,
 ) -> list[GenerationIssue]:
-    evidence = _evidence_text(retrieval)
     issues: list[GenerationIssue] = []
     for plan_index, plan in enumerate(plans, 1):
         classifier_text = mask_authorized_food_prose(
@@ -484,18 +636,24 @@ def _unsupported_fact_issues(
         )
         if plan.accommodation is not None or plan.transport is not None:
             classifier_text = mask_accommodation_prefix_for_route_scan(
-                classifier_text
+                classifier_text,
+                accommodation=plan.accommodation,
+                code_lodging_section=getattr(plan, "code_lodging_section", "") or "",
             )
         for fact_reason, match in unsupported_fact_pattern_matches(classifier_text):
             snippet = match.group(0)
-            if snippet and snippet in evidence:
-                continue
             hard_fact = has_hard_fact_marker(snippet)
             fragment = fragment_for_span(
                 plan,
                 start=match.start(),
                 end=match.end(),
             )
+            # Unregistered prose has no POI evidence authority. Do not borrow
+            # facts from unrelated retrieval candidates, before or after repair.
+            evidence = _evidence_text(retrieval,
+                place_id=fragment.place_id if fragment is not None else None)
+            if snippet and snippet in evidence:
+                continue
             action_key = (
                 {
                     "plan_index": fragment.plan_index,
@@ -790,6 +948,7 @@ def collect_deterministic_generation_issues(
     weather_advisory_payload: WeatherAdvisoryPayload | None = None,
     attachment_auth_map: FoodAttachmentAuthMap | None = None,
     accommodation: AccommodationSuggestion | None = None,
+    body_semantics_by_review: bool = False,
 ) -> list[GenerationIssue]:
     from src.agents import publish_gate
 
@@ -828,17 +987,7 @@ def collect_deterministic_generation_issues(
         route_plans=route_plans,
         attachment_auth_map=attachment_auth_map,
         accommodation=accommodation,
+        body_semantics_by_review=body_semantics_by_review,
     )
     issues.extend(map_publish_findings_to_issues(publish_result.findings))
     return issues
-
-
-def body_review_snapshot(payload: dict) -> str:
-    """Stable fingerprint of one review context. Not a secret."""
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def review_issue_id(issue: GenerationIssue) -> str:
-    raw = json.dumps(issue.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]

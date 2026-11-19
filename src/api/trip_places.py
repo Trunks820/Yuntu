@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import text
 
+from src.agents.itinerary_lines import strip_itinerary
 from src.api.poi_catalog import (
+    CATALOG_EXCLUDED_PLACE_TYPES,
+    CATALOG_SCAN_BATCH_SIZE,
     PoiCatalogResponse,
     PoiCatalogValidationError,
     PoiSelectionResponse,
+    SelectablePoi,
+    _CATALOG_COLUMNS_SQL,
+    _CATALOG_ELIGIBILITY_SQL,
+    _project_selectable_poi,
+    _require_non_negative_int,
+    is_catalog_eligible,
     normalize_catalog_city,
     query_poi_catalog,
     query_poi_selection,
@@ -112,6 +121,27 @@ class PlaceListResponse(BaseModel):
     places: list[PlaceListItem] = Field(default_factory=list)
 
 
+class PoiInspirationPlace(SelectablePoi):
+    gallery: list[GalleryImage] = Field(min_length=1, max_length=6)
+
+
+class PoiInspirationResponse(BaseModel):
+    ok: Literal[True] = True
+    city: str
+    places: list[PoiInspirationPlace] = Field(default_factory=list)
+    next_after_id: int | None = None
+
+
+class PoiInspirationCity(BaseModel):
+    city: str
+    place_count: int = Field(ge=1)
+
+
+class PoiInspirationCitiesResponse(BaseModel):
+    ok: Literal[True] = True
+    cities: list[PoiInspirationCity] = Field(default_factory=list)
+
+
 def _coerce_json(raw: Any, default: Any) -> Any:
     if raw is None:
         return default
@@ -171,11 +201,14 @@ def _extract_detail_text(item: Any) -> str:
     return _clean_detail_text(item)
 
 
-def _detail_items(raw: Any) -> list[str]:
+def _detail_items(raw: Any, *, reasons: bool = False) -> list[str]:
     items: list[str] = []
     seen: set[str] = set()
     for item in _json_list(raw):
         cleaned = _extract_detail_text(item)
+        if reasons:
+            # v0.15.1: a blogger's day route ("Day1：A→B→C") is not a reason.
+            cleaned = _clean_detail_text(strip_itinerary(cleaned))
         if not cleaned or cleaned in seen:
             continue
         seen.add(cleaned)
@@ -213,6 +246,169 @@ def _gallery_items(raw: Any) -> list[GalleryImage]:
     return items
 
 
+# Keep the active-image aggregation identical for detail and inspiration reads.
+_ACTIVE_GALLERY_SQL = """
+                    COALESCE((
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'asset_id', image.asset_id,
+                                'position', image.position,
+                                'alt_text', image.alt_text,
+                                'desktop', jsonb_build_object(
+                                    'url', image.desktop_url,
+                                    'width', image.desktop_width,
+                                    'height', image.desktop_height
+                                ),
+                                'mobile', jsonb_build_object(
+                                    'url', image.mobile_url,
+                                    'width', image.mobile_width,
+                                    'height', image.mobile_height
+                                ),
+                                'thumb', jsonb_build_object(
+                                    'url', image.thumb_url,
+                                    'width', image.thumb_width,
+                                    'height', image.thumb_height
+                                )
+                            ) ORDER BY image.position
+                        )
+                        FROM travel_canonical_place_image AS image
+                        WHERE image.place_id = c.place_id AND image.active = TRUE
+                    ), '[]'::jsonb)
+"""
+
+
+_INSPIRATION_SCAN_SQL = text(
+    f"""
+                SELECT
+{_CATALOG_COLUMNS_SQL},
+{_ACTIVE_GALLERY_SQL} AS gallery
+                FROM travel_canonical_place AS c
+                JOIN travel_city AS city
+                  ON city.canonical_name = c.city AND city.status = 'ACTIVE'
+                WHERE c.city = :city
+                  AND c.place_id > :after_id
+{_CATALOG_ELIGIBILITY_SQL}
+                  AND EXISTS (
+                      SELECT 1 FROM travel_canonical_place_image AS image
+                      WHERE image.place_id = c.place_id AND image.active = TRUE
+                  )
+                ORDER BY c.place_id ASC
+                LIMIT :batch_limit
+    """
+)
+
+
+_INSPIRATION_CITIES_SCAN_SQL = text(
+    f"""
+                SELECT
+{_CATALOG_COLUMNS_SQL},
+{_ACTIVE_GALLERY_SQL} AS gallery
+                FROM travel_canonical_place AS c
+                JOIN travel_city AS city
+                  ON city.canonical_name = c.city AND city.status = 'ACTIVE'
+                WHERE c.place_id > :after_id
+{_CATALOG_ELIGIBILITY_SQL}
+                  AND EXISTS (
+                      SELECT 1 FROM travel_canonical_place_image AS image
+                      WHERE image.place_id = c.place_id AND image.active = TRUE
+                  )
+                ORDER BY c.place_id ASC
+                LIMIT :batch_limit
+    """
+)
+
+
+def _project_inspiration_place(row: Any, *, city: str) -> PoiInspirationPlace | None:
+    if not is_catalog_eligible(row, city=city):
+        return None
+    gallery = _gallery_items(getattr(row, "gallery", []))
+    if not gallery:
+        return None
+    return PoiInspirationPlace(
+        **_project_selectable_poi(row).model_dump(), gallery=gallery
+    )
+
+
+async def query_poi_inspiration(
+    *, city: str, after_id: int = 0, limit: int = 8
+) -> PoiInspirationResponse:
+    canonical_city = normalize_catalog_city(city)
+    cursor = _require_non_negative_int(after_id, field="after_id")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+        raise PoiCatalogValidationError("limit must be 1..20")
+    needed = limit + 1
+    batch_limit = max(needed, CATALOG_SCAN_BATCH_SIZE)
+    collected: list[PoiInspirationPlace] = []
+
+    async with get_session_factory()() as session:
+        while len(collected) < needed:
+            result = await session.execute(
+                _INSPIRATION_SCAN_SQL,
+                {
+                    "city": canonical_city,
+                    "after_id": cursor,
+                    "batch_limit": batch_limit,
+                    "excluded_types": list(CATALOG_EXCLUDED_PLACE_TYPES),
+                },
+            )
+            rows = list(result.fetchall())
+            if not rows:
+                break
+            cursor = int(rows[-1].place_id)
+            for row in rows:
+                item = _project_inspiration_place(row, city=canonical_city)
+                if item is not None:
+                    collected.append(item)
+                    if len(collected) == needed:
+                        break
+            if len(rows) < batch_limit:
+                break
+
+    page = collected[:limit]
+    return PoiInspirationResponse(
+        city=canonical_city,
+        places=page,
+        next_after_id=page[-1].place_id if len(collected) > limit else None,
+    )
+
+
+async def query_poi_inspiration_cities() -> PoiInspirationCitiesResponse:
+    cursor = 0
+    counts: dict[str, int] = {}
+    async with get_session_factory()() as session:
+        while True:
+            result = await session.execute(
+                _INSPIRATION_CITIES_SCAN_SQL,
+                {
+                    "after_id": cursor,
+                    "batch_limit": CATALOG_SCAN_BATCH_SIZE,
+                    "excluded_types": list(CATALOG_EXCLUDED_PLACE_TYPES),
+                },
+            )
+            rows = list(result.fetchall())
+            if not rows:
+                break
+            cursor = int(rows[-1].place_id)
+            for row in rows:
+                city = str(row.city).strip()
+                if _project_inspiration_place(row, city=city) is None:
+                    continue
+                counts[city] = counts.get(city, 0) + 1
+                if len(counts) > 200:
+                    raise HTTPException(
+                        status_code=500, detail="too many inspiration cities"
+                    )
+            if len(rows) < CATALOG_SCAN_BATCH_SIZE:
+                break
+
+    return PoiInspirationCitiesResponse(
+        cities=[
+            PoiInspirationCity(city=city, place_count=count)
+            for city, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        ]
+    )
+
+
 def _coordinate_within_hotlist_city(row: Any, *, city: str) -> bool:
     bounds = HOT_LIST_CITY_BOUNDS.get(city)
     if bounds is None:
@@ -245,7 +441,7 @@ def _assert_displayable(row: Any) -> None:
 
 def project_place_detail(row: Any) -> PlaceDetailResponse:
     _assert_displayable(row)
-    top_reasons = _detail_items(row.top_reasons)
+    top_reasons = _detail_items(row.top_reasons, reasons=True)
     warnings = _detail_items(row.warnings)
     summary = (
         _short_text(top_reasons[0], limit=MAX_SUMMARY_LENGTH) if top_reasons else ""
@@ -288,7 +484,7 @@ def _is_list_displayable(row: Any, *, city: str) -> bool:
 
 
 def project_place_list_item(row: Any) -> PlaceListItem:
-    top_reasons = _detail_items(row.top_reasons)
+    top_reasons = _detail_items(row.top_reasons, reasons=True)
     summary = (
         _short_text(top_reasons[0], limit=MAX_SUMMARY_LENGTH) if top_reasons else ""
     )
@@ -382,7 +578,7 @@ async def get_place_detail(place_id: int) -> PlaceDetailResponse | None:
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                text("""
+                text(f"""
                 SELECT
                     c.place_id,
                     c.canonical_name AS name,
@@ -400,32 +596,7 @@ async def get_place_detail(place_id: int) -> PlaceDetailResponse | None:
                     COALESCE(s.warnings, '[]'::jsonb) AS warnings,
                     COALESCE(s.source_count, 0) AS source_count,
                     COALESCE(s.mention_count_30d, 0) AS mention_count_30d,
-                    COALESCE((
-                        SELECT jsonb_agg(
-                            jsonb_build_object(
-                                'asset_id', image.asset_id,
-                                'position', image.position,
-                                'alt_text', image.alt_text,
-                                'desktop', jsonb_build_object(
-                                    'url', image.desktop_url,
-                                    'width', image.desktop_width,
-                                    'height', image.desktop_height
-                                ),
-                                'mobile', jsonb_build_object(
-                                    'url', image.mobile_url,
-                                    'width', image.mobile_width,
-                                    'height', image.mobile_height
-                                ),
-                                'thumb', jsonb_build_object(
-                                    'url', image.thumb_url,
-                                    'width', image.thumb_width,
-                                    'height', image.thumb_height
-                                )
-                            ) ORDER BY image.position
-                        )
-                        FROM travel_canonical_place_image AS image
-                        WHERE image.place_id = c.place_id AND image.active = TRUE
-                    ), '[]'::jsonb) AS gallery
+{_ACTIVE_GALLERY_SQL} AS gallery
                 FROM travel_canonical_place AS c
                 LEFT JOIN travel_place_summary AS s
                   ON s.canonical_place_id = c.place_id
@@ -499,13 +670,13 @@ def _poi_catalog_http_error(exc: PoiCatalogValidationError) -> HTTPException:
     return HTTPException(status_code=422, detail=str(exc))
 
 
-async def _canonical_poi_catalog_city(city: str) -> str:
+async def _canonical_poi_catalog_city(city: str, *, active_only: bool = False) -> str:
     try:
         requested = normalize_catalog_city(city)
     except PoiCatalogValidationError as exc:
         raise _poi_catalog_http_error(exc) from exc
     resolved = await resolve_city(requested)
-    if resolved is None:
+    if resolved is None or (active_only and resolved.status != "ACTIVE"):
         raise HTTPException(
             status_code=404,
             detail={
@@ -514,6 +685,32 @@ async def _canonical_poi_catalog_city(city: str) -> str:
             },
         )
     return resolved.canonical_name
+
+
+@router.get(
+    "/trip/poi-inspiration/cities", response_model=PoiInspirationCitiesResponse
+)
+@internal_router.get(
+    "/trip/poi-inspiration/cities", response_model=PoiInspirationCitiesResponse
+)
+async def internal_poi_inspiration_cities() -> PoiInspirationCitiesResponse:
+    return await query_poi_inspiration_cities()
+
+
+@router.get("/trip/poi-inspiration", response_model=PoiInspirationResponse)
+@internal_router.get("/trip/poi-inspiration", response_model=PoiInspirationResponse)
+async def internal_poi_inspiration(
+    city: str = Query(...),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=8, ge=1, le=20),
+) -> PoiInspirationResponse:
+    canonical_city = await _canonical_poi_catalog_city(city, active_only=True)
+    try:
+        return await query_poi_inspiration(
+            city=canonical_city, after_id=after_id, limit=limit
+        )
+    except PoiCatalogValidationError as exc:
+        raise _poi_catalog_http_error(exc) from exc
 
 
 @router.get("/trip/poi-catalog", response_model=PoiCatalogResponse)

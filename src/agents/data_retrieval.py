@@ -12,60 +12,16 @@ from src.agents.diversity import (
     is_specific_place_name,
     rank_candidates,
 )
+from src.agents.preferences import food_preference_active, is_food_partition_place
 from src.agents.schema import CandidatePlace, RetrievalResult, TripRequest
 from src.pipeline.db import get_session_factory
+from src.pipeline.visit_duration import aggregate_visit_duration_facts, load_canonical_duration_facts
 
 logger = logging.getLogger(__name__)
 
 MAX_QUALIFIED_POOL_SIZE = 500
 MAX_ROUTE_PLANNING_CANDIDATES = 120
 
-_PLACE_TYPE_PREFERENCE_DIMENSIONS = {
-    # English/generic food intent. Chinese meal phrases live under "meal"
-    # so "本地小吃" does not get satisfied by cafes filling the route.
-    "food": {
-        "markers": ("food",),
-        "place_types": ("restaurant", "food", "snack", "dessert", "market"),
-    },
-    "meal": {
-        "markers": ("本地小吃", "小吃", "美食", "吃饭", "餐厅", "火锅", "吃"),
-        "place_types": ("restaurant", "food", "snack", "market"),
-    },
-    "cafe": {
-        "markers": ("咖啡", "咖啡店", "咖啡馆", "cafe"),
-        "place_types": ("cafe",),
-    },
-    "night_view": {
-        "markers": ("夜景", "夜晚", "夜间", "灯光"),
-        "place_types": ("photo_spot", "attraction"),
-    },
-    "neighborhood": {
-        "markers": ("生活街区", "街区", "市井", "烟火气"),
-        "place_types": ("business_area", "market", "other"),
-    },
-    "photo": {
-        "markers": ("拍照", "打卡", "photo"),
-        "place_types": ("photo_spot", "attraction"),
-    },
-    "shopping": {
-        "markers": ("逛街", "购物"),
-        "place_types": ("business_area", "market"),
-    },
-    "park": {
-        "markers": ("公园", "园林"),
-        "place_types": ("park", "garden"),
-    },
-    "museum": {
-        "markers": ("博物馆", "博物院", "美术馆", "museum"),
-        "place_types": ("museum",),
-    },
-    "lodging": {
-        "markers": ("住宿", "酒店"),
-        "place_types": ("hotel",),
-    },
-}
-
-_FOOD_PLACE_TYPES = {"restaurant", "food", "cafe", "snack", "dessert", "market"}
 _ADMIN_SUFFIXES = ("市", "区", "县")
 
 # Semantic avoid: when user says e.g. "不要太网红", expand to concrete POI names.
@@ -105,31 +61,9 @@ END AS top_reasons
 """.strip()
 
 
-def preference_place_type_dimensions(
-    preferences: list[str],
-) -> dict[str, set[str]]:
-    """Map explicit preferences to reusable place-type dimensions."""
-    preference_text = " ".join(preferences).lower()
-    dimensions: dict[str, set[str]] = {}
-    for dimension, rule in _PLACE_TYPE_PREFERENCE_DIMENSIONS.items():
-        markers = rule["markers"]
-        if any(marker.lower() in preference_text for marker in markers):
-            dimensions[dimension] = set(rule["place_types"])
-    return dimensions
-
-
-def preferred_place_types(preferences: list[str]) -> set[str]:
-    """Map user preferences to place_type values for deterministic boosting."""
-    return {
-        place_type
-        for place_types in preference_place_type_dimensions(preferences).values()
-        for place_type in place_types
-    }
-
-
 def is_food_place(place: CandidatePlace) -> bool:
     """Check if a place is food-related."""
-    return place.place_type in _FOOD_PLACE_TYPES
+    return is_food_partition_place(place)
 
 
 def _json_list(value: Any) -> list:
@@ -178,6 +112,7 @@ def _admissible_canonical_candidate(candidate: CandidatePlace, *, city: str) -> 
 def _candidate_from_row(row: Any, *, must_include: bool = False) -> CandidatePlace:
     place_id = int(row.place_id)
     return CandidatePlace(
+        city=getattr(row, "city", None), address=getattr(row, "address", None),
         place_id=place_id,
         canonical_place_id=place_id,
         name=str(row.name),
@@ -240,6 +175,47 @@ def _candidate_from_row(row: Any, *, must_include: bool = False) -> CandidatePla
     )
 
 
+async def _hydrate_visit_durations(session, candidates: list[CandidatePlace]) -> None:
+    """Hydrate the merged canonical pool once; keep admission/ranking intact."""
+    by_id = {candidate.canonical_place_id or candidate.place_id: candidate for candidate in candidates}
+    buckets = await load_canonical_duration_facts(session, canonical_ids=list(by_id))
+    for candidate in candidates:
+        bucket = buckets.get(candidate.canonical_place_id or candidate.place_id)
+        candidate.arrangement_evidence = list(bucket.get("arrangements", [])) if bucket else []
+        observation = bucket.get("observation") if bucket else None
+        if candidate.typical_visit_source in {"manual", "amap"}:
+            if observation is not None:
+                candidate.typical_visit_observation = observation.to_public_dict()
+                candidate.typical_visit_candidate_count = observation.candidate_count
+                candidate.typical_visit_accepted_count = observation.accepted_count
+                candidate.typical_visit_reject_reasons = [
+                    item.reason_code for item in observation.rejected
+                ]
+            continue
+        aggregate = (aggregate_visit_duration_facts(
+            bucket["facts"],
+            place_name=bucket["name"],
+            place_type=bucket["place_type"],
+            observation=observation,
+        ) if bucket else None)
+        if observation is not None:
+            candidate.typical_visit_observation = observation.to_public_dict()
+            candidate.typical_visit_candidate_count = observation.candidate_count
+            candidate.typical_visit_accepted_count = observation.accepted_count
+            candidate.typical_visit_reject_reasons = [
+                item.reason_code for item in observation.rejected
+            ]
+        candidate.typical_visit_applicable = aggregate is not None
+        candidate.typical_visit_fact_count = aggregate.fact_count if aggregate else 0
+        if aggregate:
+            candidate.typical_visit_minutes = aggregate.minutes
+            candidate.typical_visit_source = aggregate.source
+            candidate.typical_visit_confidence = aggregate.confidence
+        elif candidate.typical_visit_source == "xhs_median":
+            candidate.typical_visit_minutes = None
+            candidate.typical_visit_confidence = None
+
+
 def balance_candidate_types(
     candidates: list[CandidatePlace],
     limit: int,
@@ -249,11 +225,7 @@ def balance_candidate_types(
     if not candidates or limit <= 0:
         return []
 
-    is_food_focused = any(
-        keyword in pref.lower()
-        for pref in preferences
-        for keyword in ("美食", "吃", "food", "火锅", "小吃", "餐厅")
-    )
+    is_food_focused = food_preference_active(preferences)
     food_places = [candidate for candidate in candidates if is_food_place(candidate)]
     activities = [candidate for candidate in candidates if not is_food_place(candidate)]
     food_ratio = 0.40 if is_food_focused else 0.27
@@ -304,7 +276,7 @@ async def query(
                 SELECT
                     c.place_id,
                     c.canonical_name AS name,
-                    c.place_type,
+                    c.place_type, c.city, c.address,
                     c.district,
                     c.latitude,
                     c.longitude,
@@ -372,7 +344,7 @@ async def query(
                     SELECT
                         c.place_id,
                         c.canonical_name AS name,
-                        c.place_type,
+                        c.place_type, c.city, c.address,
                         c.district,
                         c.latitude,
                         c.longitude,
@@ -419,34 +391,30 @@ async def query(
             )
             fetched_pinned_rows.extend(pinned_result.fetchall())
 
-    seen_names: set[str] = set()
-    candidates: list[CandidatePlace] = []
-    for row in rows:
-        name = str(row.name)
-        if name in seen_names:
-            continue
-        seen_names.add(name)
-        candidate = _candidate_from_row(row, must_include=int(row.place_id) in pinned_id_set)
-        if _admissible_canonical_candidate(candidate, city=city):
-            candidates.append(candidate)
-    by_place_id = {candidate.place_id: candidate for candidate in candidates}
-    for row in fetched_pinned_rows:
-        candidate = _candidate_from_row(row, must_include=True)
-        if (
-            candidate.place_id not in by_place_id
-            and _admissible_canonical_candidate(candidate, city=city)
-        ):
-            by_place_id[candidate.place_id] = candidate
-            candidates.append(candidate)
-    for candidate in candidates:
-        if candidate.place_id in pinned_id_set:
-            candidate.must_include = True
+        seen_names: set[str] = set()
+        candidates: list[CandidatePlace] = []
+        for row in rows:
+            name = str(row.name)
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            candidate = _candidate_from_row(row, must_include=int(row.place_id) in pinned_id_set)
+            if _admissible_canonical_candidate(candidate, city=city):
+                candidates.append(candidate)
+        by_place_id = {candidate.place_id: candidate for candidate in candidates}
+        for row in fetched_pinned_rows:
+            candidate = _candidate_from_row(row, must_include=True)
+            if (
+                candidate.place_id not in by_place_id
+                and _admissible_canonical_candidate(candidate, city=city)
+            ):
+                by_place_id[candidate.place_id] = candidate
+                candidates.append(candidate)
+        for candidate in candidates:
+            if candidate.place_id in pinned_id_set:
+                candidate.must_include = True
 
-    candidates = rank_candidates(
-        candidates,
-        recent_place_id_sets=recent_place_id_sets,
-        preferred_place_types=preferred_place_types(trip_request.preferences),
-    )
+        await _hydrate_visit_durations(session, candidates)
 
     avoid_keywords = [keyword.lower() for keyword in trip_request.avoid]
 
@@ -467,6 +435,13 @@ async def query(
                 or any(name in candidate.name.lower() for name in expanded_avoid_names)
             )
         ]
+
+    candidates = rank_candidates(
+        candidates,
+        recent_place_id_sets=recent_place_id_sets,
+        preferences=trip_request.preferences,
+        trip_request=trip_request,
+    )
 
     qualified_candidate_count = len(candidates)
     route_planning_candidates = list(candidates[:MAX_ROUTE_PLANNING_CANDIDATES])

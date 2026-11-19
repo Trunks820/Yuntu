@@ -16,11 +16,12 @@ interface MapViewProps {
   onMarkerClick?: (placeId: number) => void;
 }
 
+// 与全局色板一致（src/index.css 的 --yt-*）：旧绿旧橙已收敛
 const MODE_COLOR: Record<string, string> = {
-  walking: "#0f766e",
-  transit: "#1d9e91",
-  taxi: "#f97316",
-  driving: "#1d9e91",
+  walking: "#143c35",
+  transit: "#166c5b",
+  taxi: "#a35b48",
+  driving: "#166c5b",
 };
 
 export function MapView({
@@ -292,17 +293,17 @@ function updateMarkers(
       placedPins.push({ lng: place.longitude, lat: place.latitude, yShift });
 
       const bg = isActive
-        ? (isAllDays ? palette.dark : "#0c625b")
-        : (isAllDays ? palette.primary : (isAnchor ? "#0f766e" : "#fb923c"));
+        ? (isAllDays ? palette.dark : "#143c35")
+        : (isAllDays ? palette.primary : (isAnchor ? "#166c5b" : "#b57e6b"));
 
       const dotWidth = isAllDays ? (label.length > 4 ? 40 : 34) : (isActive ? 30 : 24);
       const dotHeight = isAllDays ? 22 : (isActive ? 30 : 24);
       const borderRadius = isAllDays ? "11px" : "50%";
       const ring = isActive ? 3 : 2;
       const nameWeight = isActive ? 700 : 600;
-      const nameColor = isActive ? (isAllDays ? palette.dark : "#0a4f49") : "#374151";
+      const nameColor = isActive ? (isAllDays ? palette.dark : "#0f2f2a") : "#374151";
       const nameBg = isActive ? (isAllDays ? palette.lightBg : "#eef9f7") : "rgba(255,255,255,.96)";
-      const nameBorder = isActive ? (isAllDays ? palette.border : "#6ec6bb") : "#e5e7eb";
+      const nameBorder = isActive ? (isAllDays ? palette.border : "#c4dbcb") : "#e5e7eb";
       const baseZIndex = isActive ? 500 : (100 + currentDay.day * 20 + i);
 
       const marker = new AMap.Marker({

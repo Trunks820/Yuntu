@@ -9,7 +9,12 @@ from src.agents.pace import (
     single_leg_max_minutes,
 )
 from src.agents.route_planning import _legs, _nearest_neighbor, _within_budget
-from src.agents.route_feasibility import DayContext, evaluate_day, POLICY_VERSION
+from src.agents.route_feasibility import (
+    DayContext,
+    access_status,
+    evaluate_day,
+    POLICY_VERSION,
+)
 from src.agents.schema import (
     BudgetDayResult,
     BudgetResult,
@@ -233,6 +238,43 @@ def _resolve_ordered_day(
     )
 
 
+def _model_route_day_facts_consistent(day) -> bool:
+    """Facts only. Old load, leg and day-structure limits are not a veto."""
+    fact = day.day_feasibility
+    if fact is None:
+        return False
+    ids = [place.place_id for place in day.places]
+    if list(fact.ordered_place_ids) != ids:
+        return False
+    if [(leg.from_place_id, leg.to_place_id) for leg in day.commute_legs] != list(zip(ids, ids[1:])):
+        return False
+    poi_minutes = sum(int(leg.duration_minutes) for leg in day.commute_legs)
+    if int(fact.poi_commute_minutes) != poi_minutes:
+        return False
+    access_total = sum(int(leg.duration_minutes) for leg in day.access_legs)
+    if day.access_legs:
+        access = {leg.direction: leg for leg in day.access_legs}
+        anchors = {
+            (leg.anchor_source, leg.anchor_latitude, leg.anchor_longitude)
+            for leg in day.access_legs
+        }
+        if (
+            len(day.access_legs) != 2
+            or set(access) != {"outbound", "inbound"}
+            or not ids
+            or access["outbound"].place_id != ids[0]
+            or access["inbound"].place_id != ids[-1]
+            or len(anchors) != 1
+            or fact.access_minutes != access_total
+        ):
+            return False
+    elif fact.access_minutes is not None:
+        return False
+    if fact.access_status != access_status(day.access_legs):
+        return False
+    return int(day.commute_minutes) == poi_minutes + access_total
+
+
 def resolve_route_budgets(
     route_plans: list[RoutePlan],
     request: TripRequest,
@@ -250,10 +292,26 @@ def resolve_route_budgets(
     )
     results: list[BudgetResult] = []
     for route_plan in route_plans:
+        if route_plan.planner_source == "model":
+            days = []
+            for day in route_plan.day_groups:
+                consistent = _model_route_day_facts_consistent(day)
+                days.append(BudgetDayResult(
+                    day=day.day,
+                    status="within_budget" if consistent else "infeasible",
+                    budget_minutes=(
+                        day.traffic_policy.daily_limit_minutes
+                        if day.traffic_policy else budget_minutes
+                    ),
+                    commute_minutes=day.commute_minutes,
+                    reason="locked_model_route" if consistent else "model_route_fact_mismatch",
+                ))
+            results.append(BudgetResult(plan_label=route_plan.label, days=days))
+            continue
         if route_plan.route_policy_version == POLICY_VERSION:
             days = []
             for day in route_plan.day_groups:
-                check = evaluate_day(day.places, day.commute_legs, day.access_legs, DayContext(request, settings, day.traffic_policy))
+                check = evaluate_day(day.places, day.commute_legs, day.access_legs, DayContext(request, settings, day.traffic_policy, day.time_policy, tuple(day.visit_profiles)))
                 # Read-only verification: stored load and order must match the locked facts.
                 valid = check.feasible and check == day.day_feasibility and day.commute_minutes == check.poi_commute_minutes + (check.access_minutes or 0)
                 days.append(BudgetDayResult(day=day.day, status="within_budget" if valid else "infeasible",

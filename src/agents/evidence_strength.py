@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from src.agents.itinerary_lines import strip_itinerary
 from src.agents.schema import (
     CandidatePlace,
     CompositionBlueprint,
@@ -686,7 +687,13 @@ def _place_payload(
     signals: list[EvidenceSignal] = []
 
     for reason in place.top_reasons:
-        signal = _classify_signal(_reason_text(reason), "top_reason")
+        # v0.15.1: a blogger's day route says nothing about this place; keep
+        # only a useful tail after it (src/agents/itinerary_lines.py).
+        text_value = strip_itinerary(_reason_text(reason))
+        if not text_value:
+            _add_count(not_authorized_reasons, "itinerary_route")
+            continue
+        signal = _classify_signal(text_value, "top_reason")
         signals.append(signal)
         if signal.strength == "direct_fact":
             direct_facts.append(signal.text)
@@ -859,7 +866,7 @@ def _authorized_actions_for_role(
         )
     if role == "photo_stop":
         return (
-            "[INTERNAL 写作指引，勿输出] 拍照停留点，写出怎么取景、怎么找角度的具体建议，不要用模板句",
+            "[INTERNAL 写作指引，勿输出] 拍照停留点，优先结合本站授权素材说明可看的对象与拍摄行动；材料不足就简短，不用取景步骤凑篇幅",
         )
     if role in {"anchor_activity", "anchor"}:
         return (
@@ -902,7 +909,7 @@ def _fact_free_activity_actions(
         )
     if normalized_type == "photo_spot" or "拍照" in tags:
         return (
-            "[INTERNAL 写作指引，勿输出] 拍照点，写出怎么找角度、怎么取景的具体建议",
+            "[INTERNAL 写作指引，勿输出] 拍照点，结合本站授权素材说明拍摄对象；没有具体材料就简短给出行动，不靠重复取景步骤扩写",
         )
     if any(
         marker in tags
@@ -963,7 +970,9 @@ def deterministic_actions_for_place(place: CandidatePlace) -> tuple[str, ...]:
         return ("挑选感兴趣的主题参观，结合展品说明了解内容",)
     if kind == "park":
         return ("选择适合体力的路线散步，途中按需休息",)
-    if kind in {"street", "business_area", "commercial_area"}:
+    if kind in {"business_area", "commercial_area"}:
+        return ("沿街步行，观察沿途建筑的外观与细节", "沿商铺浏览，按需挑选商品")
+    if kind in {"street", "heritage_district", "historic_district", "historic_street"}:
         return ("沿街步行，观察沿途建筑的外观与细节",)
     if kind == "photo_spot":
         return ("选择取景方向，调整构图后拍摄",)
@@ -981,6 +990,11 @@ def authorized_actions_for_place(
 ) -> tuple[str, ...]:
     """Combine role permissions with type-aware, fact-free activity guidance."""
     base = _authorized_actions_for_role(role, meal_slot)
+    normalized_type = (place.place_type or "").strip().lower()
+    if normalized_type == "market" and role == "meal_stop":
+        # The same market owns both activities. Preserve the locked meal
+        # slot; no additional stop, time allocation or food fact is granted.
+        return tuple(dict.fromkeys([*base, *deterministic_actions_for_place(place)]))
     if role in {
         "meal_stop",
         "snack_stop",
@@ -989,11 +1003,11 @@ def authorized_actions_for_place(
         "transfer_context",
     }:
         return base
-    normalized_type = (place.place_type or "").strip().lower()
     meal_type_actions = {
         "restaurant": ("按需用餐与休整",),
         "cafe": ("咖啡或茶歇", "坐下休息"),
         "snack": ("小吃或甜品补给",),
+        "snack_shop": ("小吃或甜品补给",),
     }.get(normalized_type, ())
     if meal_type_actions:
         # The place type is authoritative for Activity wording even when the

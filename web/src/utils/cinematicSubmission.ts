@@ -1,10 +1,10 @@
-import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 import { generateFingerprint } from "./pendingSubmission";
 
 export const CINEMATIC_SUBMISSION_KEY = "yuntu-cinematic-submission-v1";
 
 // Separate from the old homepage: a pending request is not login consent.
-export function saveCinematicSubmission(form: TripFormData, owner: string) {
+export function saveCinematicSubmission(form: TripSubmitRequest, owner: string) {
   const fingerprint = generateFingerprint(form);
   let existing: { owner?: string; fingerprint?: string; request_id?: string } | null = null;
   try {

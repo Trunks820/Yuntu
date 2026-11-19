@@ -216,7 +216,10 @@ def find_food_rule_violations(
             ))
 
         if tier == "structural":
-            tier_match = FOOD_STRUCTURAL_EXPERIENCE_RE.search(span.content)
+            # the restaurant's own name is no review: "雀食府好吃街"
+            name = authorization.food_name
+            content = span.content.replace(name, "") if name else span.content
+            tier_match = FOOD_STRUCTURAL_EXPERIENCE_RE.search(content)
             if tier_match is not None:
                 violations.append(FoodRuleViolation(
                     reason="food_tier_exceeded",

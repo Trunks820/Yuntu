@@ -7,10 +7,20 @@ import type {
   JobResponse,
   JobStatus,
   PlaceDetail,
+  PublicGenerationDelivery,
+  StageProgress,
   TripResult,
 } from "@/types/trip";
+import type { HistoryResponse } from "@/types/auth";
+
 import { mapBackendStage, STAGE_MAP, TOTAL_STAGES } from "@/constants/stages";
 import { getConversationId } from "@/utils/session";
+import {
+  queryGuestHistoryTrips,
+  recordGuestJobStatus,
+  recordGuestSubmittedTrip,
+  recordGuestTripResult,
+} from "@/utils/guestTripHistory";
 import {
   mockSubmitTrip,
   mockPollJobStatus,
@@ -18,11 +28,15 @@ import {
 } from "./mock";
 
 import { ApiRequestError } from "./errors";
+import { isValidTripJobId } from "@/utils/tripJobId";
 export { ApiRequestError };
 
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === "true";
 
+/**
+ * 底层 HTTP 请求（开源免登录直连模式）
+ */
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -31,7 +45,15 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
       headers: { "Content-Type": "application/json" },
       ...options,
     });
-  } catch {
+  } catch (err: unknown) {
+    if (
+      (typeof DOMException !== "undefined" &&
+        err instanceof DOMException &&
+        err.name === "AbortError") ||
+      (err instanceof Error && err.name === "AbortError")
+    ) {
+      throw new ApiRequestError("TIMEOUT", "请求超时，请检查网络后重试", 504);
+    }
     throw new ApiRequestError("NETWORK_ERROR", "网络连接失败，请检查网络", 0);
   }
 
@@ -67,6 +89,16 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return data as T;
 }
 
+/* ---------- 本地行程记录 API（开源版浏览器 localStorage） ---------- */
+
+export async function getHistoryTrips(params?: {
+  cursor?: string;
+  limit?: number;
+  status?: string;
+}): Promise<HistoryResponse> {
+  return queryGuestHistoryTrips(params);
+}
+
 /* ---------- 原始响应类型 ---------- */
 
 interface RawSubmitResponse {
@@ -82,10 +114,15 @@ interface RawJobStatus {
   job_id: string;
   status: string; // PENDING | RUNNING | SUCCESS | FAILED | TIMEOUT | REJECTED
   current_stage: string | null;
+  stage_progress?: StageProgress | null;
   error_message: string | null;
   error_code: string | null;
   result_record_id: number | null;
   plan_count: number | null;
+  /** v0.12: 生成策略版本 */
+  generation_policy_version?: string | null;
+  /** v0.12: BFF 公共交付投影 */
+  delivery?: PublicGenerationDelivery | null;
 }
 
 function mapStatus(raw: string): JobStatus {
@@ -108,58 +145,151 @@ function mapStatus(raw: string): JobStatus {
 /* ---------- 提交与任务 API ---------- */
 
 export async function submitTrip(
-  formData: TripFormData | TripSubmitRequest,
+  formData: TripSubmitRequest,
   requestId?: string,
 ): Promise<AsyncSubmitResponse> {
-  if (USE_MOCK) return mockSubmitTrip(formData);
+  if (USE_MOCK) {
+    const mockData: TripFormData = {
+      to_city: formData.to_city,
+      start_date: formData.start_date || "",
+      end_date: formData.end_date || "",
+      days: formData.days,
+      people_count: formData.people_count,
+      preferences: formData.preferences || [],
+      avoid: formData.avoid || [],
+      notes: formData.notes || "",
+      budget: formData.budget,
+      must_include: formData.must_include,
+      commute_mode: formData.commute_mode,
+      daily_start: formData.daily_start,
+      daily_end: formData.daily_end,
+      from_city: formData.from_city,
+      accommodation: formData.accommodation,
+    };
+    const res = await mockSubmitTrip(mockData);
+    if (res.job_id) {
+      recordGuestSubmittedTrip(res.job_id, formData);
+    }
+    return res;
+  }
 
-  const raw = await request<RawSubmitResponse>("/trip/async", {
-    method: "POST",
-    body: JSON.stringify({
-      trip_request: formData,
-      request_id: requestId || `web-${crypto.randomUUID()}`,
-      source: "web",
-      conversation_id: getConversationId(),
-    }),
-  });
-  return { ok: raw.ok, job_id: raw.job_id };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const raw = await request<RawSubmitResponse>("/trip/async", {
+      method: "POST",
+      signal: controller.signal,
+      body: JSON.stringify({
+        trip_request: formData,
+        source: "web",
+        conversation_id: getConversationId(),
+        request_id: requestId || `web-${crypto.randomUUID()}`,
+      }),
+    });
+    if (!isValidTripJobId(raw.job_id)) {
+      throw new ApiRequestError("BAD_RESPONSE", "未收到有效任务编号，请稍后重试", 502);
+    }
+    recordGuestSubmittedTrip(raw.job_id, formData);
+    return { ok: raw.ok, job_id: raw.job_id };
+  } catch (err: unknown) {
+    if (
+      (err instanceof ApiRequestError && err.code === "TIMEOUT") ||
+      (typeof DOMException !== "undefined" &&
+        err instanceof DOMException &&
+        err.name === "AbortError") ||
+      (err instanceof Error && err.name === "AbortError")
+    ) {
+      throw new ApiRequestError("TIMEOUT", "提交超时，提交结果待确认", 504);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
-export async function pollJobStatus(jobId: string): Promise<JobResponse> {
-  if (USE_MOCK) return mockPollJobStatus(jobId);
 
-  const raw = await request<RawJobStatus>(`/trip/jobs/${jobId}`);
-  const status = mapStatus(raw.status);
-  const code = mapBackendStage(raw.current_stage);
+export async function pollJobStatus(
+  jobId: string,
+  options?: { signal?: AbortSignal },
+): Promise<JobResponse> {
+  if (USE_MOCK) {
+    const mockJob = await mockPollJobStatus(jobId);
+    recordGuestJobStatus(jobId, mockJob);
+    return mockJob;
+  }
 
-  return {
-    ok: true,
-    job_id: raw.job_id,
-    status,
-    stage_progress: {
-      code,
-      step: STAGE_MAP[code].step,
-      total: TOTAL_STAGES,
-    },
-    result_record_id:
-      raw.result_record_id != null ? String(raw.result_record_id) : null,
-    error:
-      status === "FAILED"
-        ? {
-            code: raw.error_code ?? "GENERATION_FAILED",
-            message: raw.error_message ?? "生成失败，请稍后重试",
-          }
-        : null,
-  };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      controller.abort();
+    } else {
+      options.signal.addEventListener("abort", () => controller.abort(), {
+        once: true,
+      });
+    }
+  }
+
+  try {
+    const raw = await request<RawJobStatus>(`/trip/jobs/${jobId}`, {
+      signal: controller.signal,
+    });
+    recordGuestJobStatus(jobId, raw);
+    const status = mapStatus(raw.status);
+    let stageProgress: StageProgress | null = null;
+    if (
+      raw.stage_progress &&
+      typeof raw.stage_progress.step === "number" &&
+      typeof raw.stage_progress.total === "number"
+    ) {
+      stageProgress = raw.stage_progress;
+    } else if (raw.current_stage) {
+      const code = mapBackendStage(raw.current_stage);
+      stageProgress = {
+        code,
+        step: STAGE_MAP[code].step,
+        total: TOTAL_STAGES,
+      };
+    }
+
+    return {
+      ok: true,
+      job_id: raw.job_id,
+      status,
+      stage_progress: stageProgress,
+      result_record_id:
+        raw.result_record_id != null ? String(raw.result_record_id) : null,
+      error:
+        status === "FAILED"
+          ? {
+              code: raw.error_code ?? "GENERATION_FAILED",
+              message: raw.error_message ?? "生成失败，请稍后重试",
+            }
+          : null,
+      delivery: raw.delivery ?? null,
+      generation_policy_version: raw.generation_policy_version ?? null,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
+
 
 export async function fetchResult(
   resultId: string,
   jobId: string,
 ): Promise<TripResult> {
-  if (USE_MOCK) return mockFetchResult(resultId);
+  if (USE_MOCK) {
+    const mockResult = await mockFetchResult(resultId);
+    recordGuestTripResult(mockResult, jobId);
+    return mockResult;
+  }
   const qs = jobId ? `?job_id=${encodeURIComponent(jobId)}` : "";
-  return request<TripResult>(`/trip/results/${resultId}${qs}`);
+  const result = await request<TripResult>(`/trip/results/${resultId}${qs}`);
+  recordGuestTripResult(result, jobId);
+  return result;
 }
 
 export async function fetchPlaceDetail(placeId: number): Promise<PlaceDetail> {
@@ -268,4 +398,9 @@ export async function fetchArtifactBlob(
 }
 
 /* ---------- Destinations API ---------- */
+
+/**
+ * Fetch destinations from BFF API
+ * Returns list of available destinations with coordinates and metadata
+ */
 export { fetchDestinations } from "@/api/destinations";

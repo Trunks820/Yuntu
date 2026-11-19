@@ -16,7 +16,7 @@ const LEVEL_LABEL: Record<PaceLevel, string> = {
 const LEVEL_STYLE: Record<PaceLevel, string> = {
   RELAXED: "bg-primary-50 text-primary-700",
   MODERATE: "bg-accent-50 text-accent-700",
-  INTENSIVE: "bg-orange-50 text-orange-700",
+  INTENSIVE: "bg-accent-100 text-accent-800",
 };
 
 export function PaceIndicator({

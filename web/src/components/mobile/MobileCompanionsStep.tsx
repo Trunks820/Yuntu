@@ -226,5 +226,3 @@ export const MobileCompanionsStep: React.FC<MobileCompanionsStepProps> = ({
     </>
   );
 };
-
-

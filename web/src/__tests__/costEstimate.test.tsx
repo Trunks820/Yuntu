@@ -62,7 +62,8 @@ describe("v0.9.4 P6 Acceptance - CostEstimateCard Visual & Contract Refactor Tes
 
     expect(screen.getByText("部分预估")).toBeInTheDocument();
     expect(screen.getAllByText("2,400").length).toBeGreaterThan(0);
-    expect(screen.getByText("部分费用待确认")).toBeInTheDocument();
+    // C7：范围说明只在摘要头部显示一次，不再重复“部分费用待确认”
+    expect(screen.queryByText("部分费用待确认")).not.toBeInTheDocument();
   });
 
   test("[Req-3] mixed and policy_zero price basis labels render correctly", () => {

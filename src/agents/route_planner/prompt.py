@@ -17,6 +17,7 @@ from src.agents.preferences import (
 from src.agents.schema import CandidatePlace, TripRequest
 from src.agents.route_planner.rules import (
     PACE_SIGHT_HOURS,
+    POT_MEAL_MARKERS,
     WALK_CAP_MINUTES,
     dinner_earliest_minute,
     dinner_latest_minute,
@@ -49,6 +50,13 @@ def _dinner_window_text(latest: int) -> str:
     return f"17:00–{_fmt(latest)} 都行"
 
 
+def _hours_number(value: float | int) -> str:
+    number = float(value)
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:.1f}".rstrip("0").rstrip(".")
+
+
 def _day_segments(rules) -> list[str]:
     """Three blocks of a day, with hours computed from ``rules``.
 
@@ -69,6 +77,8 @@ def _day_segments(rules) -> list[str]:
         summer = (
             "其中 2–3 小时回住处歇（中午最热，午饭后排 kind=rest，16:00 以后再出门）。"
         )
+    if rules.pace_mode == "relaxed" and rules.require_day_rest:
+        return _relaxed_day_segments(rules, lines, summer)
     if not rules.dinner:
         afternoon = max(0, rules.end_minute - 13 * 60)
         lines.append(
@@ -93,6 +103,47 @@ def _day_segments(rules) -> list[str]:
         "晚上：晚饭约 1 小时。没夜景的天吃完可以直接回住处。"
         f"有夜景的天：天黑约 {_fmt(rules.dark_minute)}，"
         f"夜景最多待约 {max(raw_night, 30)} 分钟。"
+    )
+    if raw_night < 45:
+        evening += "这几天晚上很紧，夜景只排离晚饭近的一处。"
+    lines.append(evening)
+    return lines
+
+
+def _relaxed_day_segments(rules, lines: list[str], summer: str) -> list[str]:
+    """Relaxed urban rhythm: one morning place, a rest, wrap the afternoon."""
+    day_end = rules.relaxed_day_end_minute
+    day_end_text = _fmt(day_end) if day_end is not None else "17:30"
+    plain = rules.relaxed_return_plain_minute
+    if plain is None:
+        plain = rules.end_minute
+    # Sized so a first draft fits: the shared morning line ends with the main place.
+    lines[0] = lines[0].replace(
+        "上午排一个主要地点。",
+        "上午排一个主要地点，停留约 2 小时；上午没有合适的地点可以晚点出门、先吃午饭。",
+    )
+    if not rules.dinner:
+        afternoon = max(0, rules.end_minute - 13 * 60)
+        lines.append(
+            f"下午：午饭约 1 小时；午饭后歇 60–90 分钟；"
+            f"从约 13:00 到 {_fmt(rules.end_minute)} 回住处，"
+            f"可逛约 {_about_hours(afternoon)}。{summer}"
+        )
+        lines.append("晚上：这个时间窗不安排晚饭和夜景。")
+        return lines
+    night_dinner = dinner_earliest_minute(rules, has_night=True)
+    lines.append(
+        "下午：午饭约 1 小时；午饭后歇 60–90 分钟；"
+        f"下午最多再一个地点，停留 1.5–2 小时，{day_end_text} 前结束。"
+        f"{summer}"
+    )
+    raw_night = rules.end_minute - 30 - max(rules.dark_minute, night_dinner + 60)
+    evening = (
+        "晚上：晚饭约 1 小时。"
+        f"没夜景的天 {_fmt(plain)} 前回到住处。"
+        f"有夜景的天：天黑约 {_fmt(rules.dark_minute)}，"
+        f"夜景最多待约 {max(raw_night, 30)} 分钟，"
+        f"{_fmt(rules.end_minute)} 前回到住处。"
     )
     if raw_night < 45:
         evening += "这几天晚上很紧，夜景只排离晚饭近的一处。"
@@ -153,22 +204,22 @@ def _rule_pairs(rules) -> list[tuple[str, str]]:
             "必去点（候选里标【必去】）全部安排；彼此相近的放在同一天连着去。漏了会被打回。",
             "必去点都排上了",
         ))
-    if rules.family:
+    if rules.family and rules.family_candidate:
         pairs.append((
             "亲子出行：要有孩子能玩的地方（候选里标【亲子】的），整趟至少一处，有多处时分散到不同天。",
             "有孩子能玩的地方",
         ))
-    if rules.night:
+    if rules.night and rules.night_candidate:
         pairs.append((
             "用户想看夜景：整趟至少安排一处标【夜景】的地点，kind 写 night。",
             "有标【夜景】的点",
         ))
-    if rules.food:
+    if rules.food and rules.food_candidate:
         pairs.append((
             "用户喜欢美食：整趟至少一顿午饭或晚饭选网友提过的店（标【网友提过】的店），否则会被打回。",
             "有一顿网友提过的正餐",
         ))
-    if rules.tea:
+    if rules.tea and rules.tea_candidate:
         pairs.append((
             "用户想去茶馆喝茶：从标【茶馆】的地点挑一处，kind 写 snack，不要占午饭或晚饭。",
             "安排了茶馆喝茶",
@@ -177,11 +228,20 @@ def _rule_pairs(rules) -> list[tuple[str, str]]:
         f"一共 {rules.days} 天，day 从 1 到 {rules.days}，行程天数不对会被打回。",
         "行程天数对了",
     ))
-    pairs.append((
-        f"节奏{rules.pace_label}：每天最多 {rules.sight_limit} 个 sight/night"
-        f"（吃饭、小吃、歇脚不算）。超过{rules.pace_label}节奏的 {rules.sight_limit} 个会被打回。",
-        f"每天最多{rules.sight_limit}个游览点",
-    ))
+    if rules.day_sight_limit is not None:
+        night_cap = rules.night_limit if rules.night_limit is not None else 1
+        pairs.append((
+            f"节奏{rules.pace_label}：每天白天最多 {rules.day_sight_limit} 个 sight、"
+            f"晚上最多 {night_cap} 个 night"
+            f"（吃饭、小吃、歇脚不算）。超过会被打回。",
+            f"每天白天最多{rules.day_sight_limit}个景点、晚上最多{night_cap}个夜景",
+        ))
+    else:
+        pairs.append((
+            f"节奏{rules.pace_label}：每天最多 {rules.sight_limit} 个 sight/night"
+            f"（吃饭、小吃、歇脚不算）。超过{rules.pace_label}节奏的 {rules.sight_limit} 个会被打回。",
+            f"每天最多{rules.sight_limit}个游览点",
+        ))
     pairs.append((
         "每天至少有一个游览点；没有游览点会被打回。",
         "每天都有游览点",
@@ -200,7 +260,19 @@ def _rule_pairs(rules) -> list[tuple[str, str]]:
     ))
     meals = "每天安排午饭" + ("和晚饭" if rules.dinner else "") + "，选正经吃饭的店"
     meals += "（挑店时尽量离前后两站近；优先选标【网友提过】的店（候选清单里的饭店和【高德餐厅】都算），其次选高德评分高的）"
-    meals += "。咖啡馆、面包烘焙、甜品、冷饮、奶茶只能当小吃（snack），每天最多 1 个小吃。"
+    if rules.skip_unrequested_snacks and not rules.food:
+        meals += (
+            "。咖啡馆、面包烘焙、甜品、冷饮、奶茶只能当小吃（snack）。"
+            "轻松节奏不单独排小吃、下午茶。"
+        )
+        if rules.tea:
+            meals += "用户要的茶馆照排。"
+    else:
+        meals += "。咖啡馆、面包烘焙、甜品、冷饮、奶茶只能当小吃（snack），每天最多 1 个小吃。"
+    # Same-day pot meals are repaired once, then kept as a note. The sentence
+    # still sits with the meal rules the model has to follow on the first draft.
+    pot_names = "、".join(POT_MEAL_MARKERS)
+    meals += f"同一天的午饭和晚饭不要都是{pot_names}这类锅子。"
     meals += "午饭在 11:30–13:30 之间开始，不在饭点会被打回。"
     if rules.dinner:
         meals += (
@@ -209,10 +281,16 @@ def _rule_pairs(rules) -> list[tuple[str, str]]:
             f"晚饭最晚仍是 {_fmt(latest)}。"
         )
         meals += "缺少午饭或缺少晚饭会被打回。"
-        meal_check = "每天有正餐、饭点对、小吃最多1个"
+        if rules.skip_unrequested_snacks and not rules.food:
+            meal_check = "每天有正餐、饭点对、不单排小吃"
+        else:
+            meal_check = "每天有正餐、饭点对、小吃最多1个"
     else:
         meals += "缺少午饭会被打回。这个时间窗里不安排晚饭和夜景。"
-        meal_check = "每天有午饭、饭点对、小吃最多1个"
+        if rules.skip_unrequested_snacks and not rules.food:
+            meal_check = "每天有午饭、饭点对、不单排小吃"
+        else:
+            meal_check = "每天有午饭、饭点对、小吃最多1个"
     pairs.append((meals, meal_check))
     if rules.dinner:
         pairs.append((
@@ -223,11 +301,25 @@ def _rule_pairs(rules) -> list[tuple[str, str]]:
             f"{rules.city}这几天天黑约 {_fmt(rules.dark_minute)}，天还没黑就去看夜景会被打回。",
             "夜景在晚饭后天黑后、当天最后",
         ))
-    pairs.append((
-        f"每天 {_fmt(rules.start_minute)} 从住处出发，{_fmt(rules.end_minute)} 前回到住处。"
-        "回到住处超过这个时间会被打回。空等不能超过 1 小时。",
-        f"{_fmt(rules.end_minute)} 前回到住处、没有空等超过 1 小时",
-    ))
+    plain = rules.relaxed_return_plain_minute
+    if (
+        rules.pace_mode == "relaxed"
+        and plain is not None
+        and plain < rules.end_minute
+    ):
+        pairs.append((
+            f"每天 {_fmt(rules.start_minute)} 从住处出发。"
+            f"没排夜景的天 {_fmt(plain)} 前回到住处（城市日；改一次后仍超只记提示）；"
+            f"有夜景的天 {_fmt(rules.end_minute)} 前回到住处，超过会被打回。"
+            "空等不能超过 1 小时。",
+            f"{_fmt(rules.end_minute)} 前回到住处、没有空等超过 1 小时",
+        ))
+    else:
+        pairs.append((
+            f"每天 {_fmt(rules.start_minute)} 从住处出发，{_fmt(rules.end_minute)} 前回到住处。"
+            "回到住处超过这个时间会被打回。空等不能超过 1 小时。",
+            f"{_fmt(rules.end_minute)} 前回到住处、没有空等超过 1 小时",
+        ))
     pairs.append((
         f"单段步行不能超过 {WALK_CAP_MINUTES} 分钟。",
         f"单段步行不超过 {WALK_CAP_MINUTES} 分钟",
@@ -255,6 +347,10 @@ def _soft_rules(rules, *, lodging_first_name: str | None = None) -> list[str]:
     """
     rows: list[str] = []
     hours = PACE_SIGHT_HOURS[rules.pace_mode]
+    relaxed_listed = PACE_SIGHT_HOURS["relaxed"]
+    if rules.pace_mode == "relaxed":
+        hours = getattr(rules, "relaxed_sight_hours", hours)
+        relaxed_listed = hours
     rows.append("一天尽量 1–2 个相邻片区，最多 3 个。")
     rows.append(
         "每类地方逛多久：大型博物馆、故宫这一级宫殿、皇家园林、大景区 3 小时；"
@@ -262,11 +358,17 @@ def _soft_rules(rules, *, lodging_first_name: str | None = None) -> list[str]:
         "夜景 1–1.5 小时；观景台、打卡点半小时。候选行带了「常逛约 N 分钟」的以它为准。"
     )
     rows.append(
-        f"每天时间预算：景点、夜景停留合计尽量不超过 {hours} 小时"
-        "（轻松 6、适中 7、紧凑 8），不含吃饭、歇脚、路上。"
+        f"每天时间预算：景点、夜景停留合计尽量不超过 {_hours_number(hours)} 小时"
+        f"（轻松 {_hours_number(relaxed_listed)}、适中 7、紧凑 8），不含吃饭、歇脚、路上。"
     )
     rows.extend(_day_segments(rules))
-    rows.append("下午逛完离晚饭还早可以排 kind=rest 回住处歇。")
+    if rules.require_day_rest:
+        rows.append(
+            "轻松每天午饭后（或下午）安排一段 kind=rest，stay_minutes 60–90；"
+            "连续逛约 3 小时就该歇一下（吃饭、歇脚都算）。"
+        )
+    else:
+        rows.append("下午逛完离晚饭还早可以排 kind=rest 回住处歇。")
     if rules.family and rules.pace_mode == "relaxed":
         rows.append("亲子又要轻松：午饭后安排 kind=rest 回住处歇脚。")
     rows.append(
@@ -474,5 +576,3 @@ def candidate_block(
             line += _lodging_distance_suffix(place, lodging)
             lines.append(line)
     return "\n".join(lines)
-
-

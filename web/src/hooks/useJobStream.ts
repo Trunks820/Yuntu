@@ -11,6 +11,8 @@ interface UseJobStreamOptions {
   consecutiveErrorThreshold?: number;
   enabled?: boolean;
   timeoutMs?: number;
+  deadline?: number;
+  initialConsecutiveErrors?: number;
 }
 
 export function useJobStream({
@@ -19,9 +21,11 @@ export function useJobStream({
   onTimeout,
   onConsecutiveErrors,
   onInterrupted,
-  consecutiveErrorThreshold = 3,
+  consecutiveErrorThreshold: _threshold = 3,
   enabled = true,
   timeoutMs = 360_000,
+  deadline,
+  initialConsecutiveErrors = 0,
 }: UseJobStreamOptions) {
   const stoppedRef = useRef(false);
   const errCountRef = useRef(0);
@@ -47,13 +51,16 @@ export function useJobStream({
   useEffect(() => {
     if (!enabled || !jobId) return;
     stoppedRef.current = false;
-    errCountRef.current = 0;
+    errCountRef.current = initialConsecutiveErrors;
 
     function connect() {
       if (stoppedRef.current || !jobId) return;
 
       closeRef.current = subscribeJobStream(jobId, {
         onData(data) {
+          if (errCountRef.current > 0) {
+            onConsecutiveErrorsRef.current?.(0);
+          }
           errCountRef.current = 0;
           if (stoppedRef.current) return;
           const terminal = onDataRef.current(data);
@@ -62,9 +69,7 @@ export function useJobStream({
         onError() {
           if (stoppedRef.current) return;
           errCountRef.current++;
-          if (errCountRef.current >= consecutiveErrorThreshold) {
-            onConsecutiveErrorsRef.current?.(errCountRef.current);
-          }
+          onConsecutiveErrorsRef.current?.(errCountRef.current);
         },
         onInterrupted() {
           if (stoppedRef.current) return;
@@ -83,12 +88,24 @@ export function useJobStream({
       }
     }
 
+    const effectiveRemainingMs = deadline
+      ? Math.max(0, deadline - Date.now())
+      : timeoutMs;
+
+    if (effectiveRemainingMs <= 0) {
+      if (!stoppedRef.current) {
+        stop();
+        onTimeoutRef.current?.();
+      }
+      return;
+    }
+
     timerRef.current = setTimeout(() => {
       if (!stoppedRef.current) {
         stop();
         onTimeoutRef.current?.();
       }
-    }, timeoutMs);
+    }, effectiveRemainingMs);
 
     document.addEventListener("visibilitychange", handleVisibility);
     connect();
@@ -97,7 +114,9 @@ export function useJobStream({
       document.removeEventListener("visibilitychange", handleVisibility);
       stop();
     };
-  }, [enabled, jobId, consecutiveErrorThreshold, timeoutMs, stop]);
+    // timeoutMs 与 initialConsecutiveErrors 故意不作为依赖项，避免普通渲染或文案轮播重建健康的 SSE 连接
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, jobId, deadline, stop]);
 
   return { stop, errCountRef };
 }

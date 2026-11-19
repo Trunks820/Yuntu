@@ -7,7 +7,7 @@ import json
 import logging
 import time
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from datetime import date
 
@@ -47,6 +47,7 @@ from src.config import Settings
 from src.agents.route_planner.rules import (
     PlannerRules,
     build_rules,
+    preference_candidate_flags,
 )
 
 from src.agents.route_planner.places import (
@@ -74,7 +75,10 @@ from src.agents.route_planner.schedule import _idle_fill_counts
 
 from src.agents.route_planner.checks import (
     urban_commute_notes,
-    _soften_urban_commute_issues,
+    missing_preference_notes,
+    pot_meal_notes,
+    relaxed_pace_notes,
+    _issues_after_one_repair,
     _estimated_leg_count,
 )
 
@@ -162,6 +166,8 @@ class RoutePlannerCall:
     completion_tokens: int
     provider: str
     model: str
+    # Set when this call was answered (or failed) on the backup leg.
+    backup_reason: str = ""
 
 
 @dataclass
@@ -336,6 +342,18 @@ async def prepare_route(
     for rows in restaurants.values():
         for place in rows:
             by_id[place.place_id] = place
+    # Night, family and tea already include the kid and tea fetches. Food is
+    # different: a 【高德餐厅】 row with visitor text is a proper meal the
+    # check accepts, and a blank row is in amap_ids and is not. Recompute only
+    # that flag so a fetched shop named 夜景 does not become a night candidate.
+    meal_places = [
+        *pool,
+        *(place for rows in restaurants.values() for place in rows),
+    ]
+    rules = replace(
+        rules,
+        food_candidate=preference_candidate_flags(meal_places, amap_ids)["food_candidate"],
+    )
     usable_lodging = _usable_user_lodging(lodging_anchor)
     lodging_name = _user_lodging_name(usable_lodging) if usable_lodging is not None else None
     lodging_point = usable_lodging.suggestion if usable_lodging is not None else None
@@ -731,7 +749,7 @@ async def plan_route(
 
     async def caller(system: str, user: str):
         if model_caller is None:
-            return await _default_caller(system, user, settings)
+            return await _default_caller(system, user, settings, step_started=started)
         return await model_caller(system, user)
 
     try:
@@ -771,6 +789,7 @@ async def plan_route(
             hotel_query=hotel_query,
             hotel_cache=hotel_cache,
             preset_lodging=preset,
+            amap_ids=prepared.amap_ids,
         )
         by_id = dict(prepared.by_id)
         for rows in prepared.restaurants.values():
@@ -861,6 +880,7 @@ async def plan_route(
                 hotel_query=hotel_query,
                 hotel_cache=hotel_cache,
                 preset_lodging=preset,
+                amap_ids=prepared.amap_ids,
             )
             adjustments.extend(more)
             for day in arranged.get("days") or []:
@@ -869,12 +889,13 @@ async def plan_route(
                     if isinstance(place, CandidatePlace):
                         by_id[place.place_id] = place
             check_kw = {"lodge": lodge, "request": request, "settings": settings}
-            revised_issues = _soften_urban_commute_issues(
+            revised_issues = _issues_after_one_repair(
                 _route_planner_pkg.collect_issues(arranged, prepared.rules, by_id, prepared.amap_ids, **check_kw)
             )
-            # The first draft's only problems were city-day commute over the cap,
-            # and the repair introduced a real failure. Deliver the first draft.
-            if revised_issues and not _soften_urban_commute_issues(first_draft["issues"]):
+            # The first draft's only problems become notes after one repair
+            # (a city day over the cap, or a same-day pair of pot meals), and
+            # the repair introduced a real failure. Deliver the first draft.
+            if revised_issues and not _issues_after_one_repair(first_draft["issues"]):
                 arranged = first_draft["arranged"]
                 adjustments = list(first_draft["adjustments"])
                 adjustments.append("改稿后出现新问题，沿用第一稿")
@@ -894,6 +915,17 @@ async def plan_route(
                 lodging_rest_count, sight_extend_count = _idle_fill_counts(arranged)
         schedule_ms = int((time.perf_counter() - schedule_started) * 1000)
         for note in urban_commute_notes(arranged, prepared.rules, **check_kw):
+            if note not in adjustments:
+                adjustments.append(note)
+        for note in missing_preference_notes(prepared.rules):
+            if note not in adjustments:
+                adjustments.append(note)
+        for note in pot_meal_notes(arranged, by_id):
+            if note not in adjustments:
+                adjustments.append(note)
+        for note in relaxed_pace_notes(
+            arranged, prepared.rules, by_id, prepared.amap_ids, **check_kw
+        ):
             if note not in adjustments:
                 adjustments.append(note)
         adjustments = _noted(adjustments, marker)
@@ -955,5 +987,3 @@ async def plan_route(
         )
     finally:
         await _close_owned_provider(owned_provider)
-
-

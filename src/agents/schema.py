@@ -12,6 +12,7 @@ from pydantic import (
     StrictInt,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -119,34 +120,45 @@ class AccommodationRequest(BaseModel):
     longitude: float | None = None
 
 
-class LodgingDisplayNotice(BaseModel):
-    """One lodging sentence that is not a price band."""
-
-    kind: str
-    text: str = ""
-
-
 class LodgingDisplayGroup(BaseModel):
-    """One lodging tier or homestay row. Prices stay empty without a source."""
-
-    kind: str
+    kind: Literal["economy", "mid", "high", "homestay"]
     label: str
-    hotels: list[str] = Field(default_factory=list)
+    hotels: list[str]
     nightly_low_cny: int | None = None
     nightly_high_cny: int | None = None
 
+    @model_validator(mode="after")
+    def _nightly_prices_together(self) -> "LodgingDisplayGroup":
+        if (self.nightly_low_cny is None) != (self.nightly_high_cny is None):
+            raise ValueError(
+                "nightly_low_cny and nightly_high_cny must both be set or both be None"
+            )
+        return self
+
+
+class LodgingDisplayNotice(BaseModel):
+    kind: Literal["user_lodging_unmatched", "holiday"]
+    text: str
+
 
 class LodgingDisplay(BaseModel):
-    """Structured lodging paragraph. Missing sourced prices use 待核实."""
-
-    layout: Literal["user_lodging", "homestay", "tiers", "brands", "area_only"]
+    layout: Literal["tiers", "homestay", "brands", "user_lodging", "area_only"]
     area_label: str
     caption: str = ""
     groups: list[LodgingDisplayGroup] = Field(default_factory=list)
-    notices: list[LodgingDisplayNotice] = Field(default_factory=list)
     round_trip_minutes_low: int | None = None
     round_trip_minutes_high: int | None = None
-    price_status: Literal["sourced", "待核实"] = "待核实"
+    notices: list[LodgingDisplayNotice] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _round_trip_together(self) -> "LodgingDisplay":
+        if (self.round_trip_minutes_low is None) != (
+            self.round_trip_minutes_high is None
+        ):
+            raise ValueError(
+                "round_trip_minutes_low and round_trip_minutes_high must both be set or both be None"
+            )
+        return self
 
 
 class AccommodationSuggestion(BaseModel):
@@ -164,6 +176,13 @@ class AccommodationSuggestion(BaseModel):
     user_input_unmatched: str = ""
     display: LodgingDisplay | None = None
 
+    @model_serializer(mode="wrap")
+    def _omit_empty_display(self, handler):
+        payload = handler(self)
+        if payload.get("display") is None:
+            payload.pop("display", None)
+        return payload
+
 
 class AccommodationAnchor(BaseModel):
     suggestion: AccommodationSuggestion
@@ -180,6 +199,8 @@ class AccommodationPlanningContext(BaseModel):
 
 
 class DayTrafficPolicy(BaseModel):
+    urban_core: tuple[float, float] | None = None
+    companion_route_sources: dict[int, str] = Field(default_factory=dict)
     version: Literal["accommodation-route-v1"] = "accommodation-route-v1"
     day_kind: Literal["urban", "excursion", "unknown"]
     classification_basis: str
@@ -391,6 +412,16 @@ class CandidatePlace(BaseModel):
     typical_visit_minutes: int | None = None
     typical_visit_source: str | None = None
     typical_visit_confidence: float | None = None
+    # Runtime-only evidence receipt; never part of public result/prompt schemas.
+    typical_visit_applicable: bool = Field(default=False, exclude=True)
+    typical_visit_fact_count: int = Field(default=0, exclude=True)
+    typical_visit_candidate_count: int = Field(default=0, exclude=True)
+    typical_visit_accepted_count: int = Field(default=0, exclude=True)
+    typical_visit_reject_reasons: list[str] = Field(default_factory=list, exclude=True)
+    typical_visit_observation: dict = Field(default_factory=dict, exclude=True)
+    city: str | None = Field(default=None, exclude=True)
+    address: str | None = Field(default=None, exclude=True)
+    arrangement_evidence: list[dict] = Field(default_factory=list, exclude=True)
     mention_count: int = 0
     positive_count: int = 0
     negative_count: int = 0
@@ -408,6 +439,15 @@ class CandidatePlace(BaseModel):
     top_reasons: list[dict] = Field(default_factory=list)
     warnings: list[dict] = Field(default_factory=list)
     must_include: bool = False
+
+    @model_validator(mode="after")
+    def _reject_unhydrated_xhs_duration(self):
+        # All CandidatePlace consumers, including the legacy dwell path, see
+        # unknown until the source-bound retrieval batch admits evidence.
+        if self.typical_visit_source == "xhs_median" and not self.typical_visit_applicable:
+            self.typical_visit_minutes = None
+            self.typical_visit_confidence = None
+        return self
 
 
 class PoiSelectionRequest(BaseModel):
@@ -545,6 +585,44 @@ class PoiSelectionResult(BaseModel):
 class VisitProfile(BaseModel):
     """Normalized planning estimate; never written back as canonical evidence."""
     place_id: int
+    visit_minutes: int = Field(ge=0)
+    basis: Literal["canonical", "type_estimate", "full_day_evidence", "unresolved_play_style", "window_conflict"]
+    source: str | None = None
+    confidence: float | None = None
+    uncertainty_minutes: int = Field(ge=0)
+    singleton_eligible: bool = False
+    policy_version: Literal["selector-route-v2"] = "selector-route-v2"
+
+    arrangement: Literal["standard", "full_day"] = "standard"
+    play_style: dict | None = None
+    play_styles: list[dict] = Field(default_factory=list)
+    evidence: list[dict] = Field(default_factory=list)
+    nested_place_ids: list[int] = Field(default_factory=list)
+    contained_place_ids: list[int] = Field(default_factory=list)
+    arrangement_warnings: list[str] = Field(default_factory=list)
+
+
+class ExcursionTimePolicy(BaseModel):
+    version: Literal["excursion-time-v1", "urban-night-time-v1"] = "excursion-time-v1"
+    pace: Literal["relaxed", "default", "compact"]
+    start_minute: int
+    end_minute: int
+    start_source: Literal["system", "user"]
+    end_source: Literal["system", "user"]
+    reference_span_minutes: int
+    reference_start_minute: int | None = None
+    reference_end_minute: int | None = None
+    system_break_intervals: list[tuple[int, int]] = Field(default_factory=list)
+    original_daily_start: str | None = None
+    original_daily_end: str | None = None
+    original_rest_windows: list[dict] = Field(default_factory=list)
+    break_intervals: list[tuple[int, int]] = Field(default_factory=list)
+    break_minutes: int = 0
+    violations: list[str] = Field(default_factory=list)
+
+
+class SelectorVisitProfile(BaseModel):
+    place_id: int
     visit_minutes: int = Field(ge=15, le=480)
     basis: Literal["canonical", "type_estimate"]
     source: str | None = None
@@ -566,6 +644,11 @@ class AccessLeg(BaseModel):
     duration_minutes: int = Field(ge=0)
     distance_meters: int = Field(ge=0)
     estimate_policy_version: Literal["selector-route-v2"] = "selector-route-v2"
+    # INTERNAL durable walking-proof receipt. Survives model_dump/rebuild.
+    # Public Result 2.3 does not project access legs; writer/prompt omit it.
+    walk_proof_receipt: str | None = None
+    # Runtime-only alias of walk_proof_receipt. Excluded from persistence.
+    walk_proof_decision: str | None = Field(default=None, exclude=True)
 
 
 class DayFeasibility(BaseModel):
@@ -583,6 +666,7 @@ class DayFeasibility(BaseModel):
     singleton_eligible: bool = False
     precise_leg_count: int = 0
     estimated_leg_count: int = 0
+    break_minutes: int = 0
 
     @property
     def feasible(self) -> bool:
@@ -615,7 +699,7 @@ class PoiSelectionCandidateV11(PoiSelectionCandidate):
     latitude: float | None = None
     longitude: float | None = None
     adcode: str | None = None
-    visit_profile: VisitProfile
+    visit_profile: SelectorVisitProfile
     experience: list[Annotated[str, StringConstraints(max_length=80)]] = Field(default_factory=list, max_length=2)
 
 
@@ -816,11 +900,13 @@ class PlanOutput(BaseModel):
     transport: TransportSuggestion | None = None
     packing_checklist: list[PackingChecklistGroup] | None = None
     travel_tips: list[TravelTip] | None = None
-    code_lodging_section: str = ""
     poi_fragments: list[PoiNarrativeFragment] = Field(
         default_factory=list,
         exclude=True,
     )
+    # Exact code-written 【住宿】 block from this process. The publish gate
+    # exempts that span only; reloaded plan JSON does not carry it.
+    code_lodging_section: str = Field(default="", exclude=True)
 
     def poi_fragment(
         self,
@@ -900,6 +986,46 @@ class CommuteLeg(BaseModel):
     # Internal P2 fact only. Public projection ignores this field; P3 will
     # consume it before creating the immutable Cost Estimate Snapshot.
     fare_observation: SourceObservation | None = None
+    # INTERNAL durable walking-proof receipt. Survives model_dump/rebuild for
+    # point and access reuse. Public Result 2.3 and writer/prompt omit it.
+    # Never copy this value onto physical transit_steps.
+    walk_proof_receipt: str | None = None
+    # Runtime-only alias of walk_proof_receipt. Excluded from persistence.
+    walk_proof_decision: str | None = Field(default=None, exclude=True)
+
+
+StopKind = Literal["lunch", "dinner", "snack", "night", "sight"]
+
+
+class TimelineMove(BaseModel):
+    mode: str = "步行"
+    minutes: int | None = None
+
+
+class DayTimelineItem(BaseModel):
+    """One scheduled stop, or a rest (place_id None), with clock times."""
+    kind: Literal["lunch", "dinner", "snack", "night", "sight", "rest"]
+    place_id: int | None = None
+    arrive: str
+    stay_minutes: int
+    # Minutes spent waiting for a meal or dark before ``arrive``.
+    wait_minutes: int = 0
+    rest_via_lodge: bool = False
+    # The leg after this item; on the last item it is the way back.
+    move_to_next: TimelineMove | None = None
+
+
+class DayTimeline(BaseModel):
+    """v0.15.1: the clock the route planner already computed for one day.
+
+    ``scheduler`` rows come from route_planner.schedule_day; ``estimated``
+    rows are rebuilt by code for routes that never had one.
+    """
+    source: Literal["scheduler", "estimated"] = "scheduler"
+    start: str
+    depart_move: TimelineMove | None = None
+    items: list[DayTimelineItem] = Field(default_factory=list)
+    return_at: str
 
 
 class RouteDayGroup(BaseModel):
@@ -915,6 +1041,37 @@ class RouteDayGroup(BaseModel):
     access_legs: list[AccessLeg] = Field(default_factory=list)
     day_feasibility: DayFeasibility | None = None
     traffic_policy: DayTrafficPolicy | None = None
+    time_policy: ExcursionTimePolicy | None = None
+    visit_profiles: list[VisitProfile] = Field(default_factory=list)
+    # Model-route stop roles by place_id, after the planner and code
+    # adjustments. Included in model_dump, so plan_json keeps it. Old rows
+    # omit the key and stay empty, which keeps meal slots guessed by order.
+    stop_kinds: dict[int, StopKind] = Field(default_factory=dict)
+    # v0.15.1: model-route clock, kept in plan_json. Old rows and selector
+    # routes have none; route_timeline.day_timeline() estimates one.
+    timeline: DayTimeline | None = None
+
+    @field_validator("stop_kinds", mode="before")
+    @classmethod
+    def _coerce_stop_kinds(cls, value: Any) -> Any:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            return value
+        cleaned: dict[int, str] = {}
+        for key, kind in value.items():
+            if isinstance(key, bool) or not isinstance(key, (int, str)):
+                continue
+            try:
+                place_id = int(str(key).strip())
+            except (TypeError, ValueError):
+                continue
+            if place_id <= 0 or isinstance(kind, bool) or not isinstance(kind, str):
+                continue
+            text = kind.strip()
+            if text in {"lunch", "dinner", "snack", "night", "sight"}:
+                cleaned[place_id] = text
+        return cleaned
 
 
 SelectedRouteStatus = Literal["USED", "DROPPED"]
@@ -983,6 +1140,12 @@ class RouteMembershipLedger(BaseModel):
 class RoutePlan(BaseModel):
     """Deterministic locked route skeleton."""
     route_policy_version: Literal["selector-route-v2"] | None = None
+    # Who locked the days. Old plan_json rows omit the key and stay selector.
+    # Included in route model_dump, so plan_json keeps it. Cost snapshots do
+    # not embed the route body; they keep using the route object in memory.
+    planner_source: Literal["selector", "model"] = "selector"
+    # Internal route evidence, included in Writer/Review context and snapshots.
+    preference_coverage: list[dict[str, Any]] = Field(default_factory=list)
     accommodation_policy_version: Literal["accommodation-route-v1"] | None = None
     accommodation_anchor: AccommodationAnchor | None = None
     accommodation_resolution_state: str | None = None
@@ -995,9 +1158,12 @@ class RoutePlan(BaseModel):
         default=None,
         exclude=True,
     )
-    planner_source: str = ""
-    preference_coverage: list[dict] = Field(default_factory=list)
-    nearby_lodging_hotel_names: list[str] | None = None
+    # Nearby hotel names from the lodging search. Absent means that search
+    # did not run. Not part of plan_json.
+    nearby_lodging_hotel_names: list[str] | None = Field(
+        default=None,
+        exclude=True,
+    )
 
 
 PublishedVariant = Literal["normal", "safe"]
@@ -1007,6 +1173,7 @@ SafeTrigger = Literal[
     "fragment_repair_failed",
     "writer_failure",
     "speculative_no_publishable_draft",
+    "preference_unverified",
 ]
 
 
@@ -1045,9 +1212,14 @@ class WorkflowResult(BaseModel):
     quality_metrics: dict = Field(default_factory=dict)
     delivery_metadata: DeliveryMetadata = Field(default_factory=DeliveryMetadata)
     route_plans: list[RoutePlan] = Field(default_factory=list)
+    route_diagnostics: dict | None = Field(default=None, exclude=True)
+    route_replay_data: dict | None = Field(default=None, exclude=True)
     weather_display: dict = Field(default_factory=dict)
     cost_estimate_snapshots: list[CostEstimateSnapshotV1] = Field(
         default_factory=list,
         exclude=True,
     )
     record_id: int | None = None
+    # RollingGo tier lookup for this process. The budget reads it; plan_json
+    # does not store it.
+    lodging_price_result: Any | None = Field(default=None, exclude=True)

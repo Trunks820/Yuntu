@@ -343,3 +343,141 @@ def build_route_name_policy(
         forbidden_text_names=forbidden_text_names,
         contextual_only_names=contextual_only_names,
     )
+
+
+# A reference is an occurrence with an evidenced role, never another route name.
+_REFERENCE_VISIT_RE = re.compile(
+    r"前往|到达|抵达|进入|走进|入内|进去|游览|参观|逛|停留|打卡|"
+    r"再去|接着去|随后去|顺路去|过去|门票|预约"
+)
+
+
+def _reference_evidence_roles(place: CandidatePlace, target: str) -> set[str]:
+    """Intersect retained positive claims with their source, under this POI."""
+    from src.agents.evidence_strength import _classify_signal
+
+    owner, other = re.escape(place.name), re.escape(target)
+    photo = re.compile(rf"{owner}(?:上|处|旁)?(?:可|可以|能)?(?:拍摄|拍|看|眺望|观赏){other}")
+    direction = re.compile(rf"{other}(?:到|至|→|➠){owner}[（(]?(?:全程|一路)(下坡|上坡)")
+
+    def roles(text: str) -> set[str]:
+        found = {"photo"} if photo.search(text) else set()
+        found.update("direction_" + m.group(1) for m in direction.finditer(text))
+        return found
+
+    result: set[str] = set()
+    for item in place.top_reasons:
+        reason = str(item.get("reason") or "")
+        source = str(item.get("evidence") or "")
+        if not source or _classify_signal(reason, "top_reason").strength not in {"direct_fact", "weak_experience"}:
+            continue
+        if "retained_spans" in item:
+            retained = item["retained_spans"]
+            if not isinstance(retained, list) or not all(isinstance(s, str) for s in retained):
+                continue
+            claims = retained
+        else:
+            # Unlocated summaries cannot create new reference authority.
+            claims = [reason] if reason and reason in source else []
+        excluded_spans = item.get("excluded_spans", [])
+        if not isinstance(excluded_spans, list):
+            continue
+        for excluded in excluded_spans:
+            if isinstance(excluded, dict) and isinstance(excluded.get("text"), str):
+                source = source.replace(excluded["text"], "")
+                claims = [s.replace(excluded["text"], "") for s in claims]
+        for claim in claims:
+            result.update(roles(claim) & roles(source))
+    return result
+
+
+def mask_evidenced_place_references(
+    text: str, *, place: CandidatePlace, candidate_names: list[str],
+    locked_names: set[str],
+) -> str:
+    """Mask only supported name occurrences for membership scans; keep offsets.
+
+    This grants no fact, activity, new stop, food or route-metadata authority.
+    Unrecognized wording keeps the existing fail-closed membership behavior.
+    """
+    from src.agents.text_quality import find_phrase_spans
+
+    hits = find_phrase_spans(text, candidate_names)
+    output = list(text)
+    for target in {name for name, _, _ in hits} - locked_names:
+        roles = _reference_evidence_roles(place, target)
+        if not roles:
+            continue
+        name = re.escape(target)
+        owner = re.escape(place.name)
+        photo = re.compile(
+            rf"(?:上桥后|在{owner}(?:上|处|旁)?)?(?:朝|向)(?P<name>{name})方向(?:取景|拍照|拍摄)"
+            rf"|(?:在{owner}(?:上|处|旁)?)?(?:拍摄|拍|眺望|远眺|观赏|看)(?P<object>{name})(?:夜景|景色|全景|外观)?"
+        )
+        direction = re.compile(rf"从(?P<name>{name})(?:这一侧|一侧|这侧)过来(?:(?:全程|一路)(?P<slope>下坡|上坡))?")
+        for segment in re.finditer(r"[^。！？；;\n]+", text):
+            if _REFERENCE_VISIT_RE.search(segment.group()):
+                continue
+            for clause in re.finditer(r"[^，,]+", segment.group()):
+                value = clause.group().strip()
+                # Both raw keyed prose and the backend-owned label are accepted.
+                prefix = place.name + "："
+                label_offset = len(prefix) if value.startswith(prefix) else 0
+                body = value[label_offset:]
+                match = photo.fullmatch(body) if "photo" in roles else None
+                group = "name"
+                if match is not None and match.group("name") is None:
+                    group = "object"
+                if match is None:
+                    match = direction.fullmatch(body)
+                    if match is None or not any(r.startswith("direction_") for r in roles):
+                        continue
+                    if match.group("slope") and "direction_" + match.group("slope") not in roles:
+                        continue
+                start = segment.start() + clause.start() + (len(clause.group()) - len(clause.group().lstrip())) + label_offset + match.start(group)
+                end = start + len(target)
+                if (target, start, end) in hits:
+                    output[start:end] = " " * (end - start)
+    return "".join(output)
+
+
+def mask_plan_place_references(
+    plan, *, route_plan: RoutePlan, plan_index: int, candidate_names: list[str],
+) -> str:
+    """Exempt prose references only inside an intact, correctly owned Day span."""
+    from src.agents.food_review import parse_food_spans
+    from src.agents.poi_fragments import fragment_registry_is_intact
+    from src.agents.route_planning import _is_day_heading_line, _parse_day_heading_number
+
+    text = plan.plan_text or ""
+    if not plan.poi_fragments or not fragment_registry_is_intact(plan):
+        return text
+    headings = []
+    for match in re.finditer(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*)?\s*(?:Day\s*(\d+)|第\s*(\d+|[一二三四五六七八九十]+)\s*(?:天|日))([^\n]*?)(?:\*\*)?\s*$", text,
+    ):
+        day = _parse_day_heading_number(match.group(1) or match.group(2))
+        if day is not None and _is_day_heading_line(match.group(), match.group(3) or ""):
+            headings.append((match, day))
+    day_counts = Counter(day for _, day in headings)
+    locked_names = {p.name for d in route_plan.day_groups for p in d.places}
+    output = list(text)
+    for fragment in plan.poi_fragments:
+        places = [p for d in route_plan.day_groups if d.day == fragment.day for p in d.places if p.place_id == fragment.place_id]
+        if fragment.plan_index != plan_index or len(places) != 1 or day_counts[fragment.day] != 1:
+            continue
+        place = places[0]
+        if not fragment.text.startswith(place.name + "："):
+            continue
+        if not any(day == fragment.day and m.end() < fragment.start and fragment.end <= (headings[i+1][0].start() if i+1 < len(headings) else len(text)) for i, (m, day) in enumerate(headings)):
+            continue
+        # Food is governed by its existing independent attachment authorization.
+        body = list(fragment.text)
+        for span in parse_food_spans(fragment.text):
+            body[span.start:span.end] = " " * (span.end - span.start)
+        masked = mask_evidenced_place_references("".join(body), place=place,
+            candidate_names=candidate_names, locked_names=locked_names)
+        for offset, (before, after) in enumerate(zip(body, masked)):
+            if before != after:
+                output[fragment.start + offset] = after
+    return "".join(output)

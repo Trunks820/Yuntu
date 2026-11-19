@@ -9,6 +9,7 @@ from src.agents.preferences import candidate_is_tea_place
 from src.agents.schema import (
     CandidatePlace,
     TripRequest,
+    parse_hhmm,
 )
 
 from src.agents.route_planner.rules import (
@@ -24,6 +25,7 @@ from src.agents.route_planner.rules import (
     day_has_night,
     dinner_earliest_minute,
     dinner_latest_minute,
+    is_pot_meal,
     schedule_start_minute,
 )
 
@@ -52,12 +54,22 @@ def _stay(stop: dict) -> int:
     return min(max(minutes, 20), 240)
 
 
+def _rest_goes_via_lodge(stop: dict, lodge: CandidatePlace | None) -> bool:
+    """Unset flag keeps the old 'any lodging means go back' path."""
+    if lodge is None:
+        return False
+    flagged = stop.get("_rest_via_lodge")
+    if flagged is None:
+        return True
+    return bool(flagged)
+
+
 def _movement_pairs(stops: list[dict], lodge: CandidatePlace | None) -> list[tuple]:
     pairs = []
     pos = lodge
     for stop in stops:
         if stop.get("kind") == "rest":
-            if lodge is None:
+            if not _rest_goes_via_lodge(stop, lodge):
                 continue
             if pos is not None and _point_key(pos) != _point_key(lodge):
                 pairs.append((pos, lodge))
@@ -99,21 +111,49 @@ def _timeline_prev_place(timeline: list[dict], index: int):
     return None
 
 
-def _extend_prev_sight(timeline: list[dict], meal_index: int, wait: int, day_number) -> str | None:
+# A relaxed lunch that still has a long wait leaves no earlier than this.
+LATE_DEPARTURE_CAP = 11 * 60
+# Leave about half an hour early, not zero: the meal window stays put.
+LUNCH_IDLE_TARGET = 30
+# A dinner rest keeps a short gap so the meal is not entered on the dot.
+DINNER_IDLE_SLACK = 15
+# July and August keep the long midday rest. Do not cut it under two hours.
+SUMMER_REST_FLOOR = 120
+# Relaxed rests and a late sight are shortened before anything is dropped.
+RELAXED_REST_FLOOR = 60
+SIGHT_SHRINK_FLOOR = 60
+
+
+def _extend_prev_sight(
+    timeline: list[dict],
+    meal_index: int,
+    wait: int,
+    day_number,
+    *,
+    day_end: int | None = None,
+) -> str | None:
     meal = timeline[meal_index]["stop"]
     meal_label = "午饭" if meal.get("kind") == "lunch" else "晚饭"
-    sight = None
+    sight_item = None
     for item in reversed(timeline[:meal_index]):
         stop = item.get("stop") or {}
-        if stop.get("kind") == "sight" and stop.get("_place") is not None:
-            sight = stop
+        # Relaxed: a sight before the previous meal cannot shorten this wait.
+        if day_end is not None and stop.get("kind") in {"lunch", "dinner"}:
             break
-    if sight is None:
+        if stop.get("kind") == "sight" and stop.get("_place") is not None:
+            sight_item = item
+            break
+    if sight_item is None:
         return None
+    sight = sight_item["stop"]
     already = sight.get("_extended_minutes")
     already = already if isinstance(already, int) and already > 0 else 0
     current = _stay(sight)
     extra = min(SIGHT_EXTEND_CAP - already, 240 - current, wait)
+    # Relaxed urban days pass day_end. The added minutes must not finish after it.
+    if day_end is not None:
+        room = int(day_end) - (int(sight_item["arrive"]) + current)
+        extra = min(extra, max(0, room))
     if extra <= 0:
         return None
     sight["stay_minutes"] = current + extra
@@ -183,6 +223,7 @@ async def _fill_meal_gaps(
     rules: PlannerRules,
     lodge: CandidatePlace | None,
     estimator,
+    day_end: int | None = None,
 ) -> list[str]:
     """Eat meal waits over 1 hour: rest at lodging, or linger at the previous sight."""
     notes: list[str] = []
@@ -205,10 +246,110 @@ async def _fill_meal_gaps(
             if inserted:
                 notes.append(inserted)
                 continue
-        extended = _extend_prev_sight(timeline, index, wait, day.get("day"))
+        extended = _extend_prev_sight(
+            timeline, index, wait, day.get("day"), day_end=day_end,
+        )
         if extended:
             notes.append(extended)
     return notes
+
+
+def _shrink_for_day_end(
+    day: dict,
+    timeline: list[dict],
+    late_index: int,
+    day_end: int,
+    rules: PlannerRules,
+) -> list[str]:
+    """Make room before the relaxed wrap: shorten rests, then the late sight.
+
+    Only rests after the last meal before the sight count: the sight is not
+    pinned to a clock, so it moves up by what they lose. Floors stay.
+    """
+    item = timeline[late_index]
+    over = int(item["arrive"]) + int(item["stay"]) - int(day_end)
+    if over <= 0:
+        return []
+    number = day.get("day")
+    notes: list[str] = []
+    first = 0
+    for index in range(late_index - 1, -1, -1):
+        if timeline[index]["stop"].get("kind") in {"lunch", "dinner"}:
+            first = index + 1
+            break
+    floor = SUMMER_REST_FLOOR if rules.start_month in {7, 8} else RELAXED_REST_FLOOR
+    for index in range(first, late_index):
+        stop = timeline[index]["stop"]
+        if stop.get("kind") != "rest" or over <= 0:
+            continue
+        current = _stay(stop)
+        cut = min(over, current - floor)
+        if cut <= 0:
+            continue
+        stop["stay_minutes"] = current - cut
+        over -= cut
+        notes.append(f"第{number}天歇改为约 {current - cut} 分钟，{_fmt(day_end)} 前收")
+    if over > 0:
+        sight = item["stop"]
+        current = _stay(sight)
+        cut = min(over, current - SIGHT_SHRINK_FLOOR)
+        if cut > 0:
+            sight["stay_minutes"] = current - cut
+            notes.append(f"第{number}天「{sight['_place'].name}」少逛 {cut} 分钟，{_fmt(day_end)} 前收")
+    return notes
+
+
+def _absorb_relaxed_waits(
+    day: dict,
+    timeline: list[dict],
+    *,
+    start_minute: int,
+    can_delay: bool,
+) -> list[str]:
+    """A relaxed city day does not wait at a restaurant.
+
+    Lunch: leave later, down to about half an hour of wait, no later than
+    11:00. Dinner: rest before it, or lengthen the rest already there. Where
+    the rest happens is decided on the next pass.
+    """
+    number = day.get("day")
+    stops = day.get("stops") or []
+    for item in timeline:
+        meal = item["stop"]
+        kind = meal.get("kind")
+        wait = item.get("wait")
+        if kind not in {"lunch", "dinner"} or not isinstance(wait, int) or wait <= IDLE_LIMIT_MINUTES:
+            continue
+        if kind == "lunch":
+            if not can_delay:
+                continue
+            delay = min(wait - LUNCH_IDLE_TARGET, LATE_DEPARTURE_CAP - start_minute)
+            if delay <= 0:
+                continue
+            day["_start_delay"] = int(day.get("_start_delay") or 0) + delay
+            return [f"第{number}天上午时间宽，改为约 {_fmt(start_minute + delay)} 出门"]
+        if meal not in stops:
+            continue
+        absorb = max(20, wait - DINNER_IDLE_SLACK)
+        if _immediate_rest_before(stops, meal):
+            rest = stops[stops.index(meal) - 1]
+            current = _stay(rest)
+            longer = min(240, current + absorb)
+            if longer <= current:
+                continue
+            rest["stay_minutes"] = longer
+            return [f"第{number}天晚饭前多歇约 {longer - current} 分钟"]
+        stay = min(240, absorb)
+        stops.insert(stops.index(meal), {
+            "kind": "rest",
+            "place_id": None,
+            "stay_minutes": stay,
+            "_idle_fill": True,
+            "_rest_slot": "pre_dinner",
+        })
+        day["stops"] = stops
+        return [f"第{number}天晚饭前歇约 {stay} 分钟"]
+    return []
 
 
 def _day_is_excursion(
@@ -222,6 +363,149 @@ def _day_is_excursion(
     from src.agents.route_planner.checks import classify_day, _day_stop_places
 
     return classify_day(_day_stop_places(day), request, settings, lodge).day_kind == "excursion"
+
+
+def _adjacent_place(stops: list[dict], index: int, *, forward: bool):
+    seq = stops[index + 1 :] if forward else reversed(stops[:index])
+    for stop in seq:
+        if stop.get("kind") == "rest":
+            continue
+        place = stop.get("_place")
+        if place is not None:
+            return place
+    return None
+
+
+async def _assign_rest_via_lodge(
+    stops: list[dict],
+    lodge: CandidatePlace | None,
+    rules: PlannerRules,
+    estimator,
+) -> None:
+    """Mark each rest: back to lodging, or stay put.
+
+    Relaxed only goes back when both legs are within PRE_DINNER_REST_LEG_CAP.
+    Other paces keep the old 'lodging exists → go back' path.
+    """
+    rests = [(index, stop) for index, stop in enumerate(stops) if stop.get("kind") == "rest"]
+    if not rests:
+        return
+    if lodge is None:
+        for _index, stop in rests:
+            stop["_rest_via_lodge"] = False
+        return
+    gated = bool(rules.rest_via_lodge_only_when_near)
+    if not gated:
+        for _index, stop in rests:
+            stop["_rest_via_lodge"] = True
+        return
+    pairs = []
+    meta = []
+    for index, stop in rests:
+        prev = _adjacent_place(stops, index, forward=False)
+        nxt = _adjacent_place(stops, index, forward=True)
+        meta.append((stop, prev, nxt))
+        if prev is not None:
+            pairs.append((prev, lodge))
+        if nxt is not None:
+            pairs.append((lodge, nxt))
+    quoted = {}
+    if pairs:
+        resolved = await resolve_legs(
+            estimator,
+            pairs,
+            rules.commute_mode,
+            taxi_over_minutes=int(rules.taxi_over_minutes),
+            taxi_ratio=float(rules.taxi_ratio),
+        )
+        quoted = {
+            (_point_key(origin), _point_key(dest)): value
+            for (origin, dest), value in zip(pairs, resolved)
+        }
+    for stop, prev, nxt in meta:
+        inbound = 0
+        outbound = 0
+        if prev is not None:
+            inbound, _mode = _lookup(quoted, prev, lodge)
+            if inbound is None:
+                stop["_rest_via_lodge"] = False
+                continue
+        if nxt is not None:
+            outbound, _mode = _lookup(quoted, lodge, nxt)
+            if outbound is None:
+                stop["_rest_via_lodge"] = False
+                continue
+        stop["_rest_via_lodge"] = (
+            inbound <= PRE_DINNER_REST_LEG_CAP and outbound <= PRE_DINNER_REST_LEG_CAP
+        )
+
+
+def _countable_snack(stop: dict) -> bool:
+    kind = stop.get("kind")
+    place = stop.get("_place")
+    snack_stop = kind == "snack" and not (place is not None and candidate_is_tea_place(place))
+    light_stop = (
+        place is not None
+        and is_light_food_place(place)
+        and kind in {"sight", "snack", "night"}
+    )
+    return bool(snack_stop or light_stop)
+
+
+def drop_unrequested_snacks(plan: dict, rules: PlannerRules) -> list[str]:
+    """Relaxed days drop snacks unless the user asked for food. Must-go stays."""
+    if not rules.skip_unrequested_snacks or rules.food:
+        return []
+    notes = []
+    for day in plan.get("days") or []:
+        kept = []
+        for stop in day.get("stops") or []:
+            if not _countable_snack(stop):
+                kept.append(stop)
+                continue
+            place = stop.get("_place")
+            if place is not None and (
+                place.must_include or place.place_id in rules.must_ids
+            ):
+                kept.append(stop)
+                continue
+            # A tea house can also read as light food. The user asked for it.
+            if rules.tea and place is not None and candidate_is_tea_place(place):
+                kept.append(stop)
+                continue
+            name = place.name if place is not None and getattr(place, "name", None) else stop.get("place_id")
+            notes.append(f"第{day.get('day')}天去掉小吃「{name}」（轻松不单排小吃）")
+        day["stops"] = kept
+    return notes
+
+
+def _insert_relaxed_rest(day: dict) -> str | None:
+    stops = day.get("stops") or []
+    lunch_at = next((index for index, stop in enumerate(stops) if stop.get("kind") == "lunch"), None)
+    if lunch_at is None:
+        return None
+    nxt = lunch_at + 1
+    if nxt < len(stops) and stops[nxt].get("kind") == "rest":
+        current = stops[nxt]
+        stay = 0
+        try:
+            stay = int(current.get("stay_minutes") or 0)
+        except (TypeError, ValueError):
+            stay = 0
+        if stay >= 60:
+            return None
+        current["stay_minutes"] = 60
+        current["_relaxed_rest_fill"] = True
+        return f"第{day.get('day')}天午饭后加一段歇约 60 分钟"
+    rest = {
+        "kind": "rest",
+        "place_id": None,
+        "stay_minutes": 60,
+        "_relaxed_rest_fill": True,
+    }
+    stops.insert(lunch_at + 1, rest)
+    day["stops"] = stops
+    return f"第{day.get('day')}天午饭后加一段歇约 60 分钟"
 
 
 async def schedule_day(
@@ -250,9 +534,16 @@ async def schedule_day(
             day["_inplace_rest_noted"] = True
     for attempt in range(12):
         movable = [stop for stop in day.get("stops") or [] if stop.get("kind") == "rest" or stop.get("_place")]
+        excursion = _day_is_excursion(day, request, lodge, settings)
         start_minute = schedule_start_minute(
-            rules, request, excursion=_day_is_excursion(day, request, lodge, settings)
+            rules, request, excursion=excursion
         )
+        # Relaxed city days only: the wrap clock, and a later start set by
+        # _absorb_relaxed_waits.
+        day_end = None if excursion else rules.relaxed_day_end_minute
+        if day_end is not None:
+            start_minute += int(day.get("_start_delay") or 0)
+        await _assign_rest_via_lodge(movable, lodge, rules, estimator)
         dinner_from = dinner_earliest_minute(rules, has_night=day_has_night(movable))
         pairs = _movement_pairs(movable, lodge)
         resolved = await resolve_legs(
@@ -279,7 +570,7 @@ async def schedule_day(
         for stop in movable:
             if stop.get("kind") == "rest":
                 stay = _stay(stop)
-                via_lodge = lodge is not None
+                via_lodge = _rest_goes_via_lodge(stop, lodge)
                 if via_lodge and pos is not None and _point_key(pos) != _point_key(lodge):
                     minutes, mode = _lookup(quoted, pos, lodge)
                     if minutes is None:
@@ -296,6 +587,8 @@ async def schedule_day(
                     if via_lodge:
                         stop["_rest_via_lodge"] = True
                         pos = lodge
+                    else:
+                        stop["_rest_via_lodge"] = False
                     timeline.append({"stop": stop, "arrive": t, "stay": stay, "wait": 0, "move": (0, "步行")})
                     t += stay
                 continue
@@ -424,19 +717,77 @@ async def schedule_day(
                     reason = "回住处太晚，可选点"
             if victim is None:
                 victim, reason = removable(dinner_at), "回住处太晚"
-        sights = [item["stop"] for item in timeline if item["stop"].get("kind") in {"sight", "night"}]
-        if victim is None and len(sights) > rules.sight_limit:
-            limit_reason = f"超过每天 {rules.sight_limit} 个点"
-            victim = optional_victim(None)
-            reason = f"{limit_reason}，可选点" if victim is not None else ""
+        def limit_drop(kind_name: str, cap: int, label: str):
+            chosen = [item["stop"] for item in timeline if item["stop"].get("kind") == kind_name]
+            if len(chosen) <= cap:
+                return None, ""
+            limit_reason = f"超过每天 {cap} 个{label}"
+            for stop in reversed(chosen):
+                if stop.get("optional") is True and cluster_drop(stop):
+                    return stop, f"{limit_reason}，可选点"
+            candidates = [stop for stop in chosen if cluster_drop(stop)]
+            if not candidates:
+                return None, ""
+            picked = min(
+                candidates,
+                key=lambda stop: (stop["_place"].mention_count or 0, stop["_place"].place_id),
+            )
+            return picked, limit_reason
+
+        if rules.day_sight_limit is not None:
             if victim is None:
-                candidates = [stop for stop in sights if stop.get("kind") == "sight" and cluster_drop(stop)]
-                if candidates:
-                    victim = min(
-                        candidates,
-                        key=lambda stop: (stop["_place"].mention_count or 0, stop["_place"].place_id),
-                    )
-                    reason = limit_reason
+                night_cap = rules.night_limit if rules.night_limit is not None else 1
+                victim, reason = limit_drop("night", night_cap, "夜景")
+            if victim is None:
+                victim, reason = limit_drop("sight", rules.day_sight_limit, "点")
+        else:
+            sights = [item["stop"] for item in timeline if item["stop"].get("kind") in {"sight", "night"}]
+            if victim is None and len(sights) > rules.sight_limit:
+                limit_reason = f"超过每天 {rules.sight_limit} 个点"
+                victim = optional_victim(None)
+                reason = f"{limit_reason}，可选点" if victim is not None else ""
+                if victim is None:
+                    candidates = [stop for stop in sights if stop.get("kind") == "sight" and cluster_drop(stop)]
+                    if candidates:
+                        victim = min(
+                            candidates,
+                            key=lambda stop: (stop["_place"].mention_count or 0, stop["_place"].place_id),
+                        )
+                        reason = limit_reason
+        late_index = None
+        if victim is None and day_end is not None:
+            late_index = next(
+                (
+                    index
+                    for index, item in enumerate(timeline)
+                    if item["stop"].get("kind") == "sight"
+                    and item["arrive"] + item["stay"] > day_end
+                ),
+                None,
+            )
+        if late_index is not None and attempt < 11:
+            # Shorten first. A drop only takes the late sight or a later one,
+            # and never the day's last daytime sight: the soft check notes it.
+            shrunk = _shrink_for_day_end(day, timeline, late_index, day_end, rules)
+            if shrunk:
+                trims.extend(shrunk)
+                continue
+            day_sights = {
+                item["stop"]["_place"].place_id
+                for item in timeline
+                if item["stop"].get("kind") == "sight" and item["stop"].get("_place") is not None
+            }
+            later = [
+                item["stop"]
+                for item in timeline[late_index:]
+                if item["stop"].get("kind") == "sight"
+                and cluster_drop(item["stop"])
+                and day_sights - cluster_drop(item["stop"])
+            ]
+            victim = next((stop for stop in reversed(later) if stop.get("optional") is True), None)
+            reason = "白天景点收得太晚，可选点" if victim is not None else ""
+            if victim is None and later:
+                victim, reason = later[0], "白天景点收得太晚"
         if victim is not None:
             drop_ids = {place_id for place_id in cluster_drop(victim) if place_id not in protected}
         if drop_ids and attempt < 11:
@@ -456,11 +807,30 @@ async def schedule_day(
             continue
         if attempt < 11:
             fills = await _fill_meal_gaps(
-                day, timeline, rules=rules, lodge=lodge, estimator=estimator
+                day, timeline, rules=rules, lodge=lodge, estimator=estimator,
+                day_end=day_end,
             )
             if fills:
                 trims.extend(fills)
                 continue
+            if day_end is not None:
+                absorbed = _absorb_relaxed_waits(
+                    day,
+                    timeline,
+                    start_minute=start_minute,
+                    can_delay=parse_hhmm(request.daily_start) is None,
+                )
+                if absorbed:
+                    trims.extend(absorbed)
+                    continue
+            if rules.require_day_rest and not excursion:
+                from src.agents.route_planner.checks import day_has_qualifying_rest
+
+                if not day_has_qualifying_rest(day.get("stops") or [], rules):
+                    inserted = _insert_relaxed_rest(day)
+                    if inserted:
+                        trims.append(inserted)
+                        continue
         break
     for item in timeline:
         item["stop"]["time"] = _fmt(item["arrive"])
@@ -581,6 +951,177 @@ async def repick_meals(
     return changes
 
 
+def _meal_stop(stops: list[dict], kind: str) -> dict | None:
+    return next((stop for stop in stops if stop.get("kind") == kind), None)
+
+
+def _attached_place(stop: dict | None) -> CandidatePlace | None:
+    if stop is None:
+        return None
+    place = stop.get("_place")
+    return place if isinstance(place, CandidatePlace) else None
+
+
+def _must_meal(place: CandidatePlace, rules: PlannerRules) -> bool:
+    return bool(place.must_include) or place.place_id in rules.must_ids
+
+
+def _visitor_proper_meal(place: CandidatePlace | None, amap_ids: set[int]) -> bool:
+    return bool(place and _proper_meal(place) and _visitor_meal(place, amap_ids))
+
+
+def _pot_swap_choice(
+    lunch: dict,
+    dinner: dict,
+    *,
+    rules: PlannerRules,
+    amap_ids: set[int],
+    meals: list[dict],
+) -> dict | None:
+    """Which of the two pot meals to replace.
+
+    The meal without visitor evidence goes first. When both have it, or
+    neither does, dinner goes first. A must-go shop stays. When the user
+    asked for food, the swap must leave at least one visitor meal.
+    """
+    lunch_place = _attached_place(lunch)
+    dinner_place = _attached_place(dinner)
+    lunch_visitor = _visitor_proper_meal(lunch_place, amap_ids)
+    dinner_visitor = _visitor_proper_meal(dinner_place, amap_ids)
+    if lunch_visitor != dinner_visitor:
+        ordered = (lunch, dinner) if not lunch_visitor else (dinner, lunch)
+    else:
+        ordered = (dinner, lunch)
+    for stop in ordered:
+        place = _attached_place(stop)
+        if place is not None and _must_meal(place, rules):
+            continue
+        if rules.food and _visitor_proper_meal(place, amap_ids):
+            others = sum(
+                1
+                for other in meals
+                if other is not stop and _visitor_proper_meal(_attached_place(other), amap_ids)
+            )
+            if others < 1:
+                continue
+        return stop
+    return None
+
+
+async def _nearby_non_pot(
+    anchor: CandidatePlace,
+    *,
+    fetch_restaurants,
+    session,
+    city: str,
+    exclude: set[int],
+) -> CandidatePlace | None:
+    """Same nearby lookup as ``repick_meals``, limited to a non-pot proper meal."""
+    lat, lng = _coords(anchor)
+    if lat is None:
+        return None
+    try:
+        found = await fetch_restaurants(
+            session,
+            city=city,
+            latitude=lat,
+            longitude=lng,
+            radius_meters=1500,
+            limit=5,
+            exclude_place_ids=sorted(exclude),
+        )
+    except Exception:
+        return None
+    near = []
+    for item in found or []:
+        place = _as_candidate(item)
+        if place.place_id in exclude or not _proper_meal(place) or is_pot_meal(place):
+            continue
+        distance = hav_km(anchor, place)
+        if distance is None or distance > MEAL_NEAR_KM:
+            continue
+        near.append(place)
+    if not near:
+        return None
+    return min(
+        near,
+        key=lambda place: (
+            0 if place.top_reasons else 1,
+            -_rating(place),
+            hav_km(anchor, place) or 0,
+            place.place_id,
+        ),
+    )
+
+
+async def diversify_same_day_pots(
+    plan: dict,
+    lodge: CandidatePlace | None,
+    *,
+    rules: PlannerRules,
+    fetch_restaurants,
+    session,
+    city: str,
+    used_ids: set[int],
+    amap_ids: set[int] | None = None,
+    swapped_days: list[dict] | None = None,
+) -> list[str]:
+    """Replace one pot meal when the same day's lunch and dinner are both pots.
+
+    A day that cannot be swapped is left for the check. Each swapped day is
+    added to ``swapped_days`` so the caller can schedule it again: the legs
+    and arrival times were computed for the old shop.
+    """
+    blocked = set(amap_ids or ())
+    changes = []
+    days = plan.get("days") or []
+    meals = [
+        stop
+        for day in days
+        for stop in day.get("stops") or []
+        if stop.get("kind") in {"lunch", "dinner"}
+    ]
+    for day in days:
+        stops = day.get("stops") or []
+        lunch = _meal_stop(stops, "lunch")
+        dinner = _meal_stop(stops, "dinner")
+        if lunch is None or dinner is None:
+            continue
+        if not is_pot_meal(_attached_place(lunch)) or not is_pot_meal(_attached_place(dinner)):
+            continue
+        target = _pot_swap_choice(
+            lunch, dinner, rules=rules, amap_ids=blocked, meals=meals,
+        )
+        if target is None:
+            continue
+        index = stops.index(target)
+        anchor = _meal_anchor(stops, index, lodge)
+        if anchor is None:
+            continue
+        current = _attached_place(target)
+        exclude = set(used_ids)
+        if current is not None:
+            exclude.add(current.place_id)
+        best = await _nearby_non_pot(
+            anchor,
+            fetch_restaurants=fetch_restaurants,
+            session=session,
+            city=city,
+            exclude=exclude,
+        )
+        if best is None:
+            continue
+        meal = "午饭" if target.get("kind") == "lunch" else "晚饭"
+        old_name = current.name if current is not None else target.get("place_id")
+        changes.append(f"第{day.get('day')}天{meal}由「{old_name}」改为不同口味的「{best.name}」")
+        target["place_id"] = best.place_id
+        target["_place"] = best
+        used_ids.add(best.place_id)
+        if swapped_days is not None:
+            swapped_days.append(day)
+    return changes
+
+
 def _visitor_meal(place: CandidatePlace, amap_ids: set[int]) -> bool:
     if place.place_id in amap_ids or is_light_food_place(place) or candidate_is_tea_place(place):
         return False
@@ -614,5 +1155,3 @@ def _idle_fill_counts(plan: dict | None) -> tuple[int, int]:
             if isinstance(extra, int) and extra > 0:
                 extends += 1
     return rests, extends
-
-

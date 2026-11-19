@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
+from src.agents.preferences import candidate_matches_scoring_preference, order_preference_candidates
 from src.agents.schema import (
     CandidateGroup,
     CandidatePlace,
@@ -78,13 +79,22 @@ def rank_candidates(
     *,
     recent_place_id_sets: Iterable[set[int]] | None = None,
     preferred_place_types: set[str] | None = None,
+    preferences: Sequence[str] | None = None,
+    trip_request=None,
 ) -> list[CandidatePlace]:
     """Apply deterministic preference boosts and recent-history penalties."""
     counts = recent_appearance_counts(recent_place_id_sets)
     preferred_types = preferred_place_types or set()
     ranked = list(candidates)
     for candidate in ranked:
-        preference_boost = 1.0 if candidate.place_type in preferred_types else 0.0
+        if preferences is not None:
+            preference_boost = (
+                1.0
+                if candidate_matches_scoring_preference(candidate, preferences)
+                else 0.0
+            )
+        else:
+            preference_boost = 1.0 if candidate.place_type in preferred_types else 0.0
         history_penalty = HISTORY_PENALTY_PER_APPEARANCE * counts[candidate.place_id]
         if candidate.base_priority > 0:
             candidate.effective_score = (
@@ -100,12 +110,16 @@ def rank_candidates(
 
     ranked.sort(
         key=lambda candidate: (
+            not candidate_matches_scoring_preference(candidate, preferences) if preferences else False,
             -candidate.effective_score,
             -candidate.recommend_score,
             -candidate.mention_count,
             candidate.place_id,
         )
     )
+    if preferences:
+        from src.agents.schema import TripRequest
+        ranked = order_preference_candidates(ranked, trip_request or TripRequest(preferences=list(preferences)))
     return ranked
 
 
@@ -234,6 +248,7 @@ def normalize_plan_places(
                 packing_checklist=plan.packing_checklist,
                 travel_tips=plan.travel_tips,
                 poi_fragments=plan.poi_fragments,
+                code_lodging_section=plan.code_lodging_section,
             ))
             continue
 
@@ -276,6 +291,7 @@ def normalize_plan_places(
             packing_checklist=plan.packing_checklist,
             travel_tips=plan.travel_tips,
             poi_fragments=plan.poi_fragments,
+            code_lodging_section=plan.code_lodging_section,
         ))
     return normalized
 

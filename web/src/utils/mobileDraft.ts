@@ -613,5 +613,3 @@ export function clearMobileEditSnapshot(): void {
     /* ignore */
   }
 }
-
-

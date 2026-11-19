@@ -12,5 +12,3 @@ export function useIsMobileViewport(): boolean {
   }, []);
   return isMobile;
 }
-
-

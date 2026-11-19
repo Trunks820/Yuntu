@@ -45,5 +45,3 @@ export function formatMonthDay(date: string, withYear = false): string {
   const [y, m, d] = date.split("-");
   return `${withYear ? `${y}年` : ""}${Number(m)}月${Number(d)}日`;
 }
-
-

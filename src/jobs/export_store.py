@@ -336,7 +336,10 @@ async def get_or_create_artifact(
                         width_px = NULL,
                         height_px = NULL,
                         page_count = NULL,
-                        metadata = CAST(:metadata AS jsonb),
+                        metadata = CAST(:metadata AS jsonb)
+                            || CASE WHEN metadata ? 'model_call_records'
+                                THEN jsonb_build_object('model_call_records', metadata->'model_call_records')
+                                ELSE '{}'::jsonb END,
                         attempt_count = 0,
                         error_code = NULL,
                         error_message = NULL,
@@ -625,7 +628,10 @@ async def mark_artifact_ready(
                     width_px = :width_px,
                     height_px = :height_px,
                     page_count = :page_count,
-                    metadata = COALESCE(CAST(:metadata AS jsonb), metadata),
+                    metadata = COALESCE(CAST(:metadata AS jsonb), metadata)
+                        || CASE WHEN metadata ? 'model_call_records'
+                            THEN jsonb_build_object('model_call_records', metadata->'model_call_records')
+                            ELSE '{}'::jsonb END,
                     error_code = NULL,
                     error_message = NULL,
                     finished_time = NOW(),

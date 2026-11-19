@@ -3,8 +3,11 @@ import { cityPhotoSources } from '@/utils/cityPhotoSources';
 /* eslint-disable react-refresh/only-export-components */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  BUNDLED_FALLBACK_IMAGE,
+  bundledCityImages,
   cityAssetPathname,
   resolveCityAssetVariant,
+  usesBundledCityAssets,
 } from '@/config/cityAssets';
 
 const FALLBACK_IMAGE = '/city-placeholder.svg';
@@ -237,6 +240,10 @@ export function resolveOptimalUrl(url: string): string {
 /** 取某城本地风景图 URL（明信片/等待页等共用） */
 export function getCityPhotoUrls(city: string, count = 4): string[] {
   const folder = CITY_NAME_TO_FOLDER[city];
+  if (usesBundledCityAssets()) {
+    const imgs = folder ? bundledCityImages(folder) : [BUNDLED_FALLBACK_IMAGE];
+    return Array.from({ length: count }, (_, idx) => imgs[idx % imgs.length]);
+  }
   if (folder && CITY_IMAGES[folder]?.length) {
     return CITY_IMAGES[folder].slice(0, count).map((f) => resolveOptimalUrl(`/city/${folder}/${f}`));
   }
@@ -244,13 +251,16 @@ export function getCityPhotoUrls(city: string, count = 4): string[] {
 }
 
 export function cityNameOfImage(url: string): string | null {
+  if (url === BUNDLED_FALLBACK_IMAGE || url.startsWith('/bundled/')) {
+    return url.includes('chongqing') ? '重庆' : null;
+  }
   const match = cityAssetPathname(url)?.match(/^\/city(?:-opt)?\/([^/]+)\//);
   return match ? (FOLDER_TO_CITY_NAME[match[1]] ?? null) : null;
 }
 
 /**
  * 取某城市的图片列表（用于给方案卡配图）。
- * 旧演示页使用；未配置城市返回中性占位图。生产页面读取 BFF 目录图片。
+ * 旧演示页使用；未配置 CDN 时回退内置资源，生产页面读取 BFF 目录图片。
  */
 export function cityImageList(city: string): string[] {
   const entry = Object.entries(CITY_NAME_TO_FOLDER).find(
@@ -258,6 +268,9 @@ export function cityImageList(city: string): string[] {
   );
   if (entry) {
     const folder = entry[1];
+    if (usesBundledCityAssets()) {
+      return bundledCityImages(folder);
+    }
     return CITY_IMAGES[folder].map((f) => resolveOptimalUrl(`/city/${folder}/${f}`));
   }
   return [FALLBACK_IMAGE];

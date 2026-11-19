@@ -1,16 +1,15 @@
-import type { TripFormData } from "@/types/form";
 import type { TripSubmitRequest } from "@/types/tripRequest";
 
 const PENDING_SUBMISSION_KEY = "yuntu_pending_submission";
 
 export interface PendingSubmission {
   request_id: string;
-  trip_request: TripFormData;
+  trip_request: TripSubmitRequest;
   fingerprint: string;
   created_at: number;
 }
 
-export function generateFingerprint(formData: TripFormData | TripSubmitRequest): string {
+export function generateFingerprint(formData: TripSubmitRequest): string {
   const normalized = {
     accommodation: formData.accommodation
       ? {
@@ -25,7 +24,7 @@ export function generateFingerprint(formData: TripFormData | TripSubmitRequest):
     daily_end: formData.daily_end ?? "",
     daily_start: formData.daily_start ?? "",
     days: formData.days,
-    end_date: formData.end_date,
+    end_date: formData.end_date ? formData.end_date.trim() : "",
     from_city: formData.from_city ? formData.from_city.trim() : "",
     must_include: formData.must_include
       ? formData.must_include.map((m) => ({
@@ -36,7 +35,7 @@ export function generateFingerprint(formData: TripFormData | TripSubmitRequest):
     notes: formData.notes ? formData.notes.trim() : "",
     people_count: formData.people_count,
     preferences: formData.preferences ? formData.preferences.map((s) => s.trim()) : [],
-    start_date: formData.start_date,
+    start_date: formData.start_date ? formData.start_date.trim() : "",
     to_city: formData.to_city ? formData.to_city.trim() : "",
   };
   return JSON.stringify(normalized);
@@ -53,7 +52,7 @@ export function getPendingSubmission(): PendingSubmission | null {
   }
 }
 
-export function savePendingSubmission(formData: TripFormData): PendingSubmission {
+export function savePendingSubmission(formData: TripSubmitRequest): PendingSubmission {
   const currentFingerprint = generateFingerprint(formData);
   const existing = getPendingSubmission();
 

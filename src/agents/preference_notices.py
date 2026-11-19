@@ -507,5 +507,3 @@ def _rebind_fragments(plan: PlanOutput, updated_text: str):
         }))
         cursor = index + len(fragment.text)
     return rebound
-
-

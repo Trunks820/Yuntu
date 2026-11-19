@@ -24,6 +24,15 @@ from src.agents.pretrip_advice import (
     amap_evidence_ref,
     normalize_advice_text,
 )
+from src.agents.amap_keys import (
+    POI_DETAIL_KEY_BUCKET,
+    AmapKeyCoordinator,
+    classify_amap_infocode,
+    configured_amap_keys,
+    dedupe_amap_keys,
+    get_amap_key_coordinator,
+    key_fingerprint,
+)
 from src.agents.schema import CandidatePlace
 from src.config import Settings, get_settings
 
@@ -76,13 +85,24 @@ class AmapPoiDetailClient:
         self,
         *,
         api_key: str = "",
+        api_keys: Sequence[str] | None = None,
         enabled: bool = False,
         timeout_seconds: float = 5.0,
         client: Any | None = None,
         monotonic: Callable[[], float] | None = None,
         queried_at: str | None = None,
+        coordinator: AmapKeyCoordinator | None = None,
     ) -> None:
-        self.api_key = str(api_key or "").strip()
+        if api_keys is None:
+            stripped = str(api_key or "").strip()
+            self._keys = [stripped] if stripped else []
+            # An explicit one-key client stays on its own coordinator so tests
+            # do not mark a process-wide key exhausted.
+            self._key_coordinator = coordinator or AmapKeyCoordinator()
+        else:
+            self._keys = dedupe_amap_keys(api_keys)
+            self._key_coordinator = coordinator or get_amap_key_coordinator()
+        self.api_key = self._keys[0] if self._keys else ""
         self.enabled = bool(enabled)
         self.timeout_seconds = float(timeout_seconds)
         self._client = client
@@ -134,7 +154,7 @@ class AmapPoiDetailClient:
                 t0=t0,
                 monotonic=self._monotonic,
             )
-        if not self.api_key:
+        if not self._keys:
             return _result(
                 status=STATUS_API_KEY_MISSING,
                 t0=t0,
@@ -207,47 +227,77 @@ class AmapPoiDetailClient:
         queried_at: str,
         snapshot_label: str,
     ) -> tuple[list[AmapTipFact], int, str]:
-        params = {
-            "key": self.api_key,
-            "id": "|".join(batch_ids),
-            "show_fields": "business",
-        }
-        try:
-            response = await self._get(params, remaining)
-        except httpx.TimeoutException:
-            logger.warning("amap_poi_detail fail-open status=%s", STATUS_TIMEOUT)
-            return [], 0, STATUS_TIMEOUT
-        except httpx.TransportError:
-            logger.warning("amap_poi_detail fail-open status=%s", STATUS_API_ERROR)
-            return [], 0, STATUS_API_ERROR
-        except Exception:
-            logger.warning("amap_poi_detail fail-open status=%s", STATUS_API_ERROR)
-            return [], 0, STATUS_API_ERROR
-
-        http_status = int(getattr(response, "status_code", 0) or 0)
-        http_fail = _status_from_http(http_status)
-        if http_fail is not None:
-            logger.warning(
-                "amap_poi_detail fail-open status=%s http=%s",
-                http_fail,
-                http_status,
+        excluded: set[str] = set()
+        last_status = STATUS_API_KEY_MISSING
+        while True:
+            key = self._key_coordinator.next_key(
+                self._keys,
+                bucket=POI_DETAIL_KEY_BUCKET,
+                exclude=excluded,
             )
-            return [], 0, http_fail
+            if key is None:
+                return [], 0, last_status
+            params = {
+                "key": key,
+                "id": "|".join(batch_ids),
+                "show_fields": "business",
+            }
+            try:
+                response = await self._get(params, remaining)
+            except httpx.TimeoutException:
+                logger.warning("amap_poi_detail fail-open status=%s", STATUS_TIMEOUT)
+                return [], 0, STATUS_TIMEOUT
+            except httpx.TransportError:
+                logger.warning("amap_poi_detail fail-open status=%s", STATUS_API_ERROR)
+                return [], 0, STATUS_API_ERROR
+            except Exception:
+                logger.warning("amap_poi_detail fail-open status=%s", STATUS_API_ERROR)
+                return [], 0, STATUS_API_ERROR
 
-        payload = _read_json(response)
-        if payload is None:
-            logger.warning("amap_poi_detail fail-open status=%s", STATUS_MALFORMED)
-            return [], 0, STATUS_MALFORMED
+            http_status = int(getattr(response, "status_code", 0) or 0)
+            http_fail = _status_from_http(http_status)
+            if http_fail is not None:
+                logger.warning(
+                    "amap_poi_detail fail-open status=%s http=%s",
+                    http_fail,
+                    http_status,
+                )
+                return [], 0, http_fail
 
-        provider_status = _status_from_payload(payload)
-        if provider_status is not None:
-            infocode = str(payload.get("infocode") or "")
-            logger.warning(
-                "amap_poi_detail fail-open status=%s infocode=%s",
-                provider_status,
-                infocode or "-",
-            )
-            return [], 0, provider_status
+            payload = _read_json(response)
+            if payload is None:
+                logger.warning("amap_poi_detail fail-open status=%s", STATUS_MALFORMED)
+                return [], 0, STATUS_MALFORMED
+
+            provider_status = _status_from_payload(payload)
+            if provider_status is not None:
+                infocode = str(payload.get("infocode") or "")
+                info = str(payload.get("info") or "")
+                if classify_amap_infocode(infocode, info) == "quota":
+                    self._key_coordinator.mark_quota_exhausted(
+                        key,
+                        bucket=POI_DETAIL_KEY_BUCKET,
+                    )
+                    excluded.add(key_fingerprint(key))
+                    last_status = provider_status
+                    logger.warning(
+                        "amap_poi_detail quota fingerprint=%s infocode=%s",
+                        key_fingerprint(key),
+                        infocode or "-",
+                    )
+                    if self._key_coordinator.usable_keys(
+                        self._keys,
+                        bucket=POI_DETAIL_KEY_BUCKET,
+                        exclude=excluded,
+                    ):
+                        continue
+                logger.warning(
+                    "amap_poi_detail fail-open status=%s infocode=%s",
+                    provider_status,
+                    infocode or "-",
+                )
+                return [], 0, provider_status
+            break
 
         pois = payload.get("pois")
         if not isinstance(pois, list):
@@ -296,11 +346,13 @@ def amap_poi_detail_client_from_settings(
     client: Any | None = None,
 ) -> AmapPoiDetailClient:
     resolved = settings or get_settings()
+    keys = configured_amap_keys(resolved)
     return AmapPoiDetailClient(
-        api_key=resolved.amap_api_key,
+        api_keys=keys,
         enabled=resolved.amap_poi_detail_enabled,
         timeout_seconds=resolved.amap_poi_detail_timeout,
         client=client,
+        coordinator=get_amap_key_coordinator(),
     )
 
 
@@ -344,7 +396,7 @@ def start_amap_poi_detail_task(
             skip_status=STATUS_DISABLED,
             monotonic=clock,
         )
-    if not client.api_key:
+    if not client._keys:
         return AmapPoiDetailTaskHandle(
             task=None,
             t0=t0,

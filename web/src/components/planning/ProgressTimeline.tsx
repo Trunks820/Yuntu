@@ -66,7 +66,7 @@ export function ProgressTimeline({ currentCode, failed }: ProgressTimelineProps)
                       <span className="absolute inset-0 rounded-full bg-accent-500/20 animate-ping" />
                       <span className="absolute -inset-1 rounded-full bg-accent-400/20 blur-xs" />
                       {/* 核心发光晶体 */}
-                      <span className="relative flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-accent-500 to-amber-500 text-white shadow-[0_0_14px_rgba(249,115,22,0.5)] border border-white/80">
+                      <span className="relative flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-accent-500 to-accent-300 text-white shadow-[0_0_14px_rgba(163,91,72,0.5)] border border-white/80">
                         <span className="h-2 w-2 rounded-full bg-white animate-pulse" />
                       </span>
                     </div>

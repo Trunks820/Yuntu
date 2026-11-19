@@ -30,6 +30,7 @@ router = APIRouter(dependencies=[Depends(verify_public_api_client)])
 
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _FORBIDDEN_METADATA_KEYS = {
+    "model_call_records",
     "storage_key",
     "local_path",
     "file_path",

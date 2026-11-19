@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.agents.activity_vocabulary import _ACTIVITY_ACTION_MARKERS, _MEAL_ACTIVITY_MARKERS
 from src.agents.composition_blueprint import commute_style
 from src.agents.accommodation_review import (
     check_accommodation_violations,
@@ -21,7 +22,7 @@ from src.agents.food_review import (
     mask_authorized_food_names_in_spans,
     strip_food_span_markers,
 )
-from src.agents.poi_alias import build_route_name_policy
+from src.agents.poi_alias import build_route_name_policy, mask_plan_place_references
 from src.agents.route_planning import (
     _is_day_heading_line,
     _parse_day_heading_number,
@@ -97,50 +98,6 @@ _UNTRUSTED_TRANSPORT_SIGNAL_RE = re.compile(
     r"打车前往|坐车前往|乘车前往|"
     r"步行几分钟(?:就能|可)到|"
     r"打车或坐车|打车或乘车"
-)
-_ACTIVITY_ACTION_MARKERS = (
-    "参观",
-    "游览",
-    "逛",
-    "漫步",
-    "散步",
-    "走一段",
-    "走一圈",
-    "探索",
-    "取景",
-    "构图",
-    "拍摄",
-    "拍",
-    "观察",
-    "看看",
-    "看",
-    "阅读",
-    "休息",
-    "坐下",
-    "茶歇",
-    "补给",
-    "用餐",
-    "午餐",
-    "晚餐",
-    "吃",
-    "喝",
-    "品尝",
-    "登上",
-    "俯瞰",
-)
-_MEAL_ACTIVITY_MARKERS = (
-    "用餐",
-    "午餐",
-    "晚餐",
-    "吃",
-    "喝",
-    "品尝",
-    "小吃",
-    "甜品",
-    "咖啡",
-    "茶歇",
-    "补给",
-    "休息",
 )
 _GENERIC_ACTIVITY_PHRASES = (
     "按自己的节奏在这里看看走走",
@@ -295,6 +252,10 @@ def _sanitize_transit_clause(clause: str, commute_legs: list[Any]) -> str:
 def _sanitize_transit_line(line: str, commute_legs: list[Any]) -> str:
     """Clause-level cleanup so a mixed activity paragraph is not discarded."""
     if not _is_transit_bearing_line(line):
+        return line
+    if _article_prompt() and not line.lstrip().startswith(("通勤参考：", "通勤参考:")):
+        # v0.15.1 article: its transit sentences were checked against the legs when it was
+        # split; cutting from the first transit word would also cut the "站名：" label.
         return line
     if line.lstrip().startswith(("通勤参考：", "通勤参考:")):
         return ""
@@ -779,8 +740,16 @@ def _meaningful_activity_text(
     role: str,
     place_type: str,
     locked_names: list[str],
+    place_name: str = "",
 ) -> bool:
-    cleaned = text or ""
+    from src.agents.explicit_preference_fulfillment import current_activity_body, has_executed_activity
+
+    meal = role in _MEAL_ROLES or place_type in {"restaurant", "cafe", "snack"}
+    cleaned, _ = current_activity_body(text or "", place_name=place_name,
+        other_place_names=[name for name in locked_names if name != place_name],
+        dimension="food" if meal else "activity")
+    if not has_executed_activity(cleaned):
+        return False
     for name in sorted(locked_names, key=len, reverse=True):
         if name:
             cleaned = cleaned.replace(name, "")
@@ -807,7 +776,7 @@ def _meaningful_activity_text(
             and cjk_length >= 3
         )
     return (
-        any(marker in compact for marker in _ACTIVITY_ACTION_MARKERS)
+        has_executed_activity(compact)
         and cjk_length >= 6
     )
 
@@ -815,6 +784,7 @@ def _meaningful_activity_text(
 def _validate_activity_coverage(
     plans: list[PlanOutput],
     route_plans: list[RoutePlan],
+    *, body_semantics_by_review: bool = False,
 ) -> list[PublishFinding]:
     """Require useful per-stop actions, not headings or commute-only mentions."""
     findings: list[PublishFinding] = []
@@ -825,8 +795,8 @@ def _validate_activity_coverage(
         bodies = _day_bodies(plan.plan_text or "")
         role_by_place_id = _activity_role_by_place_id(plan)
 
+        locked_names = [place.name for day in route_plan.day_groups for place in day.places if place.name]
         for day_group in route_plan.day_groups:
-            locked_names = [place.name for place in day_group.places if place.name]
             if plan.poi_fragments:
                 for place in day_group.places:
                     role = role_by_place_id.get(place.place_id, "")
@@ -837,12 +807,9 @@ def _validate_activity_coverage(
                         day=day_group.day,
                         place_id=place.place_id,
                     )
-                    if fragment is not None and _meaningful_activity_text(
-                        fragment.text,
-                        role=role,
-                        place_type=place.place_type,
-                        locked_names=locked_names,
-                    ):
+                    if fragment is not None and (bool(fragment.text.strip()) if body_semantics_by_review else
+                            _meaningful_activity_text(fragment.text, role=role, place_type=place.place_type,
+                                locked_names=locked_names, place_name=place.name)):
                         continue
                     findings.append(PublishFinding(
                         reason="activity_content_missing",
@@ -937,6 +904,7 @@ def _validate_activity_coverage(
                         role=role,
                         place_type=place.place_type,
                         locked_names=locked_names,
+                        place_name=place.name,
                     )
                     for window in windows
                 ):
@@ -958,9 +926,10 @@ def _validate_activity_coverage(
 def collect_activity_coverage_findings(
     plans: list[PlanOutput],
     route_plans: list[RoutePlan],
+    *, body_semantics_by_review: bool = False,
 ) -> list[PublishFinding]:
     """Expose stable-key Activity findings to deterministic local completion."""
-    return _validate_activity_coverage(plans, route_plans)
+    return _validate_activity_coverage(plans, route_plans, body_semantics_by_review=body_semantics_by_review)
 
 
 def _day_heading_text(plan_text: str) -> str:
@@ -968,6 +937,20 @@ def _day_heading_text(plan_text: str) -> str:
         match.group(0)
         for match, _day in _valid_day_heading_matches(plan_text or "")
     )
+
+
+def _article_prompt() -> bool:
+    from src.config import get_settings
+    return str(getattr(get_settings(), "writer_prompt_version", "") or "").strip() == "article"
+
+
+def _article_skeleton_plans(plans: list[PlanOutput], route_plans: list[RoutePlan]) -> list[PlanOutput]:
+    from src.agents.article_writer import article_skeleton
+    return [
+        plan.model_copy(update={"plan_text": article_skeleton(plan.plan_text, route_plans[index])})
+        if index < len(route_plans) else plan
+        for index, plan in enumerate(plans)
+    ]
 
 
 def _validate_route_membership(
@@ -979,17 +962,29 @@ def _validate_route_membership(
 ) -> list[PublishFinding]:
     findings: list[PublishFinding] = []
     candidate_names = [candidate.name for candidate in retrieval.candidates]
+    article = _article_prompt()
     for index, plan in enumerate(plans):
         if index >= len(route_plans):
             continue
         route_plan = route_plans[index]
+        if article:
+            # v0.15.1 D3: places named in the article are not visits; the
+            # backend's titles and stop labels carry the route.
+            from src.agents.article_writer import article_skeleton
+            plan = plan.model_copy(update={"plan_text": article_skeleton(plan.plan_text, route_plan)})
+        reference_text = mask_plan_place_references(
+            plan, route_plan=route_plan, plan_index=index + 1,
+            candidate_names=candidate_names,
+        )
         grounded_text = _mask_grounded_transit_summaries(
-            plan.plan_text,
+            reference_text,
             route_plan,
         )
         if accommodation is not None or plan.transport is not None:
             grounded_text = mask_accommodation_prefix_for_route_scan(
-                grounded_text
+                grounded_text,
+                accommodation=accommodation,
+                code_lodging_section=getattr(plan, "code_lodging_section", "") or "",
             )
         locked_by_day = {
             day_group.day: {place.name for place in day_group.places}
@@ -1091,7 +1086,13 @@ def _validate_route_membership(
             allowed = locked_by_day.get(day, set())
             if not allowed:
                 continue
-            section_names = set(extract_claimed_names(section, candidate_names))
+            # Today's stops, including planner meal stops, are often absent from
+            # retrieval.candidates. The longest-name scan can only hide a shorter
+            # other-day POI when the current stop name itself is in this list.
+            section_names = set(extract_claimed_names(
+                section,
+                [*candidate_names, *(name for name in allowed if name)],
+            ))
             for name in sorted(section_names & locked_names):
                 if name in allowed:
                     continue
@@ -1181,6 +1182,7 @@ def check_publish_gate(
     route_plans: list[RoutePlan] | None = None,
     attachment_auth_map: FoodAttachmentAuthMap | None = None,
     accommodation: AccommodationSuggestion | None = None,
+    body_semantics_by_review: bool = False,
 ) -> PublishGateResult:
     """Return deterministic publish-quality findings for final plans."""
     findings: list[PublishFinding] = []
@@ -1199,13 +1201,28 @@ def check_publish_gate(
             attachment_auth_map=attachment_auth_map,
             accommodation=accommodation,
         ))
-        findings.extend(_validate_transit_grounding(plans, route_plans))
+        # v0.15.1 article: its transit sentences were checked against the legs when it
+        # was split (article_writer); the backend's own lines are what is checked here.
+        findings.extend(_validate_transit_grounding(
+            _article_skeleton_plans(plans, route_plans) if _article_prompt() else plans,
+            route_plans,
+        ))
         findings.extend(_validate_arrival_durations(plans, route_plans))
-        findings.extend(collect_activity_coverage_findings(plans, route_plans))
+        findings.extend(collect_activity_coverage_findings(plans, route_plans, body_semantics_by_review=body_semantics_by_review))
     findings.extend(_validate_food_authorization(plans, attachment_auth_map))
     for index, plan in enumerate(plans, 1):
         findings.extend(_validate_plan_text(plan, index))
-        findings.extend(check_accommodation_violations(plan, accommodation))
+        plan_routes = (
+            [route_plans[index - 1]]
+            if route_plans and index - 1 < len(route_plans)
+            else None
+        )
+        findings.extend(check_accommodation_violations(
+            plan,
+            accommodation,
+            retrieval=retrieval,
+            route_plans=plan_routes,
+        ))
     blocking_findings = [
         finding
         for finding in findings

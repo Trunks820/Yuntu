@@ -17,10 +17,8 @@ from src.export.city_background import (
     CITY_BACKGROUND_ASSET_KEYS,
     FALLBACK_BACKGROUND_PATH,
     CityBackgroundClient,
-    extract_base64_image,
     fallback_city_background,
     fallback_city_background_with_metadata,
-    message_content,
     resolve_city_background,
 )
 from src.export.image_prompt import (
@@ -32,6 +30,7 @@ from src.export.image_prompt import (
     build_share_image_prompt_payload,
 )
 from src.export.public_text import public_items, public_text
+from src.export.source_contract import validate_export_result_contract
 
 
 SHARE_IMAGE_LAYOUT_WIDTH = 1440
@@ -282,8 +281,10 @@ def _validated_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("result")
     if not isinstance(result, dict):
         raise ShareImageRenderError("INVALID_EXPORT_SOURCE")
-    if result.get("schema_version") not in {"2.0", "2.1", "2.2"}:
-        raise ShareImageRenderError("INVALID_EXPORT_SOURCE")
+    try:
+        validate_export_result_contract(result)
+    except (TypeError, ValueError) as exc:
+        raise ShareImageRenderError("INVALID_EXPORT_SOURCE") from exc
     if not isinstance(result.get("city"), dict):
         raise ShareImageRenderError("INVALID_EXPORT_SOURCE")
     if not _user_facing_text(_dict(result.get("city")).get("name")):
@@ -1134,14 +1135,6 @@ def _draw_capsule_icon(draw: ImageDraw.ImageDraw, x: int, y: int, fill: str) -> 
 def _hex_to_rgba(value: str, alpha: int) -> tuple[int, int, int, int]:
     raw = value.lstrip("#")
     return (int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16), alpha)
-
-
-def _message_content(payload: dict[str, Any]) -> str:
-    return message_content(payload)
-
-
-def _extract_base64_image(content: str) -> bytes | None:
-    return extract_base64_image(content)
 
 
 def _compression_mode(days: int) -> str:

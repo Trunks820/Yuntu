@@ -366,5 +366,3 @@ export function consumeMobileSubmitIntent(
 
   return true;
 }
-
-

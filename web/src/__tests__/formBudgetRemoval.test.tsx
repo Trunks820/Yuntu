@@ -1,14 +1,15 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import InputPage from "@/pages/InputPage";
+import SpreadStartPage from "@/pages/start/SpreadStartPage";
 import {
   getPendingSubmission,
   savePendingSubmission,
 } from "@/utils/pendingSubmission";
 import type { TripFormData } from "@/types/form";
 
-describe("InputPage Form Budget Removal & Stored Data Compatibility Tests", () => {
+describe("SpreadStartPage Budget Removal & Stored Data Compatibility Tests", () => {
   beforeEach(() => {
     sessionStorage.clear();
     Object.defineProperty(window, "matchMedia", {
@@ -48,14 +49,19 @@ describe("InputPage Form Budget Removal & Stored Data Compatibility Tests", () =
     // 验证旧版 pending submission 读取正常
     expect(pending?.trip_request.to_city).toBe("重庆");
 
-    // 渲染 InputPage，不产生任何异常或报错
+    // 渲染新版 SpreadStartPage，不产生任何异常或报错
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
     render(
-      <MemoryRouter>
-        <InputPage />
-      </MemoryRouter>,
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <SpreadStartPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
 
-    expect(screen.getAllByText("帮我排行程").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("就选这几张").length).toBeGreaterThan(0);
     // 验证页面上不渲染“预算范围”标签
     expect(screen.queryByText("预算范围")).toBeNull();
   });

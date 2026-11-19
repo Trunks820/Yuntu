@@ -1,40 +1,55 @@
+/** 「随手收集灵感」的想去清单：后端没有收藏接口，只存在这台设备上，按账号分开 */
 export interface InspirationSave {
-  city: string;
   placeId: number;
   name: string;
-  district?: string | null;
-  savedAt?: number;
+  city: string;
+  district: string | null;
+  savedAt: number;
 }
 
-const KEY = "yuntu-inspiration-saves-v1";
+const STORAGE_PREFIX = "yuntu_mobile_inspiration_v1:";
+const SAVE_LIMIT = 200;
 
-function bucket(owner: string): InspirationSave[] {
+function storageKey(userId: string): string {
+  return `${STORAGE_PREFIX}${userId}`;
+}
+
+function isSave(value: unknown): value is InspirationSave {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.placeId === "number" &&
+    Number.isInteger(v.placeId) &&
+    v.placeId > 0 &&
+    typeof v.name === "string" &&
+    v.name.trim() !== "" &&
+    typeof v.city === "string" &&
+    v.city.trim() !== "" &&
+    (v.district === null || typeof v.district === "string") &&
+    typeof v.savedAt === "number"
+  );
+}
+
+export function loadInspirationSaves(userId: string): InspirationSave[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(KEY) || "{}") as Record<string, InspirationSave[]>;
-    const rows = raw[owner];
-    if (!Array.isArray(rows)) return [];
-    return rows.filter(
-      (row) =>
-        row &&
-        typeof row.city === "string" &&
-        typeof row.name === "string" &&
-        Number.isInteger(row.placeId),
-    );
+    const parsed: unknown = JSON.parse(localStorage.getItem(storageKey(userId)) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    return parsed.filter(isSave).filter((s) => {
+      const key = `${s.city}:${s.placeId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   } catch {
     return [];
   }
 }
 
-export function loadInspirationSaves(owner: string): InspirationSave[] {
-  return bucket(owner);
-}
-
-/** Returns false when the browser refuses to store the list. */
-export function saveInspirationSaves(owner: string, saves: InspirationSave[]): boolean {
+/** 返回是否写入成功；浏览器不允许存储时，收藏只在这次打开期间保留 */
+export function saveInspirationSaves(userId: string, saves: InspirationSave[]): boolean {
   try {
-    const raw = JSON.parse(localStorage.getItem(KEY) || "{}") as Record<string, unknown>;
-    raw[owner] = saves;
-    localStorage.setItem(KEY, JSON.stringify(raw));
+    localStorage.setItem(storageKey(userId), JSON.stringify(saves.slice(-SAVE_LIMIT)));
     return true;
   } catch {
     return false;

@@ -1,0 +1,996 @@
+/* =========================================================================
+   Yuntu PC Spread — Shared Appearance (Colors, Typography, Topbar & Chrome)
+   Source of truth: docs/design/yuntu-spread-20261022/styles.css & book.css
+   All rules scoped strictly under .yuntu-spread so other pages are untouched.
+   ========================================================================= */
+
+/* 朱雀仿宋只有一档粗细；写成 100 900，要粗体时也用这一档，浏览器不会假加粗 */
+@import "../assets/fonts/zhuque-fangsong/zhuque-fangsong.css";
+
+:root {
+  --desk: #ebe8df;
+  --paper: #f7f5ef;
+  --paper-hi: #faf8f3;
+  --paper-2: #ebe8df;
+  --surface: #fffef9;
+  --ink: #173b35;
+  --deep: #143c35;
+  --green: #166c5b;
+  --green-tint: rgba(22, 108, 91, 0.08);
+  --mint: #dce9d6;
+  --cinnabar: #a35b48;
+  --cinnabar-bg: #f6ebe6;
+  --muted: #55625e;
+  --faint: #646f6a;
+  --line: #e4e1d7;
+  --line-strong: #cdd0c4;
+  --serif: "Zhuque Fangsong", "FangSong", "STFangsong", serif;
+  --sans: "Satoshi", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  /* 字号只有六档 */
+  --fs-xs: 12px;
+  --fs-sm: 14px;
+  --fs-md: 16px;
+  --fs-lg: 20px;
+  --fs-xl: 28px;
+  --fs-2xl: 36px;
+  /* 圆角只有三档：小件、卡片、胶囊 */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-pill: 999px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --top: 52px;
+
+  /* 旅行册：时段配色、深色底的字色 */
+  --on: #f5f3ec;
+  --on-muted: rgba(245, 243, 236, 0.78);
+  --sky-morning: #e3e8e1;
+  --sky-afternoon: #ece2ca;
+  --sky-evening: #e4cbbd;
+  --sky-night: #1d3732;
+  --dot-morning: #9fb2a6;
+  --dot-afternoon: #c3aa76;
+  --dot-evening: #b98774;
+  --dot-night: #1d3732;
+  --lift:
+    0 0 0 1px rgba(23, 59, 53, 0.05),
+    0 2px 6px rgba(23, 59, 53, 0.06),
+    0 8px 18px rgba(23, 59, 53, 0.12);
+}
+
+/* @media (min-width: 768px) body 改挂到 .yuntu-spread 上，绝不污染全局 body 与手机端 */
+.yuntu-spread {
+  background: radial-gradient(
+    ellipse at 50% 24%,
+    #f1efe7 0%,
+    #e6e2d6 60%,
+    #dbd6c7 100%
+  );
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  font-synthesis: none;
+}
+
+.yuntu-spread[data-paper-bg="true"] {
+  background: var(--paper);
+}
+
+.yuntu-spread .page-enter {
+  animation: none;
+}
+
+.yuntu-spread .icon {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+}
+
+.yuntu-spread .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ───────── 顶栏（温润亚麻书案，清爽墨色字）───────── */
+.yuntu-spread .topbar {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--ink);
+  font-synthesis: none;
+  height: var(--top);
+  padding: 0 40px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  position: relative;
+  z-index: 40;
+}
+
+.yuntu-spread .topbar button,
+.yuntu-spread .topbar input {
+  font: inherit;
+  color: inherit;
+}
+
+.yuntu-spread .topbar button {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.yuntu-spread .topbar a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.yuntu-spread .topbar :focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+  border-radius: var(--r-sm);
+}
+
+.yuntu-spread .topbar .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.yuntu-spread .topbar .brand-mark {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-md);
+  background: var(--deep);
+  color: var(--surface);
+  display: grid;
+  place-items: center;
+  box-shadow: 0 2px 5px rgba(20, 60, 53, 0.16);
+}
+
+.yuntu-spread .topbar .brand-mark svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.yuntu-spread .topbar .brand-name {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+
+.yuntu-spread .topbar .sections {
+  display: flex;
+  gap: 4px;
+}
+
+.yuntu-spread .topbar .sections a {
+  padding: 6px 14px;
+  font-size: 14px;
+  color: var(--muted);
+  border-radius: var(--r-md);
+  position: relative;
+  transition: color 0.2s, background 0.2s;
+}
+
+.yuntu-spread .topbar .sections a:hover {
+  color: var(--ink);
+  background: rgba(23, 59, 53, 0.06);
+}
+
+.yuntu-spread .topbar .sections a[aria-current="page"] {
+  color: var(--green);
+  font-weight: 500;
+  background: rgba(22, 108, 91, 0.09);
+}
+
+.yuntu-spread .topbar .sections a[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 2px;
+  height: 2px;
+  background: var(--green);
+  border-radius: var(--r-sm);
+}
+
+.yuntu-spread .topbar .account {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.yuntu-spread .topbar .account a {
+  color: inherit;
+  border-radius: var(--r-pill);
+  transition: color 0.15s;
+}
+
+.yuntu-spread .topbar .quota {
+  font-variant-numeric: tabular-nums;
+}
+
+.yuntu-spread .topbar .account .quota:hover {
+  color: var(--ink);
+}
+
+.yuntu-spread .topbar .user {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.yuntu-spread .topbar .avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--mint);
+  color: var(--green);
+  display: grid;
+  place-items: center;
+  font-family: var(--serif);
+  font-size: var(--fs-xs);
+}
+
+.yuntu-spread .topbar .user[aria-current="page"] .avatar {
+  background: var(--green);
+  color: var(--surface);
+}
+
+.yuntu-spread .topbar .login-link {
+  padding: 6px 18px;
+  border-radius: var(--r-pill);
+  background: var(--deep);
+  color: var(--surface) !important;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  transition: background 0.2s;
+}
+
+.yuntu-spread .topbar .login-link:hover {
+  background: #1f4d44;
+}
+
+.yuntu-spread .topbar .login-link[hidden] {
+  display: none;
+}
+
+/* 顶栏的小胶囊：离开等待页以后，进度跟着走，点它回来 */
+.yuntu-spread .topbar .bind-chip {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  background: var(--green-tint);
+  box-shadow: inset 0 0 0 1px rgba(22, 108, 91, 0.28);
+  color: var(--green);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.yuntu-spread .topbar .bind-chip[hidden] {
+  display: none;
+}
+
+.yuntu-spread .topbar .bind-chip:not([hidden]) + .account {
+  margin-left: 20px;
+}
+
+.yuntu-spread .topbar .bind-chip i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: yuntu-spread-pulse 1.6s ease-in-out infinite;
+}
+
+.yuntu-spread .topbar .bind-chip .icon,
+.yuntu-spread .topbar .bind-chip svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.yuntu-spread .topbar .bind-chip.is-ready,
+.yuntu-spread .topbar .bind-chip.is-basic,
+.yuntu-spread .topbar .bind-chip[data-state="ready"],
+.yuntu-spread .topbar .bind-chip[data-state="basic"] {
+  background: var(--green);
+  color: var(--surface);
+  box-shadow: none;
+}
+
+.yuntu-spread .topbar .bind-chip.is-no_route,
+.yuntu-spread .topbar .bind-chip[data-state="no_route"] {
+  background: var(--cinnabar-bg);
+  color: var(--cinnabar);
+  box-shadow: inset 0 0 0 1px rgba(163, 91, 72, 0.35);
+}
+
+.yuntu-spread .topbar .bind-chip.is-timeout,
+.yuntu-spread .topbar .bind-chip[data-state="timeout"] {
+  background: #f6efdf;
+  color: #8a6a2f;
+  box-shadow: inset 0 0 0 1px rgba(138, 106, 47, 0.3);
+}
+
+@keyframes yuntu-spread-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* ───────── 书桌与通用控件（全收拢在 .yuntu-spread .desk 下，不污染旧页面与移动端）───────── */
+.yuntu-spread .desk {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--ink);
+  font-synthesis: none;
+  height: calc(100vh - var(--top));
+  padding: 6px 64px 34px 40px;
+  position: relative;
+}
+
+.yuntu-spread .desk button,
+.yuntu-spread .desk input {
+  font: inherit;
+  color: inherit;
+}
+
+.yuntu-spread .desk button {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.yuntu-spread .desk a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.yuntu-spread .desk :focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+  border-radius: var(--r-sm);
+}
+
+.yuntu-spread .view,
+.yuntu-spread .desk .view {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.yuntu-spread .view[hidden],
+.yuntu-spread .desk .view[hidden] {
+  display: none;
+}
+
+/* 照片统一调色：降一点饱和、略偏暖，让来源不同的图放在一起不打架 */
+.yuntu-spread .desk .photo,
+.yuntu-spread .photo {
+  filter: saturate(0.82) contrast(0.97) brightness(1.02) sepia(0.05);
+}
+
+.yuntu-spread .desk .btn-primary {
+  padding: 10px 22px;
+  border-radius: var(--r-pill);
+  background: var(--green);
+  color: var(--surface);
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 3px 10px rgba(22, 108, 91, 0.25);
+  transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+  cursor: pointer;
+}
+
+.yuntu-spread .desk .btn-primary svg {
+  width: 15px;
+  height: 15px;
+  transition: transform 0.2s var(--ease);
+}
+
+.yuntu-spread .desk .btn-primary:hover:not(:disabled) {
+  background: var(--deep);
+  transform: translateY(-1px);
+  box-shadow: 0 5px 14px rgba(20, 60, 53, 0.35);
+}
+
+.yuntu-spread .desk .btn-primary:hover:not(:disabled) svg {
+  transform: translateX(3px);
+}
+
+.yuntu-spread .desk .btn-primary:disabled {
+  background: var(--line);
+  color: var(--muted);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.yuntu-spread .desk .chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 13px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-strong);
+  background: transparent;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.yuntu-spread .desk .chip:hover:not(:disabled) {
+  border-color: var(--green);
+  color: var(--ink);
+}
+
+.yuntu-spread .desk .chip[aria-pressed="true"],
+.yuntu-spread .desk .chip.is-on {
+  background: var(--green);
+  border-color: var(--green);
+  color: var(--surface);
+}
+
+.yuntu-spread .desk .chip[aria-pressed="true"]:hover:not(:disabled),
+.yuntu-spread .desk .chip.is-on:hover:not(:disabled) {
+  background: var(--deep);
+  border-color: var(--deep);
+  color: var(--surface);
+}
+
+.yuntu-spread .desk .chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.yuntu-spread .desk .chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.yuntu-spread .desk .link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  color: var(--green);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: rgba(22, 108, 91, 0.3);
+  text-underline-offset: 4px;
+  transition: text-decoration-color 0.15s, color 0.15s;
+  cursor: pointer;
+}
+
+.yuntu-spread .desk .link:hover:not(:disabled) {
+  text-decoration-color: currentColor;
+}
+
+.yuntu-spread .desk .link:disabled {
+  color: var(--faint);
+  text-decoration: none;
+  cursor: not-allowed;
+}
+
+.yuntu-spread .desk .link svg {
+  width: 13px;
+  height: 13px;
+}
+
+.yuntu-spread .desk .btn-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  padding: 6px 2px;
+  cursor: pointer;
+}
+
+.yuntu-spread .desk .btn-text:hover {
+  color: var(--ink);
+}
+
+.yuntu-spread .desk .btn-text svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* ───────── 登录（2026-11-08 定方向甲“大画框”） ─────────
+ * 左边是出发页那只相框放大到半屏以上，城市摄影图 6 秒换一张，城市名用大字压在照片左下；右边表单直接放在纸上，不再套卡片。
+ * 所有规则收拢在 .yuntu-spread .desk 下面，不污染其它页面与移动端。 */
+.yuntu-spread .desk .lgv {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 540px;
+}
+
+.yuntu-spread .desk #view-login .fa-frame {
+  position: relative;
+  border-radius: 24px;
+  overflow: hidden;
+  background: #d9d5c8;
+}
+
+.yuntu-spread .desk #view-login .fa-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transform: scale(1.06);
+  filter: saturate(0.84) contrast(0.97) brightness(1.02) sepia(0.05);
+  transition: opacity 1.4s var(--ease), transform 9s linear;
+}
+
+.yuntu-spread .desk #view-login .fa-img.is-on {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.yuntu-spread .desk #view-login .fa-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to top,
+    rgba(10, 25, 20, 0.52),
+    rgba(10, 25, 20, 0) 46%
+  );
+  pointer-events: none;
+}
+
+.yuntu-spread .desk #view-login .fa-cap {
+  position: absolute;
+  left: 48px;
+  bottom: 44px;
+  max-width: calc(100% - 96px);
+  z-index: 2;
+  color: #fbf8ef;
+  transition: opacity 0.45s var(--ease);
+}
+
+.yuntu-spread .desk #view-login .fa-city {
+  display: block;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 120px;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  text-shadow: 0 2px 30px rgba(0, 0, 0, 0.22);
+}
+
+.yuntu-spread .desk #view-login .fa-tags {
+  display: block;
+  margin-top: 16px;
+  font-size: 15px;
+  letter-spacing: 0.24em;
+  opacity: 0.92;
+}
+
+.yuntu-spread .desk #view-login .fa-credit {
+  position: absolute;
+  right: 22px;
+  bottom: 18px;
+  max-width: 52%;
+  text-align: right;
+  z-index: 2;
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.82);
+  transition: opacity 0.45s var(--ease);
+}
+
+.yuntu-spread .desk #view-login .fa-dots {
+  position: absolute;
+  left: 50px;
+  top: 38px;
+  z-index: 2;
+  display: flex;
+  gap: 6px;
+}
+
+.yuntu-spread .desk #view-login .fa-dots i {
+  width: 16px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.5);
+  transition: width 0.4s var(--ease), background 0.4s;
+}
+
+.yuntu-spread .desk #view-login .fa-dots i.on {
+  width: 34px;
+  background: #fff;
+}
+
+.yuntu-spread .desk .lgv-side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+  max-height: 100%;
+  padding: 8px 0;
+}
+
+.yuntu-spread .desk #view-login .lg {
+  width: 384px;
+  margin: auto 0;
+}
+
+.yuntu-spread .desk #view-login .lg-draft {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 4px 12px 4px 4px;
+  border-radius: var(--r-pill);
+  background: var(--green-tint);
+  font-size: 13px;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-login .lg-draft i {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--green);
+  color: #fff;
+}
+
+.yuntu-spread .desk #view-login .lg-draft svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.yuntu-spread .desk #view-login .lg-h {
+  margin: 20px 0 0;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 52px;
+  line-height: 1.22;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-login .lg-sub {
+  margin: 16px 0 0;
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-login .lg-sub b {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-login .lg-pane {
+  margin-top: 34px;
+  animation: yuntu-spread-lg-in 0.32s var(--ease) both;
+}
+
+@keyframes yuntu-spread-lg-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.yuntu-spread .desk #view-login .lg-ld {
+  width: 100%;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: var(--deep);
+  color: #f5f3ec;
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  transition: background 0.2s;
+}
+
+.yuntu-spread .desk #view-login .lg-ld:hover:not(:disabled) {
+  background: #1f4d44;
+}
+
+.yuntu-spread .desk #view-login .lg-ld:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+.yuntu-spread .desk #view-login .lg-note {
+  margin: 9px 0 0;
+  font-size: 12px;
+  color: var(--faint);
+  text-align: center;
+}
+
+.yuntu-spread .desk #view-login .lg-or {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 28px 0 18px;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.yuntu-spread .desk #view-login .lg-or::before,
+.yuntu-spread .desk #view-login .lg-or::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line-strong);
+}
+
+.yuntu-spread .desk #view-login .lg-field {
+  margin: 0;
+}
+
+.yuntu-spread .desk #view-login .lg-field + .lg-field {
+  margin-top: 12px;
+}
+
+.yuntu-spread .desk #view-login .lg-row {
+  display: flex;
+  height: 52px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.yuntu-spread .desk #view-login .lg-row:focus-within {
+  border-color: var(--green);
+  box-shadow: 0 0 0 4px rgba(22, 108, 91, 0.12);
+}
+
+.yuntu-spread .desk #view-login .lg-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 0 16px;
+  border: 0;
+  background: none;
+  font-size: 15px;
+  color: var(--ink);
+  outline: none;
+}
+
+.yuntu-spread .desk #view-login .lg-row input::placeholder {
+  color: #9aa29d;
+}
+
+.yuntu-spread .desk #view-login .lg-row button {
+  padding: 0 18px;
+  border-left: 1px solid var(--line);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--green);
+  white-space: nowrap;
+  transition: background 0.2s, color 0.2s;
+}
+
+.yuntu-spread .desk #view-login .lg-row button:hover:not(:disabled) {
+  background: var(--green-tint);
+}
+
+.yuntu-spread .desk #view-login .lg-row button:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.yuntu-spread .desk #view-login .lg-field.is-bad .lg-row {
+  border-color: var(--cinnabar);
+  box-shadow: 0 0 0 4px rgba(163, 91, 72, 0.1);
+}
+
+.yuntu-spread .desk #view-login .lg-hint {
+  margin: 9px 0 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--cinnabar);
+}
+
+.yuntu-spread .desk #view-login .lg-notice {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-login .lg-code input {
+  font-size: 20px;
+  letter-spacing: 0.42em;
+  font-variant-numeric: tabular-nums;
+}
+
+.yuntu-spread .desk #view-login .lg-code input::placeholder {
+  font-size: 15px;
+  letter-spacing: 0;
+}
+
+.yuntu-spread .desk #view-login .lg-go {
+  margin-top: 14px;
+  width: 100%;
+  height: 52px;
+  border-radius: 12px;
+  background: var(--deep);
+  color: #f5f3ec;
+  font-size: 15px;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+
+.yuntu-spread .desk #view-login .lg-go:hover:not(:disabled) {
+  background: #1f4d44;
+}
+
+.yuntu-spread .desk #view-login .lg-go:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+.yuntu-spread .desk #view-login .lg-sent {
+  margin: 0 0 14px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-login .lg-sent b {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.yuntu-spread .desk #view-login .lg-sent button {
+  margin-left: 10px;
+  color: var(--green);
+  border-bottom: 1px solid rgba(22, 108, 91, 0.4);
+}
+
+.yuntu-spread .desk #view-login .lg-resend {
+  margin-top: 14px;
+  font-size: 13px;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-login .lg-resend:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.yuntu-spread .desk #view-login .lg-done {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-login .lg-done b {
+  display: block;
+  margin-bottom: 4px;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 26px;
+  color: var(--green);
+}
+
+.yuntu-spread .desk #view-login .lg-mode {
+  margin: 22px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-login .lg-mode-btn {
+  color: var(--green);
+  font-weight: 500;
+  border-bottom: 1px solid rgba(22, 108, 91, 0.35);
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.yuntu-spread .desk #view-login .lg-mode-btn:hover {
+  color: var(--deep);
+  border-bottom-color: var(--deep);
+}
+
+.yuntu-spread .desk #view-login .lg-back {
+  display: inline-block;
+  margin-top: 18px;
+  font-size: 13px;
+  color: var(--muted);
+  transition: color 0.2s;
+}
+
+.yuntu-spread .desk #view-login .lg-back:hover {
+  color: var(--ink);
+}
+
+@media (max-width: 1400px) {
+  .yuntu-spread .desk .lgv {
+    grid-template-columns: minmax(0, 1fr) 480px;
+  }
+
+  .yuntu-spread .desk #view-login .fa-city {
+    font-size: 96px;
+  }
+}
+
+@media (max-width: 1120px) {
+  .yuntu-spread .desk .lgv {
+    grid-template-columns: minmax(0, 1fr) 420px;
+  }
+
+  .yuntu-spread .desk #view-login .fa-city {
+    font-size: 80px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yuntu-spread .desk #view-login .fa-img {
+    transform: none;
+    transition: none;
+  }
+
+  .yuntu-spread .desk #view-login .lg-pane {
+    animation: none;
+  }
+}

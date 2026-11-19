@@ -56,6 +56,9 @@ class GenerationMetrics:
     writer_keyed_fragment_repair_remaining_count: int = 0
     writer_keyed_fragment_repair_latency_ms: int = 0
     writer_keyed_fragment_repair_failure_reason: str = ""
+    writer_keyed_preference_repair_target_count: int = 0
+    writer_keyed_preference_repair_applied_count: int = 0
+    writer_keyed_preference_repair_remaining_count: int = 0
     review_keyed_fragment_repair_attempted: bool = False
     review_keyed_fragment_repair_target_count: int = 0
     review_keyed_fragment_repair_applied_count: int = 0
@@ -67,6 +70,23 @@ class GenerationMetrics:
     review_keyed_fragment_repair_failure_reason: str = ""
     review_keyed_fragment_repair_failure_policy: str = ""
     review_keyed_fragment_required_count: int = 0
+    explicit_preference_evaluated: bool = False
+    explicit_preference_dimensions: list[str] = field(default_factory=list)
+    explicit_preference_findings: list[dict[str, Any]] = field(default_factory=list)
+    explicit_preference_arrangement_failures: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+    explicit_preference_body_missing_keys: list[dict[str, int]] = field(
+        default_factory=list
+    )
+    explicit_preference_repair_attempted: bool = False
+    explicit_preference_repair_keys: list[dict[str, int]] = field(default_factory=list)
+    explicit_preference_repair_applied_keys: list[dict[str, int]] = field(
+        default_factory=list
+    )
+    explicit_preference_repair_failure_reason: str = ""
+    explicit_preference_before_reasons: list[str] = field(default_factory=list)
+    explicit_preference_after_reasons: list[str] = field(default_factory=list)
     post_review_ds_rescue_available: bool = False
     post_review_ds_rescue_attempted: bool = False
     post_review_ds_rescue_reason: str = ""

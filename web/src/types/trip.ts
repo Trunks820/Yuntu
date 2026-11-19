@@ -1,6 +1,40 @@
 import type { CostEstimateSummary } from "./cost";
 export type { CostEstimateSummary };
 
+/* ---------- v0.12 公共交付与结算（BFF PublicGenerationDelivery） ---------- */
+
+/** BFF 公共交付结果。UNKNOWN 是 BFF 观察失败状态，不是 Travel 合法终态 */
+export type DeliveryOutcome =
+  | "PENDING"
+  | "DETAILED"
+  | "BASIC"
+  | "NO_ROUTE"
+  | "FAILED"
+  | "UNKNOWN";
+
+/** 额度结算状态。只有 RELEASED 才能显示"不扣额度" */
+export type QuotaState =
+  | "RESERVED"
+  | "CONSUMED"
+  | "RELEASED"
+  | "NOT_APPLICABLE"
+  | "UNKNOWN";
+
+export type GenerationPolicyVersion = "legacy" | "v0.12";
+
+/**
+ * BFF 向前端公开的交付投影。
+ * 字段由 BFF 白名单构造，前端不得扩大或推测。
+ */
+export interface PublicGenerationDelivery {
+  schema_version: "1.0";
+  outcome: DeliveryOutcome;
+  review_state: string | null;
+  reason_code: string | null;
+  quota_state: QuotaState;
+  result_available: boolean;
+}
+
 export type PaceLevel = "RELAXED" | "MODERATE" | "INTENSIVE";
 export type CommuteStatus = "WITHIN_LIMIT" | "OVER_LIMIT";
 
@@ -35,12 +69,17 @@ export type PlaceRole = string;
 /** 公开停留时段：上午/下午/傍晚/晚上。后端从路线推导，前端不得反推成钟点 */
 export type SchedulePeriod = "morning" | "afternoon" | "evening" | "night";
 
-/** 精确时间的受治理来源。只有这四种来源的 exact_* 才允许展示为确定时间 */
+/**
+ * 精确时间的受治理来源。
+ * - reservation / event / transport / verified_venue_rule：确定时间来源
+ * - planned：按行程推算的参考时间（仅填 exact_start，展示时加"约"）
+ */
 export type ExactTimeSource =
   | "reservation"
   | "event"
   | "transport"
-  | "verified_venue_rule";
+  | "verified_venue_rule"
+  | "planned";
 
 /**
  * place.schedule（Schema 1.5）。exact_start/exact_end 通常为 null；
@@ -96,6 +135,10 @@ export interface JobResponse {
   stage_progress: StageProgress | null;
   result_record_id: string | null;
   error: JobError | null;
+  /** v0.12: BFF 投递映射 */
+  delivery?: PublicGenerationDelivery | null;
+  /** v0.12: 生成策略版本 */
+  generation_policy_version?: string | null;
 }
 
 export interface TripPlace {
@@ -171,28 +214,40 @@ export interface TripDay {
 
 export type AccommodationSource = "user_specified" | "auto_recommended";
 
+/** 住宿明细版式。旧记录没有 display。 */
+export type LodgingDisplayLayout =
+  | "tiers"
+  | "homestay"
+  | "brands"
+  | "user_lodging"
+  | "area_only";
+
+export type LodgingDisplayGroupKind = "economy" | "mid" | "high" | "homestay";
+
+export type LodgingDisplayNoticeKind = "user_lodging_unmatched" | "holiday";
+
+/** BFF 转发时去掉值为 null 的键，所以可为空的字段也可能缺省。 */
 export interface LodgingDisplayGroup {
-  kind: string;
+  kind: LodgingDisplayGroupKind;
   label: string;
-  hotels?: string[];
+  hotels: string[];
   nightly_low_cny?: number | null;
   nightly_high_cny?: number | null;
 }
 
 export interface LodgingDisplayNotice {
-  kind: string;
+  kind: LodgingDisplayNoticeKind;
   text: string;
 }
 
 export interface LodgingDisplay {
-  layout: "user_lodging" | "homestay" | "tiers" | "brands" | "area_only";
+  layout: LodgingDisplayLayout;
   area_label: string;
   caption?: string;
   groups?: LodgingDisplayGroup[];
-  notices?: LodgingDisplayNotice[];
   round_trip_minutes_low?: number | null;
   round_trip_minutes_high?: number | null;
-  price_status?: "sourced" | "待核实";
+  notices?: LodgingDisplayNotice[];
 }
 
 export interface AccommodationInfo {
@@ -307,6 +362,10 @@ export interface TripResult {
   plans: TripPlan[];
   /** Schema 1.5：必去地点交付回执；1.4 无此字段 */
   must_include?: TripMustInclude[] | null;
+  /** v0.12: 生成策略版本 */
+  generation_policy_version?: GenerationPolicyVersion;
+  /** v0.12: BFF 公共交付投影 */
+  delivery?: PublicGenerationDelivery | null;
 }
 
 export interface AsyncSubmitResponse {

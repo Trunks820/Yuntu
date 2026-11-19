@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import json
 import logging
@@ -19,7 +20,6 @@ import httpx
 from pydantic import ValidationError
 from sqlalchemy import text
 
-from src.agents.data_retrieval import preference_place_type_dimensions
 from src.agents.pace import (
     RELAXED_PACE_MARKERS,
     commute_estimate_speed_kmh,
@@ -28,6 +28,14 @@ from src.agents.pace import (
     single_leg_max_minutes,
 )
 from src.agents.poi_alias import ALIAS_SUFFIXES
+from src.agents.preferences import (
+    NIGHT_VIEW,
+    food_preference_active,
+    is_food_partition_place,
+    is_nature_core_place as _is_nature_core_place,
+    nature_preference_active,
+    scoring_dimension_ids,
+)
 from src.agents.schema import (
     CandidateGroup,
     CandidatePlace,
@@ -45,8 +53,18 @@ from src.agents.schema import (
     TransitStep,
     TripRequest,
     PlanOutput,
+    parse_hhmm,
 )
 from src.config import get_settings
+from src.agents.amap_keys import (
+    ROUTE_KEY_BUCKET,
+    amap_keys_configured,
+    classify_amap_failure,
+    configured_amap_keys,
+    get_amap_key_coordinator,
+    key_fingerprint,
+    redact_amap_key,
+)
 from src.agents.route_feasibility import (
     POLICY_VERSION, DWELL_TIME_MINUTES, DayContext, build_visit_profile,
     evaluate_day, day_slot_limit, daytime_activity, valid_coordinate, access_summary,
@@ -100,7 +118,7 @@ class _ProcessWideAmapRateLimiter:
     def __init__(self) -> None:
         self._states: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
-    def _state(self) -> tuple[asyncio.Lock, dict[tuple[str, str], float]]:
+    def _state(self) -> tuple[asyncio.Lock, dict[tuple[str, ...], float]]:
         loop = asyncio.get_running_loop()
         state = self._states.get(loop)
         if state is None:
@@ -111,7 +129,7 @@ class _ProcessWideAmapRateLimiter:
     async def wait_for_slot(
         self,
         *,
-        scope: tuple[str, str],
+        scope: tuple[str, ...],
         min_interval: float,
         deadline_monotonic: float | None,
     ) -> float | None:
@@ -139,6 +157,11 @@ class _ProcessWideAmapRateLimiter:
 
 
 _PROCESS_WIDE_AMAP_RATE_LIMITER = _ProcessWideAmapRateLimiter()
+# Task-local so concurrent legs on one provider do not swap keys.
+_CURRENT_AMAP_ROUTE_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_amap_route_key",
+    default=None,
+)
 REMOTE_CENTER_DISTANCE_KM = 35.0
 REMOTE_CLUSTER_DISTANCE_KM = 25.0
 URBAN_CORE_NEIGHBOR_KM = 15.0
@@ -184,60 +207,10 @@ PLACE_WEIGHTS = {
 
 _EVENING_MARKERS = ("夜景", "日落", "夜游", "灯光", "夜晚")
 _DAYTIME_MARKERS = ("白天", "上午", "下午", "清晨", "早上", "日间")
-_FOOD_PLACE_TYPES = {"restaurant", "food", "cafe", "snack", "dessert", "market"}
 DEFAULT_DAY_CAPACITY_MINUTES = 420
 EVENING_ONLY_CAPACITY_MINUTES = 120
 DEFAULT_DAY_WEIGHT_BUDGET = 7.0
 MIN_TIME_PREFERENCE_WEIGHT_BUDGET = 4.0
-NATURE_PREFERENCE_MARKERS = (
-    "自然",
-    "自然风光",
-    "公园",
-    "园林",
-    "山水",
-    "湖",
-    "河",
-    "海",
-    "湿地",
-    "森林",
-    "徒步",
-    "户外",
-    "长城",
-)
-NATURE_CORE_PLACE_TYPES = {
-    "park",
-    "scenic",
-    "nature",
-    "trail",
-    "mountain",
-    "waterfront",
-    "garden",
-}
-NATURE_CORE_TEXT_MARKERS = (
-    "公园",
-    "园",
-    "园林",
-    "湖",
-    "海",
-    "河",
-    "湿地",
-    "森林",
-    "山",
-    "长城",
-    "颐和园",
-    "圆明园",
-    "北海",
-)
-NON_NATURE_PLACE_TYPES = {
-    "restaurant",
-    "hotel",
-    "food",
-    "cafe",
-    "snack",
-    "dessert",
-    "business_area",
-    "market",
-}
 RELAXED_PREFERENCE_MARKERS = RELAXED_PACE_MARKERS
 SPATIAL_SPREAD_PREFERENCE_MARKERS = (
     "分散",
@@ -300,7 +273,7 @@ MULTI_AREA_WEAK_NAME_MARKERS = (
 
 def is_food_place(place: CandidatePlace) -> bool:
     """Check if a place is food-related."""
-    return place.place_type in _FOOD_PLACE_TYPES
+    return is_food_partition_place(place)
 
 
 def top_by_score(places: list[CandidatePlace], n: int) -> list[CandidatePlace]:
@@ -314,6 +287,18 @@ class RouteProviderError(RuntimeError):
 
 class RouteProviderRateLimitError(RouteProviderError):
     """Raised when the route provider is temporarily rate-limited."""
+
+    def __init__(self, message: str, infocode: str = "") -> None:
+        self.infocode = infocode
+        super().__init__(message)
+
+
+class _AmapKeyQuota(RouteProviderRateLimitError):
+    """This key is out of quota. The route loop may retry another key."""
+
+
+class _AmapKeyOverLimit(RouteProviderRateLimitError):
+    """This key and mode are cooling down. The route loop may retry another key."""
 
 
 class RouteProviderBudgetExceededError(RouteProviderRateLimitError):
@@ -333,6 +318,19 @@ class RoutePlanInvariantError(RuntimeError):
         super().__init__(
             "route plan invariant violation: " + "; ".join(violations)
         )
+
+
+class RouteFullDayConflictError(RoutePlanInvariantError):
+    """A proved day-count contradiction between source-admitted required places."""
+
+    def __init__(self, full_day_place_ids: list[int], independent_must_include_ids: list[int], days: int) -> None:
+        self.full_day_place_ids = tuple(sorted(full_day_place_ids))
+        self.independent_must_include_ids = tuple(sorted(independent_must_include_ids))
+        self.available_days = days
+        # Independent required visits need at least one further ordinary day.
+        self.required_days = len(self.full_day_place_ids) + bool(self.independent_must_include_ids)
+        self.place_ids = tuple(sorted(set(self.full_day_place_ids) | set(self.independent_must_include_ids)))
+        super().__init__(["full_day_conflict"], [])
 
 
 class RouteMustIncludeConflictError(RuntimeError):
@@ -390,6 +388,22 @@ class PreciseRoute:
 
 AMAP_ROUTE_CACHE_PAYLOAD_VERSION = 4
 AMAP_V5_COST_CACHE_PROVIDER = "amap_v5_cost_v4"
+
+# Internal walking-proof decisions for generation_mode=transit. Never public copy.
+WALK_PROOF_ADOPTED = "adopted"
+WALK_PROOF_OVER_DURATION = "over_duration"
+WALK_PROOF_NO_PATH = "no_path"
+WALK_PROOF_INVALID = "invalid_route"
+WALK_PROOF_PROVIDER_ERROR = "provider_error"
+WALK_PROOF_TIMEOUT = "timeout"
+WALK_PROOF_BUDGET = "budget_exhausted"
+WALK_PROOF_RATE_LIMITED = "rate_limited"
+WALK_PROOF_CANCELLED = "cancelled"
+# Frozen U4 L8 proof cap. Native walking-mode policy keeps route_single_leg_max_walking.
+WALK_PROOF_MAX_DURATION_MINUTES = 28
+# Sidecar key prefix inside known_precise_legs. Values are reason strings, never
+# CommuteLeg records. Distinct from (from_id, to_id, mode) success facts.
+WALK_PROOF_REJECT_SENTINEL = "__walk_proof_reject__"
 
 
 TRANSIT_DETAIL_GENERIC_TEMPLATE = (
@@ -673,8 +687,12 @@ class RoutePlanningMetrics:
     route_v2_stop_reason: str = ""
     route_v2_local_repair_evaluations: int = 0
     route_v2_repair_batches: int = 0
+    route_v2_coverage_report: list = field(default_factory=list)
+    route_v2_repair_trace: list = field(default_factory=list)
+    route_v2_proved_conflicts: dict = field(default_factory=dict)
     access_route_attempt_count: int = 0
     access_route_fact_count: int = 0
+    walk_proof_receipts: list[dict[str, Any]] = field(default_factory=list)
     plan_count: int = 0
     day_count: int = 0
     # Final-plan snapshot, recomputed from returned plans at the workflow exit.
@@ -768,6 +786,28 @@ class RoutePlanningMetrics:
     def record_effective_fallback(self, mode: EffectiveCommuteMode) -> None:
         self.by_effective_mode[mode]["estimate_fallback_count"] += 1
 
+    def record_walk_proof(
+        self,
+        decision: str,
+        *,
+        from_place_id: int | None = None,
+        to_place_id: int | None = None,
+        direction: str | None = None,
+        place_id: int | None = None,
+    ) -> None:
+        if not decision:
+            return
+        row: dict[str, Any] = {"decision": str(decision)}
+        if from_place_id is not None:
+            row["from_place_id"] = int(from_place_id)
+        if to_place_id is not None:
+            row["to_place_id"] = int(to_place_id)
+        if direction is not None:
+            row["direction"] = str(direction)
+        if place_id is not None:
+            row["place_id"] = int(place_id)
+        self.walk_proof_receipts.append(row)
+
     def record_precise_recovery_reason(self, reason: str, count: int = 1) -> None:
         if reason not in self.amap_precise_recovery_reason_counts:
             return
@@ -810,8 +850,15 @@ class RoutePlanningMetrics:
             "route_v2_stop_reason": self.route_v2_stop_reason,
             "route_v2_local_repair_evaluations": self.route_v2_local_repair_evaluations,
             "route_v2_repair_batches": self.route_v2_repair_batches,
+            "route_v2_coverage_report": list(self.route_v2_coverage_report),
+            "route_v2_repair_trace": list(self.route_v2_repair_trace),
+            "route_v2_proved_conflicts": {
+                str(place_id): str(reason)
+                for place_id, reason in self.route_v2_proved_conflicts.items()
+            },
             "access_route_attempt_count": self.access_route_attempt_count,
             "access_route_fact_count": self.access_route_fact_count,
+            "walk_proof_receipts": [dict(row) for row in self.walk_proof_receipts],
             "plan_count": self.plan_count,
             "selected_used": self.selected_used,
             "selected_dropped": self.selected_dropped,
@@ -1019,6 +1066,7 @@ class AmapRouteProvider:
         metrics: RoutePlanningMetrics | None = None,
         deadline_monotonic: float | None = None,
         wall_start_monotonic: float | None = None,
+        time_budget_ms: int | None = None,
     ) -> None:
         settings = get_settings()
         self.api_generation = (
@@ -1035,14 +1083,21 @@ class AmapRouteProvider:
             if self.api_generation == "v5"
             else "amap"
         )
-        self.api_key = settings.amap_api_key
+        self._configured_keys = configured_amap_keys(settings)
+        self.api_key = self._configured_keys[0] if self._configured_keys else ""
+        self._amap_keys = get_amap_key_coordinator()
         self.timeout = settings.amap_route_timeout
         self.min_interval = 1 / max(settings.amap_route_qps, 0.1)
         self.backoff_seconds = max(0.0, settings.amap_route_backoff_seconds)
         self.cache_ttl_seconds = max(1, settings.amap_route_cache_ttl_hours) * 3600
         self.hard_call_cap = max(0, int(settings.amap_route_call_budget or 0))
         self.call_budget = self.hard_call_cap
-        self.time_budget_ms = max(0, int(settings.amap_route_time_budget_ms or 0))
+        # None keeps the shared backup budget. A positive override is a
+        # separate wall clock for one provider instance.
+        if time_budget_ms is None:
+            self.time_budget_ms = max(0, int(settings.amap_route_time_budget_ms or 0))
+        else:
+            self.time_budget_ms = max(0, int(time_budget_ms))
         wall_start = (
             float(wall_start_monotonic)
             if wall_start_monotonic is not None
@@ -1111,6 +1166,7 @@ class AmapRouteProvider:
         destination_longitude: float | None = None,
         destination_latitude: float | None = None,
     ) -> str:
+        # Every Amap key shares this cache. Do not put the key or its fingerprint here.
         namespace = "cost_v4" if api_generation == "v5" else "v3"
         return (
             f"amap:route:{namespace}:"
@@ -1449,30 +1505,24 @@ class AmapRouteProvider:
     ) -> None:
         if not self._cache_available:
             return
-        route_pairs = {
-            self._route_cache_key(
-                origin=day_group.places[index],
-                destination=day_group.places[index + 1],
-                city=city,
-                api_generation=self.api_generation,
-                mode=resolve_leg_effective_mode(
-                    day_group.places[index],
-                    day_group.places[index + 1],
-                    generation_mode=generation_mode,
-                ),
-            ): (
-                day_group.places[index],
-                day_group.places[index + 1],
-                resolve_leg_effective_mode(
-                    day_group.places[index],
-                    day_group.places[index + 1],
-                    generation_mode=generation_mode,
-                ),
-            )
-            for plan in plans
-            for day_group in plan.day_groups
-            for index in range(max(0, len(day_group.places) - 1))
-        }
+        route_pairs: dict[str, tuple[CandidatePlace, CandidatePlace, EffectiveCommuteMode]] = {}
+        for plan in plans:
+            for day_group in plan.day_groups:
+                for index in range(max(0, len(day_group.places) - 1)):
+                    origin = day_group.places[index]
+                    destination = day_group.places[index + 1]
+                    for mode in _provider_query_modes(
+                        origin,
+                        destination,
+                        generation_mode=generation_mode,
+                    ):
+                        route_pairs[self._route_cache_key(
+                            origin=origin,
+                            destination=destination,
+                            city=city,
+                            api_generation=self.api_generation,
+                            mode=mode,
+                        )] = (origin, destination, mode)
         if not route_pairs:
             return
         redis_misses = dict(route_pairs)
@@ -1633,11 +1683,106 @@ class AmapRouteProvider:
             await self._redis_client.aclose()
 
     def is_backing_off(self) -> bool:
-        return time.monotonic() < self._disabled_until
+        if time.monotonic() < self._disabled_until:
+            return True
+        keys = self._active_keys()
+        coordinator = getattr(self, "_amap_keys", None)
+        if not keys or coordinator is None:
+            return False
+        return not coordinator.usable_keys(keys, bucket=ROUTE_KEY_BUCKET)
 
     def _enter_backoff(self, reason: str) -> None:
         self._disabled_reason = reason
         self._disabled_until = time.monotonic() + self.backoff_seconds
+
+    def _active_keys(self) -> list[str]:
+        configured = [
+            str(key).strip()
+            for key in (getattr(self, "_configured_keys", None) or [])
+            if str(key).strip()
+        ]
+        current = str(getattr(self, "api_key", "") or "").strip()
+        # Tests assign a fixture key after construction. That override must
+        # not rotate in a real key loaded from settings.
+        if current and current not in configured:
+            return [current]
+        if configured:
+            return configured
+        return [current] if current else []
+
+    def _limiter_fingerprint(self) -> str:
+        # The pool sets the context var before reserve. A direct reserve, the
+        # shape the existing tests stub, stays on this provider's own key.
+        current_key = _CURRENT_AMAP_ROUTE_KEY.get()
+        if not current_key:
+            current_key = str(getattr(self, "api_key", "") or "").strip()
+        if current_key:
+            return key_fingerprint(current_key)
+        keys = self._active_keys()
+        return key_fingerprint(keys[0] if keys else "")
+
+    def _coordinator(self):
+        coordinator = getattr(self, "_amap_keys", None)
+        if coordinator is None:
+            coordinator = get_amap_key_coordinator()
+            self._amap_keys = coordinator
+        return coordinator
+
+    def _no_usable_key(self, mode: str) -> bool:
+        keys = self._active_keys()
+        if not keys:
+            return False
+        return not self._coordinator().usable_keys(
+            keys,
+            bucket=ROUTE_KEY_BUCKET,
+            mode=mode,
+        )
+
+    def _redacted_failure_message(self, payload: dict, request_key: str) -> str:
+        info = str(
+            payload.get("info")
+            or payload.get("errmsg")
+            or payload.get("message")
+            or "Amap route API failed"
+        )
+        infocode = str(payload.get("infocode") or "")
+        safe = redact_amap_key(info, request_key)
+        safe = redact_amap_key(safe, str(self.api_key or ""))
+        for key in self._active_keys():
+            safe = redact_amap_key(safe, key)
+        return f"{safe} ({infocode})"
+
+    def _key_limit_error(
+        self,
+        message: str,
+        infocode: str,
+        *,
+        kind: str,
+    ) -> RouteProviderRateLimitError:
+        # A direct _fetch_http_route call is outside the retry loop, so it
+        # keeps the old provider-wide backoff.
+        if _CURRENT_AMAP_ROUTE_KEY.get() is None:
+            self._enter_backoff(message)
+            return RouteProviderRateLimitError(message, infocode)
+        if kind == "quota":
+            return _AmapKeyQuota(message, infocode)
+        return _AmapKeyOverLimit(message, infocode)
+
+    def _log_key_event(self, api_key: str, mode: str, kind: str, infocode: str) -> None:
+        logger.warning(
+            "amap route key %s fingerprint=%s mode=%s infocode=%s",
+            kind,
+            key_fingerprint(api_key),
+            mode,
+            infocode or "-",
+        )
+
+    async def _unreserve_call(self) -> None:
+        async with self._budget_lock:
+            if self._call_count > 0:
+                self._call_count -= 1
+            if self._metrics is not None and self._metrics.amap_call_count > 0:
+                self._metrics.amap_call_count -= 1
 
     async def _lookup_cache(
         self,
@@ -1912,19 +2057,20 @@ class AmapRouteProvider:
             for index in range(max(0, len(day_group.places) - 1)):
                 origin = day_group.places[index]
                 destination = day_group.places[index + 1]
-                keys.add(
-                    self._route_cache_key(
-                        origin=origin,
-                        destination=destination,
-                        city=city,
-                        api_generation=self.api_generation,
-                        mode=resolve_leg_effective_mode(
-                            origin,
-                            destination,
-                            generation_mode=generation_mode,
-                        ),
+                for mode in _provider_query_modes(
+                    origin,
+                    destination,
+                    generation_mode=generation_mode,
+                ):
+                    keys.add(
+                        self._route_cache_key(
+                            origin=origin,
+                            destination=destination,
+                            city=city,
+                            api_generation=self.api_generation,
+                            mode=mode,
+                        )
                     )
-                )
         return keys
 
     def allocate_uncached_plan_calls(
@@ -2021,23 +2167,36 @@ class AmapRouteProvider:
     async def _reserve_amap_call(
         self,
         effective_mode: EffectiveCommuteMode,
+        *,
+        key_fingerprint: str | None = None,
     ) -> float:
+        fingerprint = key_fingerprint or self._limiter_fingerprint()
+        # Count the call before the sleep, then wait outside this provider's
+        # lock. Two keys can then occupy two limiter scopes at once. A rejected
+        # slot rolls the count back so a deadline miss still reports zero calls.
         async with self._budget_lock:
-            self._assert_amap_budget_available()
-            wait_seconds = await _PROCESS_WIDE_AMAP_RATE_LIMITER.wait_for_slot(
-                scope=(self.api_generation, effective_mode),
-                min_interval=self.min_interval,
-                deadline_monotonic=self._deadline_monotonic,
-            )
-            if wait_seconds is None:
-                self._raise_time_budget_exceeded()
-            if self._metrics is not None:
-                self._metrics.amap_wait_ms += int(wait_seconds * 1000)
             self._assert_amap_budget_available()
             self._call_count += 1
             if self._metrics is not None:
                 self._metrics.amap_call_count += 1
-            return time.monotonic()
+        try:
+            wait_seconds = await _PROCESS_WIDE_AMAP_RATE_LIMITER.wait_for_slot(
+                scope=(fingerprint, self.api_generation, effective_mode),
+                min_interval=self.min_interval,
+                deadline_monotonic=self._deadline_monotonic,
+            )
+        except BaseException:
+            await self._unreserve_call()
+            raise
+        if wait_seconds is None or (
+            self._deadline_monotonic is not None
+            and time.monotonic() >= self._deadline_monotonic
+        ):
+            await self._unreserve_call()
+            self._raise_time_budget_exceeded()
+        if self._metrics is not None:
+            self._metrics.amap_wait_ms += int(wait_seconds * 1000)
+        return time.monotonic()
 
     async def _fetch_http_route(
         self,
@@ -2048,12 +2207,15 @@ class AmapRouteProvider:
         effective_mode: EffectiveCommuteMode,
         citycode: str | None,
     ) -> PreciseRoute:
+        request_key = _CURRENT_AMAP_ROUTE_KEY.get() or str(self.api_key or "")
+        if not request_key:
+            raise RouteProviderError("AMAP_API_KEY is not configured")
         if self.api_generation == "v3":
             if effective_mode != "driving":
                 raise RouteProviderError("v3 route compatibility only supports driving")
             url = AMAP_DRIVING_URL
             params = {
-                "key": self.api_key,
+                "key": request_key,
                 "origin": f"{origin.longitude},{origin.latitude}",
                 "destination": f"{destination.longitude},{destination.latitude}",
                 "strategy": 0,
@@ -2065,7 +2227,7 @@ class AmapRouteProvider:
                 raise RouteProviderError("transit route requires citycode")
             url = AMAP_V5_ROUTE_URLS[effective_mode]
             params = {
-                "key": self.api_key,
+                "key": request_key,
                 "origin": f"{origin.longitude},{origin.latitude}",
                 "destination": f"{destination.longitude},{destination.latitude}",
                 "show_fields": "cost,polyline",
@@ -2106,10 +2268,13 @@ class AmapRouteProvider:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 message = "Amap route API HTTP 429 rate limit"
-                self._enter_backoff(message)
                 if self._metrics is not None:
                     self._metrics.amap_rate_limit_count += 1
-                raise RouteProviderRateLimitError(message) from exc
+                raise self._key_limit_error(
+                    message,
+                    "429",
+                    kind="over_limit",
+                ) from exc
             raise RouteProviderError(
                 f"Amap route API HTTP {exc.response.status_code}"
             ) from exc
@@ -2121,15 +2286,15 @@ class AmapRouteProvider:
             payload.get("status") != "1"
             or str(payload.get("infocode") or "") != "10000"
         ):
-            message = (
-                f"{payload.get('info') or 'Amap route API failed'} "
-                f"({payload.get('infocode') or ''})"
-            )
-            if _is_amap_route_rate_limit(payload):
-                self._enter_backoff(message)
+            infocode = str(payload.get("infocode") or "").strip()
+            message = self._redacted_failure_message(payload, request_key)
+            kind = classify_amap_failure(payload)
+            if kind is None and _is_amap_route_rate_limit(payload):
+                kind = "over_limit"
+            if kind in {"quota", "over_limit"}:
                 if self._metrics is not None:
                     self._metrics.amap_rate_limit_count += 1
-                raise RouteProviderRateLimitError(message)
+                raise self._key_limit_error(message, infocode, kind=kind)
             raise RouteProviderError(
                 message
             )
@@ -2200,6 +2365,73 @@ class AmapRouteProvider:
             raise RouteProviderError("access POI endpoint must have a positive canonical ID")
         return await self.route(**kwargs)
 
+    async def _fetch_route_with_key_pool(
+        self,
+        *,
+        origin: CandidatePlace,
+        destination: CandidatePlace,
+        city: str,
+        effective_mode: EffectiveCommuteMode,
+        citycode: str | None,
+    ) -> PreciseRoute:
+        keys = self._active_keys()
+        excluded: set[str] = set()
+        last_error: RouteProviderRateLimitError | None = None
+        while True:
+            key = self._coordinator().next_key(
+                keys,
+                bucket=ROUTE_KEY_BUCKET,
+                mode=effective_mode,
+                exclude=excluded,
+            )
+            if key is None:
+                if len(keys) == 1 and last_error is not None:
+                    self._enter_backoff(str(last_error))
+                raise RouteProviderRateLimitError(
+                    str(last_error or "Amap route provider is backing off"),
+                    getattr(last_error, "infocode", ""),
+                )
+            token = _CURRENT_AMAP_ROUTE_KEY.set(key)
+            try:
+                await self._reserve_amap_call(effective_mode)
+                try:
+                    return await self._fetch_http_route(
+                        origin=origin,
+                        destination=destination,
+                        city=city,
+                        effective_mode=effective_mode,
+                        citycode=citycode,
+                    )
+                except _AmapKeyQuota as exc:
+                    self._coordinator().mark_quota_exhausted(
+                        key,
+                        bucket=ROUTE_KEY_BUCKET,
+                    )
+                    excluded.add(key_fingerprint(key))
+                    last_error = exc
+                    self._log_key_event(key, effective_mode, "quota", exc.infocode)
+                    continue
+                except _AmapKeyOverLimit as exc:
+                    self._coordinator().mark_over_limit(
+                        key,
+                        effective_mode,
+                        self.backoff_seconds,
+                    )
+                    excluded.add(key_fingerprint(key))
+                    last_error = exc
+                    self._log_key_event(
+                        key,
+                        effective_mode,
+                        "over_limit",
+                        exc.infocode,
+                    )
+                    if len(keys) == 1:
+                        self._enter_backoff(str(exc))
+                        raise
+                    continue
+            finally:
+                _CURRENT_AMAP_ROUTE_KEY.reset(token)
+
     async def route(
         self,
         *,
@@ -2213,8 +2445,12 @@ class AmapRouteProvider:
             raise RouteProviderRateLimitError(
                 self._disabled_reason or "Amap route provider is backing off"
             )
-        if not self.api_key:
+        if not self._active_keys():
             raise RouteProviderError("AMAP_API_KEY is not configured")
+        if self._no_usable_key(effective_mode):
+            raise RouteProviderRateLimitError(
+                self._disabled_reason or "Amap route provider is backing off"
+            )
         if None in (
             origin.longitude,
             origin.latitude,
@@ -2236,17 +2472,13 @@ class AmapRouteProvider:
         )
         if cached is not None:
             return cached
-        await self._reserve_amap_call(effective_mode)
-        try:
-            route = await self._fetch_http_route(
-                origin=origin,
-                destination=destination,
-                city=city,
-                effective_mode=effective_mode,
-                citycode=citycode,
-            )
-        except RouteProviderError:
-            raise
+        route = await self._fetch_route_with_key_pool(
+            origin=origin,
+            destination=destination,
+            city=city,
+            effective_mode=effective_mode,
+            citycode=citycode,
+        )
         await self._store_cache(
             origin=origin,
             destination=destination,
@@ -2614,8 +2846,8 @@ def resolve_leg_effective_mode(
     if generation_mode == "driving":
         return "driving"
     if generation_mode == "transit":
-        if road_distance_meters <= settings.commute_walk_switch_max_meters:
-            return "walking"
+        # Straight-line proximity only triggers a walking query later. Estimates
+        # stay transit so search never treats unproven walking as reachability.
         return "transit"
     if generation_mode == "walking":
         if raw_minutes > single_leg_max_minutes("walking", settings):
@@ -2628,16 +2860,392 @@ def resolve_leg_effective_mode(
     return "cycling"
 
 
+def _straight_line_meters(left: CandidatePlace, right: CandidatePlace) -> float:
+    distance_km = haversine_km(left, right)
+    if not math.isfinite(distance_km):
+        return math.inf
+    return distance_km * 1000.0
+
+
+def _transit_walk_proof_triggered(
+    left: CandidatePlace,
+    right: CandidatePlace,
+    *,
+    generation_mode: EffectiveCommuteMode,
+) -> bool:
+    if generation_mode != "transit":
+        return False
+    settings = get_settings()
+    return _straight_line_meters(left, right) <= float(
+        settings.commute_transit_walk_proof_max_meters
+    )
+
+
+def _provider_query_modes(
+    origin: CandidatePlace,
+    destination: CandidatePlace,
+    *,
+    generation_mode: EffectiveCommuteMode,
+) -> list[EffectiveCommuteMode]:
+    estimated = resolve_leg_effective_mode(
+        origin,
+        destination,
+        generation_mode=generation_mode,
+    )
+    modes: list[EffectiveCommuteMode] = [estimated]
+    if _transit_walk_proof_triggered(
+        origin,
+        destination,
+        generation_mode=generation_mode,
+    ) and "walking" not in modes:
+        modes.append("walking")
+    return modes
+
+
+def _valid_precise_route_values(distance_meters: object, duration_minutes: object) -> bool:
+    return (
+        isinstance(duration_minutes, int)
+        and not isinstance(duration_minutes, bool)
+        and duration_minutes > 0
+        and isinstance(distance_meters, int)
+        and not isinstance(distance_meters, bool)
+        and distance_meters >= 0
+    )
+
+
+def _walk_proof_duration_limit(settings=None) -> int:
+    configured = int((settings or get_settings()).route_single_leg_max_walking)
+    return min(WALK_PROOF_MAX_DURATION_MINUTES, configured)
+
+
+def _walk_proof_duration_ok(duration_minutes: int, settings=None) -> bool:
+    return duration_minutes <= _walk_proof_duration_limit(settings)
+
+
+def _adopted_walk_commute(leg: CommuteLeg) -> bool:
+    return (
+        leg.mode == "walking"
+        and leg.source == "amap"
+        and _valid_precise_route_values(leg.distance_meters, leg.duration_minutes)
+        and _walk_proof_duration_ok(leg.duration_minutes)
+    )
+
+
+def _adopted_walk_access(leg: AccessLeg) -> bool:
+    return (
+        leg.mode == "walking"
+        and leg.duration_source == "amap"
+        and _valid_precise_route_values(leg.distance_meters, leg.duration_minutes)
+        and _walk_proof_duration_ok(leg.duration_minutes)
+    )
+
+
+def _walk_proof_error_reason(error: BaseException) -> str:
+    if isinstance(error, asyncio.CancelledError):
+        return WALK_PROOF_CANCELLED
+    if isinstance(error, asyncio.TimeoutError):
+        return WALK_PROOF_TIMEOUT
+    if isinstance(error, RouteProviderBudgetExceededError):
+        return WALK_PROOF_BUDGET
+    if isinstance(error, RouteProviderRateLimitError):
+        return WALK_PROOF_RATE_LIMITED
+    if isinstance(error, RouteProviderError):
+        if "no path" in str(error).lower():
+            return WALK_PROOF_NO_PATH
+        return WALK_PROOF_PROVIDER_ERROR
+    return WALK_PROOF_PROVIDER_ERROR
+
+
+def _walk_reason_of(leg) -> str | None:
+    if isinstance(leg, str) and leg:
+        return leg
+    if leg is None:
+        return None
+    return (
+        getattr(leg, "walk_proof_decision", None)
+        or getattr(leg, "walk_proof_receipt", None)
+        or None
+    )
+
+
+def _negative_walk_reason(reason: str | None) -> str | None:
+    if reason and reason != WALK_PROOF_ADOPTED:
+        return reason
+    return None
+
+
+def _walk_proof_reject_key(from_place_id: int, to_place_id: int) -> tuple[str, int, int]:
+    return (WALK_PROOF_REJECT_SENTINEL, int(from_place_id), int(to_place_id))
+
+
+def _cached_walk_reject_reason(
+    known_precise_legs: dict | None,
+    from_place_id: int,
+    to_place_id: int,
+) -> str | None:
+    if not known_precise_legs:
+        return None
+    reason = known_precise_legs.get(
+        _walk_proof_reject_key(from_place_id, to_place_id)
+    )
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _known_success_commute(value) -> bool:
+    return (
+        isinstance(value, CommuteLeg)
+        and value.source == "amap"
+        and _valid_precise_route_values(value.distance_meters, value.duration_minutes)
+    )
+
+
+def _known_success_access(value) -> bool:
+    return (
+        isinstance(value, AccessLeg)
+        and value.duration_source == "amap"
+        and _valid_precise_route_values(value.distance_meters, value.duration_minutes)
+    )
+
+
+def _stamp_walk_proof(leg, reason: str | None):
+    if not reason:
+        return leg
+    updates = {}
+    if getattr(leg, "walk_proof_decision", None) != reason:
+        updates["walk_proof_decision"] = reason
+    if getattr(leg, "walk_proof_receipt", None) != reason:
+        updates["walk_proof_receipt"] = reason
+    if not updates:
+        return leg
+    return leg.model_copy(update=updates)
+
+
+def _remember_walk_proof_decision(
+    known_precise_legs: dict | None,
+    estimated: CommuteLeg,
+    reason: str,
+) -> None:
+    if known_precise_legs is None or not reason or reason == WALK_PROOF_ADOPTED:
+        return
+    known_precise_legs[
+        _walk_proof_reject_key(estimated.from_place_id, estimated.to_place_id)
+    ] = reason
+
+
+def _with_walk_decision(leg, reason: str | None):
+    if not reason:
+        return leg
+    return _stamp_walk_proof(leg, reason)
+
+
+def _estimate_with_cached_walk_reason(
+    estimated: CommuteLeg,
+    known_precise_legs: dict | None,
+) -> CommuteLeg:
+    """Stamp a walking-proof reason onto an estimate without reapplying precise facts."""
+    if not known_precise_legs:
+        return estimated
+    reason = _cached_walk_reject_reason(
+        known_precise_legs, estimated.from_place_id, estimated.to_place_id,
+    )
+    if not reason:
+        found = known_precise_legs.get(
+            (estimated.from_place_id, estimated.to_place_id, estimated.mode)
+        )
+        reason = (
+            _negative_walk_reason(_walk_reason_of(found))
+            if _known_success_commute(found)
+            else None
+        )
+    if not reason:
+        return estimated
+    return _stamp_walk_proof(estimated, reason)
+
+
+def _transit_walk_proof_applies(
+    origin: CandidatePlace | None,
+    destination: CandidatePlace | None,
+    *,
+    generation_mode: EffectiveCommuteMode | None,
+    estimated_mode: EffectiveCommuteMode | None = None,
+) -> bool:
+    if generation_mode is None:
+        generation_mode = estimated_mode
+    if generation_mode != "transit" or origin is None or destination is None:
+        return False
+    return _transit_walk_proof_triggered(
+        origin,
+        destination,
+        generation_mode="transit",
+    )
+
+
+def _lookup_known_commute_leg(
+    estimated: CommuteLeg,
+    known_precise_legs: dict | None,
+    *,
+    origin: CandidatePlace | None = None,
+    destination: CandidatePlace | None = None,
+    generation_mode: EffectiveCommuteMode | None = None,
+) -> CommuteLeg:
+    if not known_precise_legs:
+        return estimated
+    walking = known_precise_legs.get(
+        (estimated.from_place_id, estimated.to_place_id, "walking")
+    )
+    prove = _transit_walk_proof_applies(
+        origin,
+        destination,
+        generation_mode=generation_mode,
+        estimated_mode=estimated.mode,
+    )
+    if prove and isinstance(walking, CommuteLeg) and _adopted_walk_commute(walking):
+        return walking.model_copy(deep=True)
+    found = known_precise_legs.get(
+        (estimated.from_place_id, estimated.to_place_id, estimated.mode)
+    )
+    reject = (
+        _cached_walk_reject_reason(
+            known_precise_legs, estimated.from_place_id, estimated.to_place_id,
+        )
+        if prove
+        else None
+    )
+    if not _known_success_commute(found):
+        if reject:
+            return _stamp_walk_proof(estimated, reject)
+        return estimated
+    copied = found.model_copy(deep=True)
+    reason = reject or (
+        _negative_walk_reason(_walk_reason_of(copied)) if prove else None
+    )
+    if reason:
+        return _stamp_walk_proof(copied, reason)
+    return copied
+
+
+def _lookup_known_access(
+    leg: AccessLeg,
+    place: CandidatePlace,
+    known_access: dict | None,
+    *,
+    generation_mode: EffectiveCommuteMode | None = None,
+) -> AccessLeg:
+    known_access = known_access or {}
+    origin, destination = _v2_access_endpoints(leg, place)
+    prove = _transit_walk_proof_applies(
+        origin,
+        destination,
+        generation_mode=generation_mode,
+        estimated_mode=leg.mode,
+    )
+    walking_key = _v2_access_key(leg.model_copy(update={"mode": "walking"}), place)
+    walking = known_access.get(walking_key)
+    if prove and isinstance(walking, AccessLeg) and _adopted_walk_access(walking):
+        return walking.model_copy(deep=True)
+    found = known_access.get(_v2_access_key(leg, place))
+    if not _known_success_access(found):
+        return leg
+    copied = found.model_copy(deep=True)
+    if prove:
+        reason = _negative_walk_reason(_walk_reason_of(copied))
+        if reason:
+            return _stamp_walk_proof(copied, reason)
+    return copied
+
+
+def _precise_commute_leg(
+    origin: CandidatePlace,
+    destination: CandidatePlace,
+    precise: PreciseRoute,
+    *,
+    mode: EffectiveCommuteMode,
+    requested_commute_mode: str,
+    walk_proof_decision: str | None = None,
+) -> CommuteLeg:
+    mode_labels = {
+        "driving": "驾车",
+        "transit": "公交",
+        "walking": "步行",
+        "cycling": "骑行",
+    }
+    transit = mode == "transit"
+    walking = mode == "walking"
+    leg = CommuteLeg(
+        from_place_id=origin.place_id,
+        to_place_id=destination.place_id,
+        from_name=origin.name,
+        to_name=destination.name,
+        distance_meters=precise.distance_meters,
+        duration_minutes=precise.duration_minutes,
+        mode=mode,
+        source="amap",
+        note=(
+            f"{origin.name} → {destination.name}："
+            f"{mode_labels[mode]}预计 {precise.duration_minutes} 分钟"
+        ),
+        encoded_polyline=precise.encoded_polyline or "",
+        transit_steps=list(precise.transit_steps) if transit else [],
+        transit_detail_quality=(
+            precise.transit_detail_quality if transit else "missing"
+        ),
+        transit_detail_cache_hit=(
+            precise.transit_detail_cache_hit if transit else False
+        ),
+        fare_observation=(
+            None
+            if walking
+            else fare_for_locked_leg(
+                precise.fare_observation,
+                effective_mode=mode,
+                requested_commute_mode=requested_commute_mode,
+            )
+        ),
+        walk_proof_decision=walk_proof_decision,
+    )
+    return _stamp_walk_proof(leg, walk_proof_decision)
+
+
+_SHORT_TRANSIT_ESTIMATE_WALK_SPEED = contextvars.ContextVar(
+    "short_transit_estimate_walk_speed", default=False,
+)
+
+
+def _duration_mode_for_estimate(
+    left: CandidatePlace,
+    right: CandidatePlace,
+    *,
+    effective_mode: EffectiveCommuteMode,
+    generation_mode: EffectiveCommuteMode | None = None,
+) -> EffectiveCommuteMode:
+    # Repair previews only: unproven short transit keeps transit mode, but uses
+    # walking speed so a 1-minute transit guess is not treated as reachability.
+    if (
+        _SHORT_TRANSIT_ESTIMATE_WALK_SPEED.get()
+        and generation_mode == "transit"
+        and effective_mode == "transit"
+        and _transit_walk_proof_triggered(left, right, generation_mode="transit")
+    ):
+        return "walking"
+    return effective_mode
+
+
 def _estimated_leg(
     left: CandidatePlace,
     right: CandidatePlace,
     *,
     effective_mode: EffectiveCommuteMode,
+    generation_mode: EffectiveCommuteMode | None = None,
 ) -> CommuteLeg:
     _, distance_meters, duration_minutes = _estimate_route_values(
         left,
         right,
-        effective_mode=effective_mode,
+        effective_mode=_duration_mode_for_estimate(
+            left,
+            right,
+            effective_mode=effective_mode,
+            generation_mode=generation_mode,
+        ),
     )
     mode_labels = {
         "driving": "驾车",
@@ -2675,6 +3283,7 @@ def _legs(
                 places[index + 1],
                 generation_mode=generation_mode,
             ),
+            generation_mode=generation_mode,
         )
         for index in range(len(places) - 1)
     ]
@@ -2702,6 +3311,10 @@ def _place_distance_km(a: CandidatePlace, b: CandidatePlace) -> float | None:
 
 def _is_near_duplicate_pair(a: CandidatePlace, b: CandidatePlace) -> bool:
     """Check if two places are near-duplicates via key equality or substring containment + proximity."""
+    if get_settings().selector_route_v2_enabled:
+        from src.agents.activity_arrangement import nested_relation
+        if nested_relation(a,b) or nested_relation(b,a):
+            return False
     ka = _near_duplicate_key(a) or f"id:{a.place_id}"
     kb = _near_duplicate_key(b) or f"id:{b.place_id}"
     if ka == kb:
@@ -3738,6 +4351,151 @@ def _time_hints(
     return hints
 
 
+ROUTE_NIGHT_HINT_PREFIX = "路线计划："
+
+
+def _route_matches_dimension(place: CandidatePlace, dimension: str) -> bool:
+    from src.agents.preferences import candidate_matches_dimension
+    return candidate_matches_dimension(place, dimension)
+
+
+def route_night_visit_intervals(day: RouteDayGroup, request: TripRequest | None) -> dict[int, tuple[int, int]]:
+    """Schedule the day's bounded evening stop from the locked route, without provider I/O.
+
+    Unknown windows and incomplete/stale physical inputs do not supply proof.
+    Waiting and breaks consume the window; no member, order or load limit changes.
+    """
+    return _route_night_schedule(day, request)[0]
+
+
+def route_night_gap(day: RouteDayGroup, request: TripRequest | None) -> str | None:
+    """Why a day with an evening-stop candidate got no evening slot; None otherwise."""
+    intervals, reason = _route_night_schedule(day, request)
+    if intervals or _evening_stop_id(day.places, request) is None:
+        return None
+    return reason
+
+
+def _evening_stop_id(places: list[CandidatePlace], request: TripRequest | None) -> int | None:
+    """One evening stop per day: its last night-view place that may go after dark.
+
+    Other night-view places stay ordinary visits. Stacking several into one
+    evening overran the window and lost the whole day's arrangement (P3 S01).
+    """
+    if request is None or NIGHT_VIEW not in scoring_dimension_ids(request.preferences):
+        return None
+    stops = [place.place_id for place in places
+             if _route_matches_dimension(place, NIGHT_VIEW) and _scheduled_evening_stop(place, request)]
+    return stops[-1] if stops else None
+
+
+def _route_night_schedule(
+    day: RouteDayGroup, request: TripRequest | None,
+) -> tuple[dict[int, tuple[int, int]], str | None]:
+    if request is None or NIGHT_VIEW not in scoring_dimension_ids(request.preferences):
+        return {}, "no_night_preference"
+    policy = day.time_policy
+    if policy is not None and policy.violations:
+        return {}, "time_policy_violation"
+    start = policy.start_minute if policy is not None else parse_hhmm(request.daily_start)
+    end = policy.end_minute if policy is not None else parse_hhmm(request.daily_end)
+    user_start, user_end = parse_hhmm(request.daily_start), parse_hhmm(request.daily_end)
+    if user_start is not None:
+        start = user_start if start is None else max(start, user_start)
+    if user_end is not None:
+        end = user_end if end is None else min(end, user_end)
+    if start is None or end is None or not 0 <= start < end <= 1440:
+        return {}, "window_unknown"
+    ids = [place.place_id for place in day.places]
+    feasibility = day.day_feasibility
+    profiles = day.visit_profiles
+    if (not ids or len(ids) != len(set(ids)) or feasibility is None or not feasibility.feasible
+            or feasibility.ordered_place_ids != ids
+            or [profile.place_id for profile in profiles] != ids
+            or any(profile.arrangement != "standard" or profile.visit_minutes <= 0 for profile in profiles)
+            or [(leg.from_place_id, leg.to_place_id) for leg in day.commute_legs] != list(zip(ids, ids[1:]))):
+        return {}, "receipts_stale"
+    if (sum(p.visit_minutes for p in profiles) != feasibility.visit_minutes
+            or sum(p.uncertainty_minutes for p in profiles) != feasibility.uncertainty_minutes
+            or sum(leg.duration_minutes for leg in day.commute_legs) != feasibility.poi_commute_minutes
+            or feasibility.load_minutes != (
+                feasibility.visit_minutes + feasibility.uncertainty_minutes
+                + feasibility.poi_commute_minutes + (feasibility.access_minutes or 0)
+                + feasibility.break_minutes)
+            or feasibility.load_minutes > feasibility.load_limit_minutes):
+        return {}, "receipts_stale"
+    access = {leg.direction: leg for leg in day.access_legs}
+    if not day.access_legs and feasibility.access_minutes not in (None, 0):
+        return {}, "access_stale"
+    if day.access_legs and (
+        len(day.access_legs) != 2 or set(access) != {"outbound", "inbound"}
+        or access["outbound"].place_id != ids[0] or access["inbound"].place_id != ids[-1]
+        or len({(leg.anchor_source, leg.anchor_latitude, leg.anchor_longitude) for leg in day.access_legs}) != 1
+        or sum(leg.duration_minutes for leg in day.access_legs) != feasibility.access_minutes
+    ):
+        return {}, "access_stale"
+    breaks = list(policy.break_intervals) + list(policy.system_break_intervals) if policy is not None else []
+    breaks += [(parse_hhmm(rest.start), parse_hhmm(rest.end)) for rest in request.rest_windows]
+    if any(left is None or right is None or right <= left for left, right in breaks):
+        return {}, "breaks_invalid"
+    breaks = sorted((left, right) for left, right in breaks if left < end and start < right)
+
+    def reserve(cursor, minutes):
+        while cursor + minutes <= end:
+            overlap = next((right for left, right in breaks if cursor < right and left < cursor + minutes), None)
+            if overlap is None:
+                return cursor, cursor + minutes
+            cursor = overlap
+        return None
+
+    outbound = reserve(start, access["outbound"].duration_minutes if access else 0)
+    if outbound is None:
+        return {}, "outbound_past_window"
+    cursor = outbound[1]
+    intervals = {}
+    evening_id = _evening_stop_id(day.places, request)
+    for index, (place, profile) in enumerate(zip(day.places, profiles)):
+        night = place.place_id == evening_id
+        if intervals and not night and daytime_activity(place):
+            return {}, "daytime_after_evening_stop"
+        if night and 5 * 60 <= cursor < 18 * 60:
+            cursor = 18 * 60
+        interval = reserve(cursor, profile.visit_minutes + profile.uncertainty_minutes)
+        if interval is None:
+            return {}, "evening_stop_past_window" if night else "visit_past_window"
+        if night:
+            left, right = interval
+            if not (right <= 5 * 60 or 18 * 60 <= left <= right < 1440):
+                return {}, "evening_stop_outside_night"
+            intervals[place.place_id] = interval
+        cursor = interval[1]
+        if index < len(day.commute_legs):
+            transit = reserve(cursor, day.commute_legs[index].duration_minutes)
+            if transit is None:
+                return {}, "transit_past_window"
+            cursor = transit[1]
+    if reserve(cursor, access["inbound"].duration_minutes if access else 0) is None:
+        return {}, "inbound_past_window"
+    return intervals, None
+
+
+def route_night_hint(place: CandidatePlace, interval: tuple[int, int]) -> str:
+    def clock(minute):
+        return f"{minute // 60:02d}:{minute % 60:02d}"
+    return f"{ROUTE_NIGHT_HINT_PREFIX}{place.name}夜景{clock(interval[0])}–{clock(interval[1])}"
+
+
+def _refresh_route_night_hints(day: RouteDayGroup, request: TripRequest) -> None:
+    # Rebuild our receipts after membership, profile or actual traffic changes.
+    intervals = route_night_visit_intervals(day, request)
+    day.time_hints = [hint for hint in day.time_hints if not hint.startswith(ROUTE_NIGHT_HINT_PREFIX)]
+    for place in day.places:
+        if place.place_id in intervals:
+            template = f"{place.name}适合安排在傍晚或夜间"
+            day.time_hints = [hint for hint in day.time_hints if hint != template]
+            day.time_hints.append(route_night_hint(place, intervals[place.place_id]))
+
+
 def _is_evening_marked(place: CandidatePlace) -> bool:
     evidence = " ".join(
         str(item.get("reason", ""))
@@ -3760,6 +4518,15 @@ def _is_daytime_marked(place: CandidatePlace) -> bool:
         marker in f"{place.name} {evidence}"
         for marker in _DAYTIME_MARKERS
     )
+
+
+def _scheduled_evening_stop(place: CandidatePlace, request: TripRequest | None) -> bool:
+    explicit_night = request is not None and NIGHT_VIEW in scoring_dimension_ids(request.preferences)
+    # Keep existing evening-order constraints. Add eligible photo/night stops
+    # to that group for an explicit preference; sorting alone is never proof.
+    return (_is_evening_marked(place) or (
+        explicit_night and _route_matches_dimension(place, NIGHT_VIEW)
+    )) and not _is_daytime_marked(place)
 
 
 def _is_daytime_activity(
@@ -3804,11 +4571,19 @@ def _time_ordered_places(
         )
     daytime = [
         place for place in places
-        if not _is_evening_marked(place) or _is_daytime_marked(place)
+        if not _scheduled_evening_stop(place, request)
     ]
     evening = [
         place for place in places
-        if _is_evening_marked(place) and not _is_daytime_marked(place)
+        if _scheduled_evening_stop(place, request)
+    ]
+    if len(evening) > 1:
+        evening = _nearest_neighbor(evening, accommodation_coord)
+    # The day's evening stop closes the day; nothing long runs after it.
+    evening_id = _evening_stop_id(evening, request)
+    evening = [
+        *(place for place in evening if place.place_id != evening_id),
+        *(place for place in evening if place.place_id == evening_id),
     ]
     return [
         *(
@@ -3816,11 +4591,7 @@ def _time_ordered_places(
             if len(daytime) > 1
             else daytime
         ),
-        *(
-            _nearest_neighbor(evening, accommodation_coord)
-            if len(evening) > 1
-            else evening
-        ),
+        *evening,
     ]
 
 
@@ -3933,11 +4704,7 @@ def _route_day_invariant_violations(
 
 
 def _food_focused(preferences: list[str]) -> bool:
-    return any(
-        kw in pref.lower()
-        for pref in preferences
-        for kw in ["美食", "吃", "food", "火锅", "小吃", "餐厅"]
-    )
+    return food_preference_active(preferences)
 
 
 def _allows_food_in_core_route_slots(request: TripRequest) -> bool:
@@ -6770,16 +7537,7 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
 
 
 def _nature_preference_active(request: TripRequest) -> bool:
-    preference_text = " ".join(request.preferences)
-    if _contains_any(preference_text, NATURE_PREFERENCE_MARKERS):
-        return True
-    # Notes may contain serialized request/city context. Single-character
-    # nature markers such as 海/山/湖/河 are too ambiguous there (for example,
-    # 上海 must not become a nature preference).
-    note_markers = tuple(
-        marker for marker in NATURE_PREFERENCE_MARKERS if len(marker) >= 2
-    )
-    return _contains_any(request.notes, note_markers)
+    return nature_preference_active(request.preferences, notes=request.notes)
 
 
 def _relaxed_preference_active(request: TripRequest) -> bool:
@@ -6811,19 +7569,8 @@ def _recognized_route_preference_active(request: TripRequest) -> bool:
         _nature_preference_active(request)
         or _relaxed_preference_active(request)
         or _spatial_spread_preference_active(request)
-        or bool(preference_place_type_dimensions(request.preferences))
+        or bool(scoring_dimension_ids(request.preferences))
     )
-
-
-def _is_nature_core_place(place: CandidatePlace) -> bool:
-    place_type = (place.place_type or "").strip().lower()
-    if place_type in NON_NATURE_PLACE_TYPES:
-        return False
-    if place_type in NATURE_CORE_PLACE_TYPES:
-        return True
-    if place_type == "attraction":
-        return _contains_any(_route_quality_text(place), NATURE_CORE_TEXT_MARKERS)
-    return False
 
 
 def _route_place_count(route_plan: RoutePlan) -> int:
@@ -6835,11 +7582,7 @@ def _place_type_preference_metrics(
     retrieval: RetrievalResult,
     route_plan: RoutePlan,
 ) -> dict[str, Any]:
-    dimensions = preference_place_type_dimensions(request.preferences)
-    # Nature already has its stronger semantic matcher. Avoid double-counting a
-    # park preference as both nature and a raw place-type dimension.
-    if _nature_preference_active(request):
-        dimensions.pop("park", None)
+    dimensions = scoring_dimension_ids(request.preferences)
 
     pool_by_id: dict[int, CandidatePlace] = {}
     for candidate in [
@@ -6849,23 +7592,22 @@ def _place_type_preference_metrics(
         pool_by_id.setdefault(candidate.place_id, candidate)
     available_dimensions = {
         dimension
-        for dimension, place_types in dimensions.items()
+        for dimension in dimensions
         if any(
-            (candidate.place_type or "").strip().lower() in place_types
+            _route_matches_dimension(candidate, dimension)
             and _has_coordinates(candidate)
             and _is_core_route_slot_candidate(candidate, request=request)
             for candidate in pool_by_id.values()
         )
     }
-    route_place_types = {
-        (place.place_type or "").strip().lower()
-        for day_group in route_plan.day_groups
-        for place in day_group.places
-    }
     matched_dimensions = {
         dimension
         for dimension in available_dimensions
-        if route_place_types & dimensions[dimension]
+        if any(
+            _route_matches_dimension(place, dimension)
+            for day_group in route_plan.day_groups
+            for place in day_group.places
+        )
     }
     missing_dimensions = available_dimensions - matched_dimensions
     unavailable_dimensions = set(dimensions) - available_dimensions
@@ -7391,10 +8133,23 @@ def build_route_quality_metrics(
 
 
 def _route_quality_preference_score(candidate: dict[str, Any]) -> int:
+    """Count each matched reward once.
+
+    Legacy ``nature`` and v2 ``place_type:nature`` describe the same request.
+    """
     preference_match = candidate.get("preference_match")
     if not isinstance(preference_match, dict):
         return 0
-    return sum(1 for matched in preference_match.values() if matched is True)
+    rewards: set[str] = set()
+    for key, matched in preference_match.items():
+        if matched is not True:
+            continue
+        name = str(key)
+        if name in {"nature", "place_type:nature"}:
+            rewards.add("nature")
+        else:
+            rewards.add(name)
+    return len(rewards)
 
 
 def _route_quality_place_type_count(candidate: dict[str, Any]) -> int:
@@ -8149,28 +8904,139 @@ async def _resolve_precise_legs(
     known_precise_legs: dict[tuple[int, int, str], CommuteLeg] | None = None,
     concurrency: int,
     timeout_seconds: float,
+    walk_proof: bool = True,
+    record_leg_metrics: bool = True,
+    whole_day_fallback: bool = True,
 ) -> list[CommuteLeg]:
     if not estimated_legs:
         return []
-    if metrics is not None:
-        for estimated in estimated_legs:
-            metrics.record_effective_leg(
-                estimated.mode,
-                rationalized=estimated.mode != generation_mode,
-            )
     semaphore = asyncio.Semaphore(concurrency)
+
+    def record_final(leg: CommuteLeg, *, fallback: bool = False) -> None:
+        if metrics is None or not record_leg_metrics:
+            return
+        metrics.record_effective_leg(
+            leg.mode,
+            rationalized=leg.mode != generation_mode,
+        )
+        if fallback:
+            metrics.record_effective_fallback(leg.mode)
+
+    def remember_receipt(leg: CommuteLeg) -> CommuteLeg:
+        if metrics is None:
+            return leg
+        reason = _walk_reason_of(leg)
+        if reason:
+            metrics.record_walk_proof(
+                reason,
+                from_place_id=leg.from_place_id,
+                to_place_id=leg.to_place_id,
+            )
+        return leg
 
     async def fetch(index: int, estimated: CommuteLeg):
         origin = day_group.places[index]
         destination = day_group.places[index + 1]
         precise_key = (origin.place_id, destination.place_id, estimated.mode)
-        if known_precise_legs is not None and precise_key in known_precise_legs:
-            return index, known_precise_legs[precise_key].model_copy(deep=True), None
+        walking_key = (origin.place_id, destination.place_id, "walking")
+        prove = walk_proof and _transit_walk_proof_applies(
+            origin,
+            destination,
+            generation_mode=generation_mode,
+            estimated_mode=estimated.mode,
+        )
+        walk_reason = None
+        cached_walk = (
+            known_precise_legs.get(walking_key)
+            if known_precise_legs is not None
+            else None
+        )
+        if prove and isinstance(cached_walk, CommuteLeg) and _adopted_walk_commute(cached_walk):
+            return index, remember_receipt(cached_walk.model_copy(deep=True)), None
+        if prove:
+            walk_reason = _cached_walk_reject_reason(
+                known_precise_legs, origin.place_id, destination.place_id,
+            )
+            if walk_reason is None and known_precise_legs is not None:
+                cached_precise = known_precise_legs.get(precise_key)
+                if _known_success_commute(cached_precise):
+                    walk_reason = _negative_walk_reason(
+                        _walk_reason_of(cached_precise)
+                    )
+            if walk_reason is None:
+                async with semaphore:
+                    try:
+                        walking_precise = await provider.route(
+                            origin=origin,
+                            destination=destination,
+                            city=city,
+                            effective_mode="walking",
+                            citycode=citycode,
+                        )
+                    except RouteProviderBudgetExceededError as exc:
+                        reason = _walk_proof_error_reason(exc)
+                        _remember_walk_proof_decision(
+                            known_precise_legs, estimated, reason,
+                        )
+                        return index, remember_receipt(
+                            _with_walk_decision(estimated, reason)
+                        ), exc
+                    except RouteProviderRateLimitError as exc:
+                        reason = _walk_proof_error_reason(exc)
+                        _remember_walk_proof_decision(
+                            known_precise_legs, estimated, reason,
+                        )
+                        return index, remember_receipt(
+                            _with_walk_decision(estimated, reason)
+                        ), exc
+                    except RouteProviderError as exc:
+                        walk_reason = _walk_proof_error_reason(exc)
+                        _remember_walk_proof_decision(
+                            known_precise_legs, estimated, walk_reason,
+                        )
+                    else:
+                        if not _valid_precise_route_values(
+                            walking_precise.distance_meters,
+                            walking_precise.duration_minutes,
+                        ):
+                            walk_reason = WALK_PROOF_INVALID
+                            _remember_walk_proof_decision(
+                                known_precise_legs, estimated, walk_reason,
+                            )
+                        elif not _walk_proof_duration_ok(
+                            walking_precise.duration_minutes,
+                        ):
+                            walk_reason = WALK_PROOF_OVER_DURATION
+                            _remember_walk_proof_decision(
+                                known_precise_legs, estimated, walk_reason,
+                            )
+                        else:
+                            resolved = _precise_commute_leg(
+                                origin,
+                                destination,
+                                walking_precise,
+                                mode="walking",
+                                requested_commute_mode=requested_commute_mode,
+                                walk_proof_decision=WALK_PROOF_ADOPTED,
+                            )
+                            if known_precise_legs is not None:
+                                known_precise_legs[walking_key] = (
+                                    resolved.model_copy(deep=True)
+                                )
+                            return index, remember_receipt(resolved), None
+        if known_precise_legs is not None:
+            cached = known_precise_legs.get(precise_key)
+            if _known_success_commute(cached):
+                return index, remember_receipt(
+                    _with_walk_decision(cached.model_copy(deep=True), walk_reason)
+                ), None
         if estimated.mode == "transit" and not citycode:
             if metrics is not None:
                 metrics.amap_missing_citycode_count += 1
-            return index, estimated, _MissingTransitCitycodeError(
-                "transit route requires citycode"
+            return (
+                index,
+                remember_receipt(_with_walk_decision(estimated, walk_reason)),
+                _MissingTransitCitycodeError("transit route requires citycode"),
             )
         async with semaphore:
             try:
@@ -8182,51 +9048,20 @@ async def _resolve_precise_legs(
                     citycode=citycode,
                 )
             except RouteProviderError as exc:
-                return index, estimated, exc
-        mode_label = {
-            "driving": "驾车",
-            "transit": "公交",
-            "walking": "步行",
-            "cycling": "骑行",
-        }[estimated.mode]
-        resolved = CommuteLeg(
-            from_place_id=origin.place_id,
-            to_place_id=destination.place_id,
-            from_name=origin.name,
-            to_name=destination.name,
-            distance_meters=precise.distance_meters,
-            duration_minutes=precise.duration_minutes,
+                return index, remember_receipt(
+                    _with_walk_decision(estimated, walk_reason)
+                ), exc
+        resolved = _precise_commute_leg(
+            origin,
+            destination,
+            precise,
             mode=estimated.mode,
-            source="amap",
-            note=(
-                f"{origin.name} → {destination.name}："
-                f"{mode_label}预计 {precise.duration_minutes} 分钟"
-            ),
-            encoded_polyline=precise.encoded_polyline or "",
-            transit_steps=(
-                list(precise.transit_steps)
-                if estimated.mode == "transit"
-                else []
-            ),
-            transit_detail_quality=(
-                precise.transit_detail_quality
-                if estimated.mode == "transit"
-                else "missing"
-            ),
-            transit_detail_cache_hit=(
-                precise.transit_detail_cache_hit
-                if estimated.mode == "transit"
-                else False
-            ),
-            fare_observation=fare_for_locked_leg(
-                precise.fare_observation,
-                effective_mode=estimated.mode,
-                requested_commute_mode=requested_commute_mode,
-            ),
+            requested_commute_mode=requested_commute_mode,
+            walk_proof_decision=walk_reason,
         )
         if known_precise_legs is not None:
             known_precise_legs[precise_key] = resolved.model_copy(deep=True)
-        return index, resolved, None
+        return index, remember_receipt(resolved), None
 
     tasks = [
         asyncio.create_task(fetch(index, estimated))
@@ -8241,14 +9076,22 @@ async def _resolve_precise_legs(
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        stamped = [
+            remember_receipt(
+                _estimate_with_cached_walk_reason(estimated, known_precise_legs)
+            )
+            for estimated in estimated_legs
+        ]
+        if not whole_day_fallback:
+            return stamped
         logger.warning(
             "Amap route enrichment timed out, using estimates for day legs"
         )
         if metrics is not None:
-            metrics.amap_fallback_count += len(estimated_legs)
-            for estimated in estimated_legs:
-                metrics.record_effective_fallback(estimated.mode)
-        return estimated_legs
+            metrics.amap_fallback_count += len(stamped)
+            for leg in stamped:
+                record_final(leg, fallback=True)
+        return stamped
 
     budget_errors = [
         error
@@ -8270,19 +9113,25 @@ async def _resolve_precise_legs(
             for leg in successful_precise_legs
         ) > daily_budget
     )
-    if budget_errors and not precise_hard_violation:
+    if budget_errors and not precise_hard_violation and whole_day_fallback:
         logger.warning(
             "Amap route provider budget exhausted; using consistent "
             "estimates for the whole day: %s",
             budget_errors[0],
         )
+        stamped = [
+            remember_receipt(
+                _estimate_with_cached_walk_reason(estimated, known_precise_legs)
+            )
+            for estimated in estimated_legs
+        ]
         if metrics is not None:
             metrics.amap_provider_budget_exhausted_count += 1
             metrics.record_precise_recovery_reason("provider_budget_exhausted")
-            metrics.amap_fallback_count += len(estimated_legs)
-            for estimated in estimated_legs:
-                metrics.record_effective_fallback(estimated.mode)
-        return estimated_legs
+            metrics.amap_fallback_count += len(stamped)
+            for leg in stamped:
+                record_final(leg, fallback=True)
+        return stamped
 
     precise_legs: list[CommuteLeg] = []
     budget_exhaustion_recorded = False
@@ -8291,7 +9140,7 @@ async def _resolve_precise_legs(
         if isinstance(error, _MissingTransitCitycodeError):
             if metrics is not None:
                 metrics.amap_fallback_count += 1
-                metrics.record_effective_fallback(leg.mode)
+            record_final(leg, fallback=True)
             precise_legs.append(leg)
             continue
         if isinstance(error, RouteProviderBudgetExceededError):
@@ -8308,7 +9157,7 @@ async def _resolve_precise_legs(
                         "provider_budget_exhausted"
                     )
                 metrics.amap_fallback_count += 1
-                metrics.record_effective_fallback(leg.mode)
+            record_final(leg, fallback=True)
             budget_exhaustion_recorded = True
             precise_legs.append(leg)
             continue
@@ -8322,7 +9171,7 @@ async def _resolve_precise_legs(
                 if not rate_limit_recorded:
                     metrics.amap_provider_rate_limit_fallback_count += 1
                 metrics.amap_fallback_count += 1
-                metrics.record_effective_fallback(leg.mode)
+            record_final(leg, fallback=True)
             rate_limit_recorded = True
             precise_legs.append(leg)
             continue
@@ -8334,9 +9183,10 @@ async def _resolve_precise_legs(
             if metrics is not None:
                 metrics.amap_provider_error_fallback_count += 1
                 metrics.amap_fallback_count += 1
-                metrics.record_effective_fallback(leg.mode)
+            record_final(leg, fallback=True)
             precise_legs.append(leg)
             continue
+        record_final(leg)
         precise_legs.append(leg)
     return precise_legs
 
@@ -8345,7 +9195,6 @@ _ROUTE_WORKFLOW_RESERVE_SECONDS = 110.0
 
 
 # Route v2 owns one request-wide search budget and one final membership commit.
-V2_MAX_TRIALS = 24
 V2_MAX_PROPOSALS = 8
 V2_MAX_REPAIR_ROUNDS = 3
 # Changed-day previews have no provider I/O. At most three anchors per round
@@ -8357,6 +9206,11 @@ V2_MAX_REPAIR_PREVIEWS = 1536
 def _v2_access_key(leg, place):
     return (leg.direction, leg.anchor_source, leg.anchor_latitude, leg.anchor_longitude,
             place.place_id, place.latitude, place.longitude, leg.mode)
+
+
+def _v2_access_pair_key(leg, place):
+    return (leg.direction, leg.anchor_source, leg.anchor_latitude, leg.anchor_longitude,
+            place.place_id, place.latitude, place.longitude)
 
 
 def _v2_access_endpoints(leg, place):
@@ -8376,45 +9230,274 @@ def _v2_transport_plan(plan):
     return RoutePlan(label="provider-transport-queries", day_groups=days)
 
 
-async def _v2_resolve_access(plan, provider, known_access, attempted, *, city, citycode, deadline):
+async def _v2_resolve_access(plan, provider, known_access, attempted, *, city, citycode, deadline,
+                             generation_mode=None, walk_proof=True, walk_rejections=None):
     resolver = getattr(provider, "route_access", None)
     if not callable(resolver):
         return
+    # Keep rejected proofs across candidate rebuilds, separate from successful
+    # provider facts. The caller shares this map only within one route request.
+    walk_rejections = {} if walk_rejections is None else walk_rejections
+    settings = get_settings()
+    semaphore = asyncio.Semaphore(max(1, settings.amap_route_enrichment_concurrency))
+    deadline_exhausted = asyncio.Event()
+    if generation_mode is None:
+        generation_mode = next((leg.mode for day in plan.day_groups for leg in day.access_legs), None)
+    call_timeout = max(1, settings.amap_route_timeout)
+
+    def walking_key_for(leg, place):
+        return _v2_access_key(leg.model_copy(update={"mode": "walking"}), place)
+
+    def prove_walk(leg, place):
+        if not walk_proof:
+            return False
+        origin, destination = _v2_access_endpoints(leg, place)
+        return (
+            (generation_mode or leg.mode) == "transit"
+            and leg.mode == "transit"
+            and _transit_walk_proof_triggered(
+                origin, destination, generation_mode="transit",
+            )
+        )
+
+    def apply_targets(targets, precise):
+        for day, index, _, _ in targets:
+            day.access_legs[index] = precise.model_copy(deep=True)
+
+    def stamp_targets(targets, reason):
+        if not reason:
+            return
+        for day, index, current, place in targets:
+            walk_rejections[walking_key_for(current, place)] = reason
+            day.access_legs[index] = _stamp_walk_proof(current, reason)
+
+    pending = {}
     for day in plan.day_groups:
         by_id = {p.place_id: p for p in day.places}
         for index, leg in enumerate(day.access_legs):
             place = by_id[leg.place_id]
-            key = _v2_access_key(leg, place)
-            if key in known_access:
-                day.access_legs[index] = known_access[key].model_copy(deep=True)
+            walking_key = walking_key_for(leg, place)
+            transit_key = _v2_access_key(leg, place)
+            prove = prove_walk(leg, place)
+            if prove:
+                adopted = known_access.get(walking_key)
+                if isinstance(adopted, AccessLeg) and _adopted_walk_access(adopted):
+                    day.access_legs[index] = adopted.model_copy(deep=True)
+                    continue
+            elif _known_success_access(known_access.get(transit_key)):
+                day.access_legs[index] = known_access[transit_key].model_copy(deep=True)
                 continue
-            if key in attempted or (deadline is not None and time.monotonic() >= deadline):
-                continue
-            attempted.add(key)
+            pending.setdefault(_v2_access_pair_key(leg, place), []).append(
+                (day, index, day.access_legs[index], place))
+
+    async def query(origin, destination, mode, key):
+        if (deadline_exhausted.is_set() or
+                (deadline is not None and time.monotonic() >= deadline)):
+            return None, "deadline"
+        # Queued work must not consume an attempt or provider budget.
+        attempted.add(key)
+        remaining = max(.001, deadline - time.monotonic()) if deadline is not None else 60
+        try:
+            fact = await asyncio.wait_for(
+                resolver(
+                    origin=origin, destination=destination,
+                    city=city, effective_mode=mode, citycode=citycode,
+                ),
+                timeout=min(remaining, call_timeout),
+            )
+            if not _valid_precise_route_values(fact.distance_meters, fact.duration_minutes):
+                return None, WALK_PROOF_INVALID
+            return fact, None
+        except asyncio.TimeoutError:
+            # A wall-bound timeout may wake just before the monotonic deadline.
+            # Stop queued admission while retaining already completed facts.
+            if deadline is not None and remaining <= call_timeout:
+                deadline_exhausted.set()
+            return None, WALK_PROOF_TIMEOUT
+        except asyncio.CancelledError:
+            raise
+        except RouteProviderBudgetExceededError:
+            return None, WALK_PROOF_BUDGET
+        except RouteProviderRateLimitError:
+            return None, WALK_PROOF_RATE_LIMITED
+        except RouteProviderError as exc:
+            return None, _walk_proof_error_reason(exc)
+
+    async def fetch(pair_key, targets):
+        async with semaphore:
+            _, _, leg, place = targets[0]
             origin, destination = _v2_access_endpoints(leg, place)
-            remaining = max(.001, deadline-time.monotonic()) if deadline is not None else 60
-            call_timeout = max(1, get_settings().amap_route_timeout)
-            try:
-                fact = await asyncio.wait_for(resolver(origin=origin, destination=destination,
-                    city=city, effective_mode=leg.mode, citycode=citycode),
-                    timeout=min(remaining, call_timeout))
-                # Treat malformed provider values as missing, never as a free journey.
-                if (not isinstance(fact.duration_minutes, int) or isinstance(fact.duration_minutes, bool)
-                        or fact.duration_minutes <= 0 or not isinstance(fact.distance_meters, int)
-                        or isinstance(fact.distance_meters, bool) or fact.distance_meters < 0):
-                    raise RouteProviderError("invalid access route values")
-            except asyncio.TimeoutError:
-                # Event-loop timers may wake slightly before monotonic deadline on
-                # Windows. A wall-budget timeout must not start another direction.
-                if deadline is not None and remaining <= call_timeout:
+            walking_key = walking_key_for(leg, place)
+            transit_key = _v2_access_key(leg, place)
+            prove = prove_walk(leg, place)
+            walk_reason = walk_rejections.get(walking_key) if prove else None
+            if prove:
+                cached_walk = known_access.get(walking_key)
+                if isinstance(cached_walk, AccessLeg) and _adopted_walk_access(cached_walk):
+                    apply_targets(targets, cached_walk)
                     return
-                continue
-            except RouteProviderError:
-                continue
-            precise = leg.model_copy(update={"duration_source": "amap",
-                "duration_minutes": fact.duration_minutes, "distance_meters": fact.distance_meters})
-            known_access[key] = precise
-            day.access_legs[index] = precise.model_copy(deep=True)
+                cached_transit = known_access.get(transit_key)
+                if _known_success_access(cached_transit):
+                    walk_reason = walk_reason or _negative_walk_reason(_walk_reason_of(cached_transit))
+                if walk_reason:
+                    stamp_targets(targets, walk_reason)
+                if walk_reason is None and walking_key not in attempted:
+                    try:
+                        fact, error = await query(
+                            origin, destination, "walking", walking_key,
+                        )
+                    except asyncio.CancelledError:
+                        stamp_targets(targets, WALK_PROOF_CANCELLED)
+                        raise
+                    if error == "deadline":
+                        return
+                    if error is None and _walk_proof_duration_ok(fact.duration_minutes):
+                        precise = _stamp_walk_proof(leg.model_copy(update={
+                            "mode": "walking",
+                            "duration_source": "amap",
+                            "duration_minutes": fact.duration_minutes,
+                            "distance_meters": fact.distance_meters,
+                        }), WALK_PROOF_ADOPTED)
+                        known_access[walking_key] = precise
+                        apply_targets(targets, precise)
+                        return
+                    walk_reason = (
+                        WALK_PROOF_OVER_DURATION
+                        if error is None
+                        else error
+                    )
+                    stamp_targets(targets, walk_reason)
+                    if walk_reason in {
+                        WALK_PROOF_BUDGET,
+                        WALK_PROOF_RATE_LIMITED,
+                        WALK_PROOF_TIMEOUT,
+                    }:
+                        return
+            if _known_success_access(known_access.get(transit_key)):
+                current = known_access[transit_key].model_copy(deep=True)
+                if walk_reason:
+                    current = _stamp_walk_proof(current, walk_reason)
+                    known_access[transit_key] = current
+                apply_targets(targets, current)
+                return
+            if transit_key in attempted:
+                if walk_reason:
+                    stamp_targets(targets, walk_reason)
+                return
+            try:
+                fact, error = await query(origin, destination, leg.mode, transit_key)
+            except asyncio.CancelledError:
+                if walk_reason or prove:
+                    stamp_targets(targets, walk_reason or WALK_PROOF_CANCELLED)
+                raise
+            if error is None and fact is not None:
+                precise = leg.model_copy(update={
+                    "duration_source": "amap",
+                    "duration_minutes": fact.duration_minutes,
+                    "distance_meters": fact.distance_meters,
+                })
+                if walk_reason:
+                    precise = _stamp_walk_proof(precise, walk_reason)
+                known_access[transit_key] = precise
+                apply_targets(targets, precise)
+                return
+            if error == "deadline":
+                return
+            if walk_reason:
+                stamp_targets(targets, walk_reason)
+
+    tasks = [
+        asyncio.create_task(fetch(key, targets))
+        for key, targets in pending.items()
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Drain children before returning or propagating caller cancellation.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _v2_apply_accepted_walk_proof(
+    plan,
+    *,
+    request,
+    provider,
+    known,
+    known_access,
+    attempted_access,
+    city,
+    citycode,
+    deadline,
+    generation_mode,
+    metrics,
+    access_walk_rejections=None,
+):
+    """Prove short transit legs walkable on the accepted membership only."""
+    if provider is None or plan is None:
+        return
+    settings = get_settings()
+    await _preload_precise_route_cache(
+        provider, [plan], city=city, generation_mode=generation_mode,
+    )
+    allocate = getattr(provider, "allocate_uncached_plan_calls", None)
+    if callable(allocate):
+        allocate(plan, city=city, generation_mode=generation_mode)
+    await _v2_resolve_access(
+        plan, provider, known_access, attempted_access,
+        city=city, citycode=citycode, deadline=deadline,
+        generation_mode=generation_mode, walk_proof=True,
+        walk_rejections=access_walk_rejections,
+    )
+    for day in plan.day_groups:
+        # A deadline stops further commute queries. Access facts for every day
+        # were already applied above, including one-point days with no POI leg.
+        can_query = deadline is None or time.monotonic() < deadline
+        if day.commute_legs and can_query:
+            remaining = (
+                max(.001, deadline - time.monotonic())
+                if deadline is not None
+                else 60
+            )
+            daily_budget = (
+                day.traffic_policy.daily_limit_minutes
+                if day.traffic_policy
+                else daily_commute_budget_minutes(request, settings)
+            )
+            day.commute_legs = await _resolve_precise_legs(
+                day,
+                day.commute_legs,
+                city=city,
+                citycode=citycode,
+                generation_mode=generation_mode,
+                requested_commute_mode=request.commute_mode,
+                daily_budget=daily_budget,
+                single_leg_max=single_leg_max_minutes(generation_mode, settings),
+                provider=provider,
+                metrics=metrics,
+                known_precise_legs=known,
+                concurrency=settings.amap_route_enrichment_concurrency,
+                timeout_seconds=min(
+                    remaining,
+                    max(settings.amap_route_timeout, 1) * len(day.commute_legs),
+                ),
+                walk_proof=True,
+                record_leg_metrics=False,
+                whole_day_fallback=False,
+            )
+            day.commute_legs = [
+                _lookup_known_commute_leg(
+                    leg, known,
+                    origin=day.places[index],
+                    destination=day.places[index + 1],
+                    generation_mode=generation_mode,
+                )
+                for index, leg in enumerate(day.commute_legs)
+            ]
+        if day.commute_legs or day.access_legs:
+            _v2_finalize_day(day, request)
 
 
 def _v2_access_legs(places, request, accommodation_coord, accommodation_source, known_access=None):
@@ -8431,17 +9514,83 @@ def _v2_access_legs(places, request, accommodation_coord, accommodation_source, 
         leg = AccessLeg(direction=direction, anchor_source=accommodation_source,
                      anchor_latitude=accommodation_coord[0], anchor_longitude=accommodation_coord[1],
                      place_id=place.place_id, mode=effective, duration_minutes=minutes, distance_meters=distance)
-        result.append((known_access or {}).get(_v2_access_key(leg, place), leg).model_copy(deep=True))
+        result.append(_lookup_known_access(
+            leg, place, known_access, generation_mode=mode,
+        ))
     return result
 
 
-def _v2_finalize_day(day, request):
-    day.day_feasibility = evaluate_day(day.places, day.commute_legs, day.access_legs, DayContext(request, get_settings(), day.traffic_policy))
+def _urban_night_time_policy(day: RouteDayGroup, request: TripRequest):
+    """Freeze a planned ordinary-day window; never invent a POI opening fact.
+
+    Explicit complete windows retain their existing path. When one is missing,
+    shift the existing bounded day capacity to include the existing two-hour
+    evening allowance. Physical visits, waiting and the return still must fit.
+    """
+    if (NIGHT_VIEW not in scoring_dimension_ids(request.preferences)
+            or (request.daily_start is not None and request.daily_end is not None)
+            or (day.traffic_policy is not None and day.traffic_policy.day_kind == "excursion")):
+        return None
+    if not any(_route_matches_dimension(p, NIGHT_VIEW) for p in day.places):
+        return None
+    from src.agents.route_feasibility import capacity_minutes
+    from src.agents.pace import detect_pace_mode
+    from src.agents.schema import ExcursionTimePolicy
+    capacity = capacity_minutes(request, get_settings())
+    reference_end = 18 * 60 + EVENING_ONLY_CAPACITY_MINUTES
+    reference_start = reference_end - capacity
+    user_start, user_end = parse_hhmm(request.daily_start), parse_hhmm(request.daily_end)
+    start = max(reference_start, user_start) if user_start is not None else reference_start
+    end = min(reference_end, user_end) if user_end is not None else reference_end
+    intervals = sorted((max(start, parse_hhmm(rest.start)), min(end, parse_hhmm(rest.end)))
+                       for rest in request.rest_windows
+                       if max(start, parse_hhmm(rest.start)) < min(end, parse_hhmm(rest.end)))
+    merged = []
+    for left, right in intervals:
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(right, merged[-1][1]))
+        else:
+            merged.append((left, right))
+    return ExcursionTimePolicy(
+        version="urban-night-time-v1", pace=detect_pace_mode(request), start_minute=start, end_minute=end,
+        start_source="user" if user_start is not None and user_start >= reference_start else "system",
+        end_source="user" if user_end is not None and user_end <= reference_end else "system",
+        reference_span_minutes=capacity, reference_start_minute=reference_start,
+        reference_end_minute=reference_end, original_daily_start=request.daily_start,
+        original_daily_end=request.daily_end,
+        original_rest_windows=[rest.model_dump() for rest in request.rest_windows],
+        break_intervals=merged, break_minutes=sum(right-left for left,right in merged),
+        violations=["schedule_conflict"] if end <= start else [],
+    )
+
+
+def _v2_finalize_day(day, request, *, locked=False):
+    if not locked:
+        if day.traffic_policy is not None:
+            from src.agents.accommodation_policy import day_policy
+            from src.agents.schema import AccommodationPlanningContext
+            old = day.traffic_policy
+            day.traffic_policy = day_policy(day.places, request, get_settings(),
+                AccommodationPlanningContext(state=old.resolution_state, urban_core=old.urban_core), None, day.commute_legs)
+            day.traffic_policy.location_precision = old.location_precision
+        from src.agents.excursion_time_policy import freeze_time_policy
+        day.time_policy = freeze_time_policy(request) if day.traffic_policy and day.traffic_policy.day_kind == "excursion" else None
+        from src.agents.activity_arrangement import resolve_profiles, full_day_place
+        if any(full_day_place(p) for p in day.places) and day.time_policy is None:
+            day.time_policy = freeze_time_policy(request)
+        if day.time_policy is None:
+            day.time_policy = _urban_night_time_policy(day, request)
+        day.visit_profiles, arrangement_violations = resolve_profiles(day.places,
+            [build_visit_profile(p) for p in day.places], request, day.commute_legs, day.access_legs, day.time_policy, settings=get_settings())
+    day.day_feasibility = evaluate_day(day.places, day.commute_legs, day.access_legs,
+        DayContext(request, get_settings(), day.traffic_policy, day.time_policy, tuple(day.visit_profiles)))
+    day.day_feasibility.violations = list(dict.fromkeys(day.day_feasibility.violations))
     day.commute_minutes = day.day_feasibility.poi_commute_minutes + (day.day_feasibility.access_minutes or 0)
     day.commute_notes = [leg.note for leg in day.commute_legs]
     summary = access_summary(day)
     if summary:
         day.commute_notes.append(summary)
+    _refresh_route_night_hints(day, request)
 
 
 def _v2_make_plan(groups, request, accommodation_coord, accommodation_source, known, coupling_context=None, anchor=None, known_access=None):
@@ -8449,7 +9598,15 @@ def _v2_make_plan(groups, request, accommodation_coord, accommodation_source, kn
     days = []
     for index, places in enumerate(groups, 1):
         legs = _legs(places, generation_mode=mode)
-        legs = [known.get((leg.from_place_id, leg.to_place_id, leg.mode), leg).model_copy(deep=True) for leg in legs]
+        legs = [
+            _lookup_known_commute_leg(
+                leg, known,
+                origin=places[index],
+                destination=places[index + 1],
+                generation_mode=mode,
+            )
+            for index, leg in enumerate(legs)
+        ]
         day = RouteDayGroup(day=index, places=[p.model_copy(deep=True) for p in places],
                             area=" / ".join(dict.fromkeys(p.district for p in places if p.district)),
                             adcode=_shared_adcode(places), commute_legs=legs,
@@ -8466,31 +9623,277 @@ def _v2_make_plan(groups, request, accommodation_coord, accommodation_source, kn
         accommodation_resolution_state=coupling_context.state if coupling_context else None)
 
 
-def _v2_quality(plan, request, selection, must_ids):
-    """Fixed interest dimensions, best ordinary preference per dimension; no count reward."""
-    ordinary = [item.place_id for item in selection.selected if item.place_id not in must_ids]
-    q = {pid: 1 - i / max(1, len(ordinary)) for i, pid in enumerate(ordinary)}
-    dimensions = preference_place_type_dimensions(request.preferences)
-    places = [p for day in plan.day_groups for p in day.places]
-    coverage = sum(any(p.place_type in types for p in places) for types in dimensions.values())
-    if dimensions:
-        preference = sum(max((q.get(p.place_id, 0) for p in places if p.place_type in types and p.place_id not in must_ids), default=0)
-                         for types in dimensions.values()) / len(dimensions)
+_COVERAGE_COVERED = "COVERED"
+_COVERAGE_NO_ELIGIBLE_MATCH = "NO_ELIGIBLE_MATCH"
+_COVERAGE_HARD_CONFLICT = "HARD_CONFLICT"
+_COVERAGE_SEARCH_NOT_FOUND = "SEARCH_NOT_FOUND"
+_COVERAGE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+_COVERAGE_TRACE_LIMIT = 24
+_COVERAGE_ID_LIMIT = 8
+_MEASURED_LIMITS = ("load_limit", "daily_commute_limit", "single_leg_limit")
+
+
+def _bound_coverage_ids(values) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw in values:
+        place_id = int(raw)
+        if place_id in seen:
+            continue
+        seen.add(place_id)
+        result.append(place_id)
+        if len(result) >= _COVERAGE_ID_LIMIT:
+            break
+    return result
+
+
+def _selected_place_ids(selection) -> set[int]:
+    return {int(item.place_id) for item in selection.selected}
+
+
+def _frozen_eligible_ids(
+    *,
+    selector_input,
+    request,
+    qualified_pool,
+    must_include_place_ids=None,
+) -> tuple[int, ...]:
+    """Use the frozen Selector list, or rebuild it. Never substitute the full pool."""
+    if selector_input is not None:
+        return tuple(int(place_id) for place_id in selector_input.constraints.eligible_place_ids)
+    from src.agents.poi_selection import build_poi_selection_input
+
+    rebuilt = build_poi_selection_input(
+        request,
+        qualified_pool,
+        must_include_place_ids=must_include_place_ids,
+    )
+    return tuple(int(place_id) for place_id in rebuilt.constraints.eligible_place_ids)
+
+
+def _coverage_snapshot(
+    *,
+    plan_place_ids,
+    request,
+    selection,
+    places_by_id,
+    frozen_eligible_ids,
+    hard_applicable_ids,
+    proved_conflicts=None,
+    search_exhausted=False,
+    plan_feasible=True,
+) -> list[dict]:
+    """One row per dimension over the frozen credible pool, including replacements."""
+    selected = _selected_place_ids(selection)
+    frozen = {int(place_id) for place_id in frozen_eligible_ids}
+    hard = {int(place_id) for place_id in hard_applicable_ids}
+    in_plan = {int(place_id) for place_id in plan_place_ids}
+    conflicts = proved_conflicts or {}
+    rows = []
+    for dimension in scoring_dimension_ids(request.preferences):
+        selected_matches: list[int] = []
+        applicable: list[int] = []
+        for place_id in sorted(frozen):
+            place = places_by_id.get(place_id)
+            if place is None or not _route_matches_dimension(place, dimension):
+                continue
+            selected_matches.append(place_id)
+            if place_id in hard:
+                applicable.append(place_id)
+        plan_matches = [place_id for place_id in applicable if place_id in in_plan]
+        conflict_rows = []
+        for place_id in applicable:
+            reason = conflicts.get(place_id)
+            if reason is None:
+                reason = conflicts.get(str(place_id))
+            if reason:
+                conflict_rows.append({
+                    "place_id": int(place_id),
+                    "reason": str(reason)[:80],
+                })
+        conflicted = {
+            int(row["place_id"]) for row in conflict_rows
+        }
+        if plan_matches and plan_feasible:
+            status = _COVERAGE_COVERED
+        elif not selected_matches:
+            status = _COVERAGE_NO_ELIGIBLE_MATCH
+        elif not applicable or set(applicable) <= conflicted:
+            status = _COVERAGE_HARD_CONFLICT
+        elif search_exhausted:
+            status = _COVERAGE_BUDGET_EXHAUSTED
+        else:
+            status = _COVERAGE_SEARCH_NOT_FOUND
+        rows.append({
+            "dimension": dimension,
+            "evidence_complete": all(pid in places_by_id for pid in frozen) and len(selected_matches) <= _COVERAGE_ID_LIMIT,
+            "status": status,
+            "selected_match_ids": _bound_coverage_ids([pid for pid in selected_matches if pid in selected]),
+            "eligible_match_ids": _bound_coverage_ids(selected_matches),
+            "route_place_ids": sorted(in_plan),
+            "hard_applicable_match_ids": _bound_coverage_ids(applicable),
+            "plan_match_ids": _bound_coverage_ids(plan_matches),
+            "conflicts": conflict_rows[:_COVERAGE_ID_LIMIT],
+        })
+    return rows
+
+
+def _selected_coverage_count(rows) -> int:
+    return sum(1 for row in rows if row.get("status") == _COVERAGE_COVERED)
+
+
+
+def _coverage_rows_for_ids(
+    place_ids,
+    request,
+    selection,
+    places_by_id,
+    frozen_ids,
+    hard_ids,
+    *,
+    proved_conflicts=None,
+    search_exhausted=False,
+    plan_feasible=True,
+) -> list[dict]:
+    if not scoring_dimension_ids(request.preferences):
+        return []
+    return _coverage_snapshot(
+        plan_place_ids=place_ids,
+        request=request,
+        selection=selection,
+        places_by_id=places_by_id,
+        frozen_eligible_ids=frozen_ids,
+        hard_applicable_ids=hard_ids,
+        proved_conflicts=proved_conflicts,
+        search_exhausted=search_exhausted,
+        plan_feasible=plan_feasible,
+    )
+
+
+def _repair_trace_row(
+    *,
+    action,
+    before_ids,
+    after_ids,
+    before_count,
+    after_count,
+    decision,
+    reason,
+    constraint="",
+) -> dict:
+    before_set = {int(place_id) for place_id in before_ids}
+    after_set = {int(place_id) for place_id in after_ids}
+    return {
+        "action": str(action)[:40],
+        "decision": str(decision)[:40],
+        "reason": str(reason)[:80],
+        "constraint": str(constraint)[:80],
+        "before_count": int(before_count),
+        "after_count": int(after_count),
+        "removed_ids": _bound_coverage_ids(sorted(before_set - after_set)),
+        "added_ids": _bound_coverage_ids(sorted(after_set - before_set)),
+    }
+
+
+def _append_repair_trace(metrics, row) -> None:
+    if metrics is None or len(metrics.route_v2_repair_trace) >= _COVERAGE_TRACE_LIMIT:
+        return
+    metrics.route_v2_repair_trace.append(row)
+
+
+def _measured_limit_improved(before, after) -> str:
+    for code in _MEASURED_LIMITS:
+        if after.count(code) < before.count(code):
+            return code
+    return ""
+
+
+def _context_id_list(context, key, fallback) -> list[int]:
+    """An omitted key or None uses fallback. An explicit empty list stays empty."""
+    if key not in context or context[key] is None:
+        source = fallback
     else:
-        preference = sum(max((q.get(p.place_id, 0) for p in day.places
-                              if p.place_id not in must_ids and _is_multi_area_activity_place(p, request)), default=0)
-                         for day in plan.day_groups) / request.days
-    types = len({p.place_type for p in places if _is_multi_area_activity_place(p, request)})
-    over = sum(max(0, day.day_feasibility.load_minutes - day.day_feasibility.capacity_minutes) for day in plan.day_groups)
+        source = context[key]
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw in source:
+        place_id = int(raw)
+        if place_id in seen:
+            continue
+        seen.add(place_id)
+        result.append(place_id)
+    return result
+
+
+_PREFERENCE_COMPARISON = contextvars.ContextVar("preference_comparison", default=None)
+
+
+def _v2_quality(plan, request, selection, must_ids):
+    """Compare overall preference, travel and load inside the existing quality key."""
+    from src.agents.pace import detect_pace_mode
+    from src.agents.preferences import (preference_reference_minutes,
+        preference_contribution_score, route_preference_contributions)
+    comparison = _PREFERENCE_COMPARISON.get()
+    dimensions, reference = (comparison if comparison is not None else
+        (scoring_dimension_ids(request.preferences), preference_reference_minutes(request)))
+    places = [p for day in plan.day_groups for p in day.places]
+    over = sum(max(0, day.day_feasibility.load_minutes - day.day_feasibility.capacity_minutes)
+               for day in plan.day_groups)
+    # Finalized commute_minutes already includes accommodation access.
     commute = sum(day.commute_minutes for day in plan.day_groups)
-    stable = tuple(-p.place_id for day in plan.day_groups for p in day.places)
-    if plan.accommodation_policy_version:
-        worst_access = max((sum(a.duration_minutes for a in d.access_legs) for d in plan.day_groups),default=0)
-        return coverage, preference, types, -over, -commute, -worst_access, stable, -(plan.accommodation_anchor.place_id or 0) if plan.accommodation_anchor else 0
-    return coverage, preference, types, -over, -commute, stable
+    types = len({p.place_type for p in places if _is_multi_area_activity_place(p, request)})
+    stable = tuple(-p.place_id for p in places)
+    if not dimensions:
+        # Preserve the existing no-interest policy, including accommodation ties.
+        ordinary = [item.place_id for item in selection.selected if item.place_id not in must_ids]
+        q = {pid: 1 - i / max(1, len(ordinary)) for i, pid in enumerate(ordinary)}
+        preference = sum(max((q.get(p.place_id, 0) for p in day.places
+            if p.place_id not in must_ids and _is_multi_area_activity_place(p, request)), default=0)
+            for day in plan.day_groups) / request.days
+        remote = sum(max((p.effective_score for p in day.places
+            if p.place_id not in must_ids and not is_food_partition_place(p) and p.source_count > 0),default=0)
+            for day in plan.day_groups if day.traffic_policy is not None and day.traffic_policy.day_kind == "excursion")
+        if plan.accommodation_policy_version:
+            access = max((sum(a.duration_minutes for a in d.access_legs) for d in plan.day_groups),default=0)
+            anchor = -(plan.accommodation_anchor.place_id or 0) if plan.accommodation_anchor else 0
+            return 0, preference, remote, types, -over, -commute, -access, stable, anchor
+        return 0, preference, types, -over, -commute, stable
+    contributions = route_preference_contributions(plan, request, dimensions)
+    preference = preference_contribution_score(contributions, dimensions, reference,
+                                               commute=commute, overload=over)
+    pace_load = -over if detect_pace_mode(request) == "relaxed" else 0
+    return pace_load, preference, -over, -commute, types, stable
 
 
-def _v2_plan_violations(plan, request, must_ids, eligible_ids, *, refresh=True):
+
+def _coverage_violation_codes(plan_ids, request, coverage) -> list[str]:
+    """Report a coverage gap. Omitted coverage keeps the legacy membership check.
+
+    A supplied coverage dict with missing selection, frozen ids, hard ids, or
+    place records is incomplete. Unknown input is not treated as covered.
+    """
+    if coverage is None:
+        return []
+    if not isinstance(coverage, dict):
+        return ["coverage_context_incomplete"]
+    selection = coverage.get("selection")
+    if selection is None or any(
+        key not in coverage or coverage[key] is None
+        for key in ("frozen_ids", "hard_ids", "places_by_id")
+    ) or not hasattr(selection, "selected"):
+        return ["coverage_context_incomplete"]
+    if not scoring_dimension_ids(request.preferences):
+        return []
+    places_by_id = coverage["places_by_id"]
+    frozen = {int(place_id) for place_id in coverage["frozen_ids"]}
+    selected = _selected_place_ids(selection)
+    if any(place_id not in places_by_id for place_id in selected & frozen):
+        return ["coverage_context_incomplete"]
+    # Ordinary preference is a comparison input, not route infeasibility.
+    return []
+
+
+def _v2_plan_violations(plan, request, must_ids, eligible_ids, *, refresh=True, derive=False, coverage=None):
     ids = [p.place_id for day in plan.day_groups for p in day.places]
     violations = []
     if len(plan.day_groups) != request.days or [d.day for d in plan.day_groups] != list(range(1, request.days + 1)):
@@ -8513,10 +9916,13 @@ def _v2_plan_violations(plan, request, must_ids, eligible_ids, *, refresh=True):
             elif day.access_legs or plan.accommodation_resolution_state not in {"user_unresolved", "auto_unavailable"}:
                 violations.append("missing_locked_accommodation")
         if refresh:
-            _v2_finalize_day(day, request)
+            _v2_finalize_day(day, request, locked=not derive)
         violations.extend(day.day_feasibility.violations)
         evening_seen = False
         for place in day.places:
+            # A possible photo activity is not intrinsically evening-only.
+            # Preserve the existing hard daytime-order guard; the bounded
+            # night interval and L3 establish actual night fulfillment.
             evening_only = _is_evening_marked(place) and not _is_daytime_marked(place)
             if evening_seen and daytime_activity(place):
                 violations.append("daytime_after_evening")
@@ -8525,8 +9931,11 @@ def _v2_plan_violations(plan, request, must_ids, eligible_ids, *, refresh=True):
             violations.append("temporally_unschedulable")
         if any(p.place_id not in must_ids and _avoid_conflicts_with_place(request, p) for p in day.places):
             violations.append("hard_avoid")
-        if any(_is_near_duplicate_pair(a, b) for a, b in itertools.combinations(day.places, 2)):
+        nested = {(profile.place_id,child) for profile in day.visit_profiles for child in profile.nested_place_ids}
+        if any(_is_near_duplicate_pair(a, b) and (a.place_id,b.place_id) not in nested and (b.place_id,a.place_id) not in nested
+               for a, b in itertools.combinations(day.places, 2)):
             violations.append("near_duplicate")
+    violations.extend(_coverage_violation_codes(ids, request, coverage))
     return violations
 
 
@@ -8539,7 +9948,7 @@ def _v2_search_key(plan, request, selection, must_ids, violations):
         policy = day.traffic_policy
         daily_limit = policy.daily_limit_minutes if policy else daily_commute_budget_minutes(request, settings)
         excesses.extend((
-            max(0, feasibility.load_minutes - feasibility.load_limit_minutes) / feasibility.load_limit_minutes,
+            max(0, feasibility.load_minutes - feasibility.load_limit_minutes) / max(1, feasibility.load_limit_minutes),
             max(0, day.commute_minutes - daily_limit) / max(1, daily_limit),
         ))
         for legs, limits in ((day.commute_legs, policy.poi_leg_limits if policy else None),
@@ -8560,17 +9969,79 @@ def _v2_valid_key(plan, request, selection, must_ids):
     return verified, access_verified, _v2_quality(plan, request, selection, must_ids)
 
 
-def _v2_seed_groups(request, pool, selection, must_ids, singleton_ids, make_plan, deadline):
+def _v2_extend_day(places, candidate, request, *, accommodation_coord=None):
+    """Construct a day extension; feasibility remains owned by make_plan/evaluate_day."""
+    from src.agents.activity_arrangement import confirmed_coverage
+
+    if len(places) >= day_slot_limit(request, get_settings()):
+        return None
+    if any(candidate.place_id == current.place_id or (
+        _is_near_duplicate_pair(candidate, current) and not confirmed_coverage(current, candidate)
+    ) for current in places):
+        return None
+    return _time_ordered_places([*places, candidate], request=request,
+                                accommodation_coord=accommodation_coord)
+
+
+def _v2_seed_groups(request, pool, selection, must_ids, singleton_ids, make_plan, deadline,
+                    *, pair_required=False, paired_required=None, coverage_context=None):
     ranked = {item.place_id: i for i, item in enumerate(selection.selected)}
-    ordered = sorted(pool, key=lambda p: (p.place_id not in must_ids, ranked.get(p.place_id, 1000), -p.effective_score, p.place_id))
+    ordered = sorted(pool, key=lambda p: (p.place_id not in must_ids,
+        not any(_route_matches_dimension(p, dim) for dim in scoring_dimension_ids(request.preferences)),
+        ranked.get(p.place_id, 1000), -p.effective_score, p.place_id))
     by_id = {p.place_id: p for p in pool}
-    groups = [[by_id[pid]] for pid in singleton_ids]
-    fixed = set(range(len(groups)))
+    from src.agents.activity_arrangement import full_day_place, confirmed_coverage
+    groups, used, fixed = [], set(), set()
+    for pid in singleton_ids:
+        if pid in used:
+            continue
+        group = [by_id[pid]]
+        used.add(pid)
+        day = make_plan([group]).day_groups[0]
+        is_fixed = full_day_place(group[0]) or day.traffic_policy is None or day.traffic_policy.day_kind != "excursion"
+        # Compare required companions before separate seed/empty-day occupancy
+        # makes them unavailable to the later unused-partner search.
+        if pair_required and pid in must_ids and not is_fixed:
+            for p in ordered:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if len(group) >= day_slot_limit(request, get_settings()):
+                    break
+                if p.place_id not in must_ids or p.place_id in used or full_day_place(p):
+                    continue
+                if len(group) == 1 and is_food_partition_place(p):
+                    continue
+                if p.place_id in singleton_ids:
+                    candidate_policy = make_plan([[p]]).day_groups[0].traffic_policy
+                    if candidate_policy is None or candidate_policy.day_kind != "excursion":
+                        continue
+                if any(_is_near_duplicate_pair(p, x) and not confirmed_coverage(x, p) for x in group):
+                    continue
+                preview_group = _time_ordered_places([*group, p], request=request)
+                preview = make_plan([preview_group]).day_groups[0]
+                if (preview.traffic_policy is None or preview.traffic_policy.day_kind != "excursion"
+                        or not preview.day_feasibility.feasible):
+                    continue
+                group = preview_group
+                used.add(p.place_id)
+                if paired_required is not None:
+                    paired_required.add(p.place_id)
+        if is_fixed:
+            fixed.add(len(groups))
+        groups.append(group)
+    seeded = set(range(len(groups)))
     groups.extend([[] for _ in range(request.days - len(groups))])
-    used = set(singleton_ids)
+    for i in seeded:
+        for child in ordered:
+            if child.place_id not in used and child.place_id in ranked and confirmed_coverage(groups[i][0],child):
+                groups[i].append(child)
+                used.add(child.place_id)
     # Put remaining must-go first; extra must-go can share an ordinary day.
     for p in [p for p in ordered if p.place_id in must_ids - used]:
-        available = [i for i in range(request.days) if i not in fixed]
+        covered_day = next((i for i in seeded if confirmed_coverage(groups[i][0], p)), None)
+        if covered_day is not None:
+            groups[covered_day].append(p); used.add(p.place_id); continue
+        available = [i for i in range(request.days) if i not in seeded]
         if not available:
             return groups
         empty = next((i for i in available if not groups[i]), None)
@@ -8591,9 +10062,18 @@ def _v2_seed_groups(request, pool, selection, must_ids, singleton_ids, make_plan
             for p in ordered:
                 if p.place_id in used: continue
                 if deadline is not None and time.monotonic() >= deadline: return groups
-                if any(_is_near_duplicate_pair(p, x) for x in groups[i]): continue
+                extended = _v2_extend_day(groups[i], p, request)
+                if extended is None: continue
+                if i in seeded:
+                    policy = make_plan([groups[i]]).day_groups[0].traffic_policy
+                    if policy is not None and policy.day_kind == "excursion":
+                        if len(groups[i]) == 1 and is_food_partition_place(p):
+                            continue
+                        from src.agents.accommodation_policy import remote_anchor
+                        if remote_anchor([*groups[i],p], policy.urban_core)[0] is None:
+                            continue
                 trial_groups = [list(g) for g in groups]
-                trial_groups[i] = _time_ordered_places([*groups[i], p], request=request)
+                trial_groups[i] = extended
                 # Proposal construction evaluates only the changed day, not another complete trial.
                 changed_day = make_plan([trial_groups[i]]).day_groups[0]
                 changed_day.day = i + 1
@@ -8605,11 +10085,75 @@ def _v2_seed_groups(request, pool, selection, must_ids, singleton_ids, make_plan
             if best is None: break
             _, p, ordered_group, trial = best
             needs_partner = len(groups[i]) < 2
-            if not needs_partner and (not trial.day_groups[i].day_feasibility.feasible or
-                                      _v2_quality(trial, request, selection, must_ids) <= _v2_quality(current, request, selection, must_ids)):
+            if not needs_partner and (
+                not trial.day_groups[i].day_feasibility.feasible
+                or _v2_quality(trial, request, selection, must_ids)
+                   <= _v2_quality(current, request, selection, must_ids)
+            ):
                 break
             groups[i] = ordered_group; used.add(p.place_id)
     return groups
+
+
+def _v2_repair_coverage_context(context, pool, plan):
+    places_by_id = dict(context.get("places_by_id") or {})
+    for place in pool:
+        places_by_id.setdefault(place.place_id, place)
+    for day in plan.day_groups:
+        for place in day.places:
+            places_by_id.setdefault(place.place_id, place)
+    pool_ids = [place.place_id for place in pool]
+    return {
+        "places_by_id": places_by_id,
+        "frozen_ids": tuple(_context_id_list(context, "frozen_eligible_ids", pool_ids)),
+        "hard_ids": tuple(_context_id_list(context, "hard_applicable_ids", pool_ids)),
+        "proved": context.get("proved_conflicts"),
+    }
+
+
+def _v2_repair_keeps_selected_coverage(
+    plan, updated, request, selection, context, pool, violations, parent_violations, action, metrics,
+) -> bool:
+    """Trace ordinary preference changes; existing quality comparison owns selection."""
+    if not scoring_dimension_ids(request.preferences):
+        return True
+    coverage = _v2_repair_coverage_context(context, pool, plan)
+    parent_ids = [place.place_id for day in plan.day_groups for place in day.places]
+    trial_ids = [place.place_id for group in updated for place in group]
+    parent_rows = _coverage_rows_for_ids(
+        parent_ids, request, selection, coverage["places_by_id"],
+        coverage["frozen_ids"], coverage["hard_ids"], proved_conflicts=coverage["proved"],
+    )
+    trial_rows = _coverage_rows_for_ids(
+        trial_ids, request, selection, coverage["places_by_id"],
+        coverage["frozen_ids"], coverage["hard_ids"], proved_conflicts=coverage["proved"],
+    )
+    before_count = _selected_coverage_count(parent_rows)
+    after_count = _selected_coverage_count(trial_rows)
+    parent_matches = {
+        (row["dimension"], tuple(row["plan_match_ids"])) for row in parent_rows
+    }
+    trial_matches = {
+        (row["dimension"], tuple(row["plan_match_ids"])) for row in trial_rows
+    }
+    lost = {
+        row["dimension"]
+        for row in parent_rows
+        if row["status"] == _COVERAGE_COVERED
+    } - {
+        row["dimension"]
+        for row in trial_rows
+        if row["status"] == _COVERAGE_COVERED
+    }
+    if not lost and parent_matches == trial_matches:
+        return True
+    _append_repair_trace(metrics, _repair_trace_row(
+        action=action, before_ids=parent_ids, after_ids=trial_ids,
+        before_count=before_count, after_count=after_count,
+        decision="compare", reason="ordinary_preference_tradeoff",
+        constraint="preference_quality",
+    ))
+    return True
 
 
 def _v2_repair_proposals(plan, request, pool, must_ids, selection, context=None):
@@ -8618,7 +10162,10 @@ def _v2_repair_proposals(plan, request, pool, must_ids, selection, context=None)
     deadline = context.get("deadline")
     metrics = context.get("metrics")
     groups = [list(d.places) for d in plan.day_groups]
-    eligible = {p.place_id for p in pool}
+    pool_ids = {p.place_id for p in pool}
+    membership_ids = set(_context_id_list(context, "membership_ids", pool_ids))
+    supplement_ids = set(_context_id_list(context, "supplement_ids", pool_ids))
+    eligible = membership_ids
     parent_key = tuple(tuple(p.place_id for p in g) for g in groups)
     seen = {parent_key}
     known = context.get("known", {
@@ -8644,7 +10191,7 @@ def _v2_repair_proposals(plan, request, pool, must_ids, selection, context=None)
     ranks = {s.place_id: i for i, s in enumerate(selection.selected)}
     replacements = {}
     for i in affected:
-        replacements[i] = sorted((p for p in pool if p.place_id not in used), key=lambda p: (
+        replacements[i] = sorted((p for p in pool if p.place_id not in used and p.place_id in supplement_ids), key=lambda p: (
             min((haversine_km(p, x) for x in groups[i] if x.place_id in must_ids),
                 default=min((haversine_km(p, x) for x in groups[i]), default=0)),
             ranks.get(p.place_id, 1000), -p.effective_score, p.place_id))[:4]
@@ -8739,8 +10286,15 @@ def _v2_repair_proposals(plan, request, pool, must_ids, selection, context=None)
                 continue
             if "missing_must_include" in violations or "invalid_membership" in violations:
                 continue
+            if not _v2_repair_keeps_selected_coverage(
+                plan, updated, request, selection, context, pool, violations, parent_violations, action, metrics,
+            ):
+                continue
             new_unknown = sum((leg.from_place_id, leg.to_place_id, leg.mode) not in known
                               for i in changed for leg in trial.day_groups[i].commute_legs)
+            # Estimate-only previews cannot outrank known precise hard facts
+            # by appearing feasible. Within each traffic-evidence tier, the
+            # failure-distance prefix precedes preference/interest quality.
             ranked.append(((new_unknown == 0,
                             _v2_search_key(trial, request, selection, must_ids, violations)), action, updated))
         else:
@@ -8763,25 +10317,585 @@ def _v2_repair_proposals(plan, request, pool, must_ids, selection, context=None)
     return [(action, updated) for _, action, updated in chosen]
 
 
+def _required_full_day_conflict(pool, must_ids, days):
+    """Prove only required day occupancy, using the admitted coverage relation.
+
+    Optional selected full-day places can be dropped by search. A covered child
+    does not require another day; uncertain nesting alone cannot discharge a Must.
+    Considering every possible full-day parent keeps this proof conservative.
+    """
+    from src.agents.activity_arrangement import full_day_place, confirmed_coverage
+
+    full_places = [p for p in pool if full_day_place(p)]
+    required = [p for p in full_places if p.place_id in must_ids
+                and not any(confirmed_coverage(parent, p) for parent in full_places)]
+    required_ids = {anchor.place_id for anchor in required}
+    independent = [p.place_id for p in pool if p.place_id in must_ids
+                   and p.place_id not in required_ids
+                   and not any(confirmed_coverage(anchor, p) for anchor in required)]
+    if len(required) > days or (len(required) == days and independent):
+        return RouteFullDayConflictError([p.place_id for p in required], independent, days)
+    return None
+
+
+def _common_visit_lower_bound(place, places_by_id):
+    """Minutes every legal arrangement still consumes, or None when unknown.
+
+    A short play style, a full-day arrangement, or confirmed inclusion can
+    spend less time than the raw visit profile. Any of those, or a variant
+    whose minutes are not a verified number, means the raw profile is not a
+    universal lower bound. This does not delete evidence or change the
+    arrangement owner.
+    """
+    from src.agents.activity_arrangement import confirmed_coverage, full_day_place, source_receipts
+
+    if full_day_place(place):
+        return None
+    if any(
+        other.place_id != place.place_id and confirmed_coverage(other, place)
+        for other in places_by_id.values()
+    ):
+        return None
+    styles = [row for row in source_receipts(place) if row.get("kind") == "play_style"]
+    if styles:
+        minutes = [
+            row["minutes"] for row in styles
+            if isinstance(row.get("minutes"), int) and not isinstance(row["minutes"], bool)
+            and row["minutes"] >= 15
+        ]
+        if not minutes:
+            return None
+        return min(minutes)
+    profile = build_visit_profile(place)
+    return profile.visit_minutes + profile.uncertainty_minutes
+
+
+def _load_limit_contexts(place, request, coupling_context):
+    """(limit, breaks) for every day window this place can still use.
+
+    None means the day kind or the excursion window cannot be classified, so
+    load is not proved. Without a coupling context only the urban window is in
+    force. Access minutes are not added: a nearer anchor can make them zero.
+    """
+    from src.agents.route_feasibility import day_load_limits
+
+    settings = get_settings()
+    _capacity, urban_limit, urban_breaks = day_load_limits(request, settings)
+    urban = (urban_limit, urban_breaks)
+    if coupling_context is None:
+        return [urban]
+    core = coupling_context.urban_core
+    if core is None or place.latitude is None or place.longitude is None:
+        return None
+    from src.agents.accommodation_policy import distance_km, remote_anchor
+    from src.agents.excursion_time_policy import freeze_time_policy
+
+    window = freeze_time_policy(request)
+    remote, _sources = remote_anchor([place], core)
+    away = distance_km(core, (float(place.latitude), float(place.longitude))) >= 10
+    if window.violations and (remote is not None or away):
+        return None
+    contexts = [urban]
+    if remote is not None or away:
+        _capacity, limit, breaks = day_load_limits(request, settings, window)
+        contexts.append((limit, breaks))
+    return contexts
+
+
+def _v2_prove_singleton_conflicts(plan_ids, request, selection, places_by_id, frozen_ids, hard_ids, make_plan, proved, *, coupling_context=None):
+    """Prove only a static conflict or a common lower bound.
+
+    One infeasible ``make_plan([[place]])`` is not proof that every arrangement
+    fails. Search that never tried a placement, and budget exhaustion, are not
+    proof either. A load proof has to exceed every usable arrangement and every
+    legal day window. ``make_plan`` stays in the signature for existing callers
+    and is intentionally unused.
+    """
+    del make_plan
+    if proved is None:
+        return
+    selected = _selected_place_ids(selection)
+    frozen = {int(place_id) for place_id in frozen_ids}
+    hard = {int(place_id) for place_id in hard_ids}
+    occupied = {int(place_id) for place_id in plan_ids}
+    request_must_ids = {
+        int(item.place_id) for item in request.must_include if item.place_id is not None
+    }
+    checked = 0
+    for dimension in scoring_dimension_ids(request.preferences):
+        for place_id in sorted(selected & frozen & hard):
+            if checked >= _COVERAGE_TRACE_LIMIT:
+                return
+            if place_id in occupied or place_id in proved or str(place_id) in proved:
+                continue
+            place = places_by_id.get(place_id)
+            if place is None or not _route_matches_dimension(place, dimension):
+                continue
+            checked += 1
+            if _selection_temporally_unschedulable(place, request):
+                proved[place_id] = "temporally_unschedulable"
+                continue
+            if (
+                place_id not in request_must_ids
+                and not place.must_include
+                and _avoid_conflicts_with_place(request, place)
+            ):
+                proved[place_id] = "hard_avoid"
+                continue
+            lower_bound = _common_visit_lower_bound(place, places_by_id)
+            contexts = None if lower_bound is None else _load_limit_contexts(place, request, coupling_context)
+            if contexts and all(lower_bound + breaks > limit for limit, breaks in contexts):
+                proved[place_id] = "load_limit"
+
+
+def _v2_prefer_selected_plan(left, right, request, selection, must_ids, places_by_id, frozen_ids, hard_ids) -> bool:
+    """Preserve verified-traffic tiers and compare the existing overall quality key."""
+    if right is None:
+        return True
+    return _v2_valid_key(left, request, selection, must_ids) > _v2_valid_key(right, request, selection, must_ids)
+
+
+def _v2_preview_blocked(metrics, deadline) -> bool:
+    """The repair preview cap and the search deadline are one shared gate."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return True
+    return metrics is not None and metrics.route_v2_local_repair_evaluations >= V2_MAX_REPAIR_PREVIEWS
+
+
+def _v2_take_preview(metrics, deadline) -> bool:
+    if _v2_preview_blocked(metrics, deadline):
+        return False
+    if metrics is not None:
+        metrics.route_v2_local_repair_evaluations += 1
+    return True
+
+
+def _plan_has_verified_commute(plan) -> bool:
+    if plan is None:
+        return False
+    legs = [leg for day in plan.day_groups for leg in day.commute_legs]
+    return bool(legs) and all(leg.source == "amap" for leg in legs)
+
+
+async def _v2_verify_traffic(trial, *, request, provider, known, known_access,
+                             attempted_access, access_walk_rejections, city, citycode,
+                             deadline, mode, metrics, must_ids, eligible_ids, coverage=None):
+    """One fact merge and short-walk proof path for initial and acquired routes."""
+    settings = get_settings()
+    # HTTP/cache owners keep their original caps across every candidate.
+    if provider is not None:
+        transport = _v2_transport_plan(trial) if callable(getattr(provider, "route_access", None)) else trial
+        await _preload_precise_route_cache(provider,[transport],city=city,generation_mode=mode)
+        allocate=getattr(provider,"allocate_uncached_plan_calls",None)
+        if callable(allocate): allocate(transport,city=city,generation_mode=mode)
+        await _v2_resolve_access(trial, provider, known_access, attempted_access,
+            city=city, citycode=citycode, deadline=deadline,
+            generation_mode=mode, walk_proof=False,
+            walk_rejections=access_walk_rejections)
+        for day in trial.day_groups:
+            if deadline is not None and time.monotonic() >= deadline: break
+            if not day.commute_legs: continue
+            remaining=max(.001,deadline-time.monotonic()) if deadline is not None else 60
+            day.commute_legs = await _resolve_precise_legs(
+                day,day.commute_legs,city=city,citycode=citycode,generation_mode=mode,
+                requested_commute_mode=request.commute_mode,
+                daily_budget=day.traffic_policy.daily_limit_minutes if day.traffic_policy else daily_commute_budget_minutes(request,settings),
+                single_leg_max=single_leg_max_minutes(mode,settings),provider=provider,metrics=metrics,
+                known_precise_legs=known,concurrency=settings.amap_route_enrichment_concurrency,
+                timeout_seconds=min(remaining,max(settings.amap_route_timeout,1)*len(day.commute_legs)),
+                walk_proof=False)
+    # Existing provider degradation may return estimates for the day: known facts still win.
+    for day in trial.day_groups:
+        day.commute_legs=[
+            _lookup_known_commute_leg(
+                leg, known,
+                origin=day.places[index],
+                destination=day.places[index + 1],
+                generation_mode=mode,
+            )
+            for index, leg in enumerate(day.commute_legs)
+        ]
+    violations=_v2_plan_violations(trial,request,must_ids,eligible_ids,derive=True,coverage=coverage)
+    # A rejected short transit leg can still have a legal walking fact.
+    # Ask for that fact before treating the candidate as ineligible.
+    if await _v2_prove_traffic_invalid_short_transit(
+        trial, request=request, provider=provider, known=known,
+        known_access=known_access, attempted_access=attempted_access,
+        access_walk_rejections=access_walk_rejections,
+        city=city, citycode=citycode, deadline=deadline,
+        generation_mode=mode, metrics=metrics,
+    ):
+        violations=_v2_plan_violations(
+            trial, request, must_ids, eligible_ids, derive=True, coverage=coverage,
+        )
+    return violations
+
+
+async def _v2_route_acquired_groups(
+    request, pool, selection, must_ids, eligible_ids, provider, known, make_plan,
+    metrics, deadline, city, citycode, accommodation_coord, places_by_id,
+    frozen_ids, hard_ids, proved_conflicts, known_access, attempted_access,
+    *, access_walk_rejections=None,
+):
+    """One covering plan from legs admitted by the existing route owners.
+
+    Cache preload, uncached allocation and ``_resolve_precise_legs`` stay the
+    only query path. A miss stays unknown and is not stored as infeasible.
+    Stars start at musts and selected scoring matches, then walk outward by
+    distance. Every new day and every eligible untried multi-day combination takes one
+    preview from the shared 1536 cap and stops at the search deadline. A closed
+    gate does not evaluate a combination that has not yet been admitted.
+    Nothing here reads a provider fact index.
+    """
+    if not pool or provider is None or _v2_preview_blocked(metrics, deadline):
+        return None
+    by_id = {place.place_id: place for place in pool}
+    mode, _ = generation_base_mode(request, get_settings())
+    dimensions = scoring_dimension_ids(request.preferences)
+    selected = _selected_place_ids(selection)
+    ranks = {item.place_id: index for index, item in enumerate(selection.selected)}
+    ordered = sorted(
+        pool,
+        key=lambda place: (
+            place.place_id not in must_ids,
+            ranks.get(place.place_id, 1000),
+            -place.effective_score,
+            place.place_id,
+        ),
+    )
+    anchors = [
+        place for place in ordered
+        if place.place_id in must_ids or (
+            place.place_id in selected and any(
+                _route_matches_dimension(place, dimension) for dimension in dimensions
+            )
+        )
+    ]
+    if not anchors:
+        anchors = ordered[:8]
+    clean = []
+    seen_days = set()
+    stopped = False
+    coverage = {
+        "selection": selection,
+        "frozen_ids": tuple(frozen_ids),
+        "hard_ids": tuple(hard_ids),
+        "places_by_id": places_by_id,
+        "proved_conflicts": proved_conflicts,
+        "search_exhausted": False,
+    }
+    tried_plans = set()
+
+    def covered_by(ids):
+        return {
+            dimension for dimension in dimensions
+            if any(
+                _route_matches_dimension(by_id[place_id], dimension)
+                for place_id in ids
+            )
+        }
+
+    def verified_day(day):
+        if day.commute_legs:
+            return all(leg.source == "amap" for leg in day.commute_legs)
+        return len(day.access_legs) == 2 and all(
+            leg.duration_source == "amap" for leg in day.access_legs
+        )
+
+    def plan_ok(chosen, covered, *, count_preview):
+        key = tuple(sorted(tuple(place.place_id for place in day) for day in chosen))
+        if key in tried_plans:
+            return False
+        ids = [place.place_id for day in chosen for place in day]
+        if len(ids) != len(set(ids)) or not set(must_ids).issubset(ids):
+            return False
+        if not count_preview or not _v2_take_preview(metrics, deadline):
+            return False
+        tried_plans.add(key)
+        plan = make_plan(chosen)
+        if _v2_plan_violations(plan, request, must_ids, eligible_ids, coverage=coverage):
+            return False
+        return all(verified_day(day) for day in plan.day_groups)
+
+    def assemble(count_preview):
+        if len(clean) < request.days:
+            return None
+        ranked = sorted(clean, key=lambda item: (-len(item[2]), item[1], item[0]))[:24]
+
+        def walk(start, used, chosen, covered):
+            if len(chosen) == request.days:
+                if plan_ok(chosen, covered, count_preview=count_preview):
+                    return chosen
+                return None
+            if not count_preview or _v2_preview_blocked(metrics, deadline):
+                return None
+            for index in range(start, len(ranked)):
+                ids, _commute, day_covered, places = ranked[index]
+                if used.intersection(ids):
+                    continue
+                found = walk(index + 1, used | set(ids), [*chosen, places], covered | day_covered)
+                if found is not None:
+                    return found
+            return None
+
+        return walk(0, set(), [], set())
+
+    async def verify_day(ordered_places):
+        nonlocal stopped
+        if not _v2_take_preview(metrics, deadline):
+            stopped = True
+            return None
+        draft = make_plan([ordered_places])
+        await _v2_verify_traffic(
+            draft, request=request, provider=provider, known=known, known_access=known_access,
+            attempted_access=attempted_access, access_walk_rejections=access_walk_rejections,
+            city=city, citycode=citycode, deadline=deadline, mode=mode, metrics=metrics,
+            must_ids=set(), eligible_ids=eligible_ids,
+        )
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped = True
+        day = draft.day_groups[0]
+        if not day.day_feasibility.feasible or not verified_day(day):
+            return None
+        return ordered_places, day.commute_minutes
+
+    def partners_for(anchor):
+        return sorted(
+            (place for place in pool if place.place_id != anchor.place_id),
+            key=lambda place: (
+                place.place_id not in selected and place.place_id not in must_ids,
+                haversine_km(anchor, place), place.place_id,
+            ),
+        )
+
+    def _extensions(group, partners):
+        for partner in partners:
+            extended = _v2_extend_day(group, partner, request,
+                                      accommodation_coord=accommodation_coord)
+            if extended is not None:
+                yield extended
+
+    def compact_candidates():
+        from src.agents.activity_arrangement import full_day_place
+        for anchor in anchors:
+            if build_visit_profile(anchor).singleton_eligible or full_day_place(anchor):
+                yield [anchor]
+            yield from _extensions([anchor], partners_for(anchor))
+
+    def extended_candidates():
+        # A separate lazy stream preserves compact-day opportunities while also
+        # visiting every size permitted by the common day owner. Both streams
+        # consume the same request-wide previews, facts and deadline.
+        streams = [iter(_extensions([anchor], partners_for(anchor))) for anchor in anchors]
+        expanded = set()
+        while streams:
+            remaining = []
+            for stream in streams:
+                group = next(stream, None)
+                if group is None:
+                    continue
+                remaining.append(stream)
+                signature = tuple(place.place_id for place in group)
+                if signature in expanded:
+                    continue
+                expanded.add(signature)
+                if len(group) > 2:
+                    yield group
+                if len(group) < day_slot_limit(request, get_settings()):
+                    # Use the same selected/distance priority for each extension.
+                    remaining.append(iter(_extensions(group, partners_for(group[0]))))
+                if _v2_preview_blocked(metrics, deadline):
+                    return
+            streams = remaining
+
+    streams = [iter(compact_candidates()), iter(extended_candidates())]
+    while streams and not stopped and not _v2_preview_blocked(metrics, deadline):
+        remaining = []
+        for stream in streams:
+            if stopped or _v2_preview_blocked(metrics, deadline):
+                break
+            ordered_places = next(stream, None)
+            if ordered_places is None:
+                continue
+            remaining.append(stream)
+            ids = tuple(place.place_id for place in ordered_places)
+            if ids in seen_days:
+                continue
+            seen_days.add(ids)
+            verified = await verify_day(ordered_places)
+            if verified is None:
+                continue
+            places, commute = verified
+            clean.append((ids, commute, covered_by(ids), places))
+            found = assemble(True)
+            if found is not None:
+                return found
+        streams = remaining
+    if len(clean) < request.days or _v2_preview_blocked(metrics, deadline):
+        return None
+    return assemble(True)
+
+
+_SHORT_TRANSIT_PROOF_LIMITS = ("single_leg_limit", "daily_commute_limit")
+
+
+def _v2_day_traffic_limited(day) -> bool:
+    violations = getattr(getattr(day, "day_feasibility", None), "violations", ()) or ()
+    return any(code in violations for code in _SHORT_TRANSIT_PROOF_LIMITS)
+
+
+def _v2_unproven_short_commute(day, known) -> bool:
+    known = known or {}
+    for index, leg in enumerate(day.commute_legs):
+        if leg.mode != "transit" or index + 1 >= len(day.places):
+            continue
+        origin = day.places[index]
+        destination = day.places[index + 1]
+        if not _transit_walk_proof_applies(
+            origin, destination, generation_mode="transit", estimated_mode=leg.mode,
+        ):
+            continue
+        walking = known.get((origin.place_id, destination.place_id, "walking"))
+        if isinstance(walking, CommuteLeg) and _adopted_walk_commute(walking):
+            continue
+        if _cached_walk_reject_reason(known, origin.place_id, destination.place_id):
+            continue
+        return True
+    return False
+
+
+def _v2_unproven_short_access(day) -> bool:
+    by_id = {place.place_id: place for place in day.places}
+    for leg in day.access_legs:
+        if leg.mode != "transit" or _adopted_walk_access(leg):
+            continue
+        if _negative_walk_reason(_walk_reason_of(leg)):
+            continue
+        place = by_id.get(leg.place_id)
+        if place is None:
+            continue
+        origin, destination = _v2_access_endpoints(leg, place)
+        if _transit_walk_proof_triggered(origin, destination, generation_mode="transit"):
+            return True
+    return False
+
+
+async def _v2_prove_traffic_invalid_short_transit(
+    trial, *, request, provider, known, known_access, attempted_access,
+    city, citycode, deadline, generation_mode, metrics,
+    access_walk_rejections=None,
+) -> bool:
+    """Proof a short transit leg only after that candidate is already traffic-invalid.
+
+    Feasible trials do not pay for a walking query. The proof stays inside the
+    current trial, deadline and provider caps, and walking uses its own cache key.
+    """
+    if provider is None or generation_mode != "transit":
+        return False
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
+    limited = [day for day in trial.day_groups if _v2_day_traffic_limited(day)]
+    if not limited:
+        return False
+    prove_commute = [day for day in limited if _v2_unproven_short_commute(day, known)]
+    prove_access = any(_v2_unproven_short_access(day) for day in limited)
+    if not prove_commute and not prove_access:
+        return False
+    settings = get_settings()
+    for day in prove_commute:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        if not day.commute_legs:
+            continue
+        remaining = max(.001, deadline - time.monotonic()) if deadline is not None else 60
+        daily_budget = (
+            day.traffic_policy.daily_limit_minutes
+            if day.traffic_policy
+            else daily_commute_budget_minutes(request, settings)
+        )
+        day.commute_legs = await _resolve_precise_legs(
+            day, day.commute_legs, city=city, citycode=citycode,
+            generation_mode=generation_mode,
+            requested_commute_mode=request.commute_mode,
+            daily_budget=daily_budget,
+            single_leg_max=single_leg_max_minutes(generation_mode, settings),
+            provider=provider, metrics=metrics, known_precise_legs=known,
+            concurrency=settings.amap_route_enrichment_concurrency,
+            timeout_seconds=min(
+                remaining, max(settings.amap_route_timeout, 1) * len(day.commute_legs),
+            ),
+            walk_proof=True, record_leg_metrics=False, whole_day_fallback=False,
+        )
+    for day in trial.day_groups:
+        if not day.commute_legs:
+            continue
+        day.commute_legs = [
+            _lookup_known_commute_leg(
+                leg, known,
+                origin=day.places[index],
+                destination=day.places[index + 1],
+                generation_mode=generation_mode,
+            )
+            for index, leg in enumerate(day.commute_legs)
+        ]
+    if prove_access and (deadline is None or time.monotonic() < deadline):
+        await _v2_resolve_access(
+            trial, provider, known_access, attempted_access,
+            city=city, citycode=citycode, deadline=deadline,
+            generation_mode=generation_mode, walk_proof=True,
+            walk_rejections=access_walk_rejections,
+        )
+    return True
+
+
 async def _plan_routes_v2(request, retrieval, selection, pool, provider, metrics,
-                          accommodation_coord, accommodation_source, citycode, deadline, route_start, coupling_context=None):
+                          accommodation_coord, accommodation_source, citycode, deadline, route_start, coupling_context=None, selector_input=None):
     settings = get_settings()
     if selection.schema_version != "1.1":
         raise RoutePlanInvariantError(["selector_route_version_mismatch"], [])
-    must_ids = valid_must_include_ids(request, retrieval) | {p.place_id for p in pool if p.must_include}
+    qualified_pool = list(pool)
+    must_ids = valid_must_include_ids(request, retrieval) | {p.place_id for p in qualified_pool if p.must_include}
     selected_ids = [s.place_id for s in selection.selected]
-    all_ids = {p.place_id for p in pool}
+    all_ids = {p.place_id for p in qualified_pool}
     if len(selected_ids) != len(set(selected_ids)) or not set(selected_ids).issubset(all_ids) or not must_ids.issubset(selected_ids):
         raise RoutePlanInvariantError(["invalid_selector_membership"], [])
-    pool = [p for p in pool if valid_coordinate(p.latitude,p.longitude) and not _selection_hard_ineligible(p,request)
+    pool = [p for p in qualified_pool if valid_coordinate(p.latitude,p.longitude) and not _selection_hard_ineligible(p,request)
             and not _selection_temporally_unschedulable(p,request)
             and (p.place_id in must_ids or not _avoid_conflicts_with_place(request,p))]
-    eligible = {p.place_id for p in pool}
-    if not must_ids.issubset(eligible):
-        raise RouteMustIncludeConflictError(must_ids - eligible, "hard_conflict")
+    hard_ids = {p.place_id for p in pool}
+    if not must_ids.issubset(hard_ids):
+        raise RouteMustIncludeConflictError(must_ids - hard_ids, "hard_conflict")
+    frozen_ids = _frozen_eligible_ids(
+        selector_input=selector_input,
+        request=request,
+        qualified_pool=qualified_pool,
+        must_include_place_ids=sorted(must_ids),
+    )
+    frozen_set = {int(place_id) for place_id in frozen_ids}
+    if not must_ids.issubset(frozen_set):
+        raise RoutePlanInvariantError(["must_outside_frozen_eligible"], [])
+    if not set(selected_ids).issubset(frozen_set):
+        raise RoutePlanInvariantError(["selected_outside_frozen_eligible"], [])
+    membership_ids = frozen_set & hard_ids
+    supplement_ids = set(membership_ids)
+    eligible = membership_ids
+    pool = [p for p in pool if p.place_id in membership_ids]
+    places_by_id = {p.place_id: p for p in qualified_pool}
+    coverage_context = {
+        "frozen_ids": tuple(frozen_ids),
+        "hard_ids": tuple(hard_ids),
+        "places_by_id": places_by_id,
+    }
+    full_day_conflict = _required_full_day_conflict(pool, must_ids, request.days)
+    if full_day_conflict is not None:
+        if metrics is not None:
+            metrics.route_policy_version = POLICY_VERSION
+            metrics.route_v2_stop_reason = "full_day_conflict"
+        raise full_day_conflict
     known = {}
     known_access = {}
     attempted_access = set()
+    access_walk_rejections = {}
     from src.agents.accommodation_policy import choose_options, anchor_coord
     options = choose_options(coupling_context,pool,selection,must_ids) if coupling_context else [None]
     def make_plan(groups, option_index=0):
@@ -8795,7 +10909,15 @@ async def _plan_routes_v2(request, retrieval, selection, pool, provider, metrics
     metrics.route_v2_local_repair_evaluations = 0
     metrics.route_v2_repair_batches = 0
     metrics.route_v2_repair_rounds = 0
-    own_provider = provider is None and bool(settings.amap_api_key) and settings.amap_route_enabled
+    metrics.route_v2_coverage_report = []
+    metrics.route_v2_repair_trace = []
+    metrics.route_v2_proved_conflicts = {}
+    _v2_prove_singleton_conflicts(
+        [], request, selection, places_by_id, frozen_ids, hard_ids,
+        make_plan, metrics.route_v2_proved_conflicts,
+        coupling_context=coupling_context,
+    )
+    own_provider = provider is None and amap_keys_configured(settings) and settings.amap_route_enabled
     if own_provider:
         provider = AmapRouteProvider(mode_aware=settings.commute_mode_enabled, metrics=metrics,
                                      deadline_monotonic=deadline, wall_start_monotonic=route_start)
@@ -8808,41 +10930,54 @@ async def _plan_routes_v2(request, retrieval, selection, pool, provider, metrics
     exhausted = False
     evaluated = set()
     search_by_option = {}
+    # One extra branch per anchor keeps locally feasible required companions
+    # repairable when fewer failing days make a split route rank above them.
+    # It is a search alternative, not a new requirement on accepted routes.
+    paired_search_by_option = {}
+    def preserves_pairs(plan, pairs):
+        return all(any(pair.issubset({p.place_id for p in day.places})
+                       and day.day_feasibility.feasible for day in plan.day_groups)
+                   for pair in pairs)
+    def refresh_paired_search(i):
+        if i not in paired_search_by_option:
+            return None
+        pairs, _, parent = paired_search_by_option[i]
+        # Unknown legs may acquire their first precise fact during consider.
+        # Rank progress against the same current facts as the new trial.
+        parent = make_plan([day.places for day in parent.day_groups], i)
+        if not preserves_pairs(parent, pairs):
+            return None
+        violations = _v2_plan_violations(parent,request,must_ids,eligible,refresh=False)
+        key = _v2_search_key(parent,request,selection,must_ids,violations)
+        paired_search_by_option[i] = (pairs, key, parent)
+        return key, parent
+    max_trials = settings.route_v2_max_trials
+    def search_budget_exhausted():
+        return ((max_trials > 0 and metrics.route_v2_trial_count >= max_trials)
+                or (deadline is not None and time.monotonic() >= deadline))
     option_trials = [0 for _ in options]
     def signature_for(groups, option_index):
         return option_index, tuple(tuple(p.place_id for p in g) for g in groups)
-    async def consider(groups, action, option_index=0):
+    async def consider(groups, action, option_index=0, paired_required=None):
         nonlocal best_valid,best_search,best_search_key,exhausted
         signature = signature_for(groups, option_index)
         if signature in evaluated: return
-        if metrics.route_v2_trial_count >= V2_MAX_TRIALS or (deadline is not None and time.monotonic() >= deadline):
+        if search_budget_exhausted():
             exhausted=True; return
         evaluated.add(signature); metrics.route_v2_trial_count += 1
         option_trials[option_index] += 1
         trial=make_plan(groups, option_index)
-        # HTTP/cache owners keep their original caps across every candidate.
-        if provider is not None:
-            transport = _v2_transport_plan(trial) if callable(getattr(provider, "route_access", None)) else trial
-            await _preload_precise_route_cache(provider,[transport],city=retrieval.city,generation_mode=mode)
-            allocate=getattr(provider,"allocate_uncached_plan_calls",None)
-            if callable(allocate): allocate(transport,city=retrieval.city,generation_mode=mode)
-            await _v2_resolve_access(trial, provider, known_access, attempted_access,
-                city=retrieval.city, citycode=citycode, deadline=deadline)
-            for day in trial.day_groups:
-                if deadline is not None and time.monotonic() >= deadline: break
-                if not day.commute_legs: continue
-                remaining=max(.001,deadline-time.monotonic()) if deadline is not None else 60
-                day.commute_legs = await _resolve_precise_legs(
-                    day,day.commute_legs,city=retrieval.city,citycode=citycode,generation_mode=mode,
-                    requested_commute_mode=request.commute_mode,
-                    daily_budget=day.traffic_policy.daily_limit_minutes if day.traffic_policy else daily_commute_budget_minutes(request,settings),
-                    single_leg_max=single_leg_max_minutes(mode,settings),provider=provider,metrics=metrics,
-                    known_precise_legs=known,concurrency=settings.amap_route_enrichment_concurrency,
-                    timeout_seconds=min(remaining,max(settings.amap_route_timeout,1)*len(day.commute_legs)))
-        # Existing provider degradation may return estimates for the day: known facts still win.
-        for day in trial.day_groups:
-            day.commute_legs=[known.get((leg.from_place_id,leg.to_place_id,leg.mode),leg).model_copy(deep=True) for leg in day.commute_legs]
-        violations=_v2_plan_violations(trial,request,must_ids,eligible)
+        coverage={
+            "selection": selection, "frozen_ids": tuple(frozen_ids),
+            "hard_ids": tuple(hard_ids), "places_by_id": places_by_id,
+            "proved_conflicts": metrics.route_v2_proved_conflicts, "search_exhausted": False,
+        }
+        violations = await _v2_verify_traffic(
+            trial, request=request, provider=provider, known=known, known_access=known_access,
+            attempted_access=attempted_access, access_walk_rejections=access_walk_rejections,
+            city=retrieval.city, citycode=citycode, deadline=deadline, mode=mode,
+            metrics=metrics, must_ids=must_ids, eligible_ids=eligible, coverage=coverage,
+        )
         if not violations:
             valid_candidates.append((option_index, trial.model_copy(deep=True)))
             candidate_actions[signature] = action
@@ -8851,87 +10986,260 @@ async def _plan_routes_v2(request, retrieval, selection, pool, provider, metrics
             best_valid=trial.model_copy(deep=True)
             metrics.route_v2_accepted_action=action
         key=_v2_search_key(trial,request,selection,must_ids,violations)
+        if option_index not in paired_search_by_option and paired_required:
+            pairs = tuple(frozenset(p.place_id for p in day.places if p.place_id in must_ids)
+                          for day in trial.day_groups
+                          if any(p.place_id in paired_required for p in day.places))
+            if pairs and preserves_pairs(trial, pairs):
+                paired_search_by_option[option_index] = (pairs, key, trial.model_copy(deep=True))
+        if refresh_paired_search(option_index) is not None:
+            pairs, prior_key, _ = paired_search_by_option[option_index]
+            if preserves_pairs(trial, pairs) and key > prior_key:
+                paired_search_by_option[option_index] = (pairs, key, trial.model_copy(deep=True))
         if option_index not in search_by_option or key > search_by_option[option_index][0]:
             search_by_option[option_index] = (key, trial.model_copy(deep=True))
         if best_search_key is None or key > best_search_key:
             best_search=trial.model_copy(deep=True);best_search_key=key
+    from src.agents.preferences import preference_reference_minutes
+    initial_coverage = _coverage_snapshot(plan_place_ids=[], request=request, selection=selection,
+        places_by_id=places_by_id, frozen_eligible_ids=frozen_ids, hard_applicable_ids=hard_ids,
+        proved_conflicts=metrics.route_v2_proved_conflicts)
+    comparison_dimensions = tuple(row["dimension"] for row in initial_coverage
+        if not (row["evidence_complete"] and row["status"] in {"NO_ELIGIBLE_MATCH", "HARD_CONFLICT"}))
+    comparison_token = _PREFERENCE_COMPARISON.set(
+        (comparison_dimensions, preference_reference_minutes(request)))
+    estimate_token = (
+        _SHORT_TRANSIT_ESTIMATE_WALK_SPEED.set(True)
+        if max_trials > 0 and not callable(getattr(provider, "route_access", None))
+        else None
+    )
     try:
         ranks={s.place_id:i for i,s in enumerate(selection.selected)}
+        from src.agents.activity_arrangement import source_receipts
+        def singleton_candidate(point):
+            if not (any(options) if coupling_context else accommodation_coord is not None):
+                return False
+            if build_visit_profile(point).singleton_eligible:
+                return True
+            if not any(row.get("kind") == "play_style" for row in source_receipts(point)):
+                return False
+            return any(make_plan([[point]], i).day_groups[0].visit_profiles[0].singleton_eligible
+                       for i in range(len(options)))
         long_ids=[p.place_id for p in sorted(pool,key=lambda p:(p.place_id not in must_ids,ranks.get(p.place_id,1000),p.place_id))
-                  if build_visit_profile(p).singleton_eligible and (any(options) if coupling_context else accommodation_coord is not None)]
-        configs=[[]]+[long_ids[:n] for n in range(1,min(request.days,len(long_ids))+1)]
+                  if singleton_candidate(p)]
+        from src.agents.activity_arrangement import full_day_place, confirmed_coverage
+        from src.agents.accommodation_policy import remote_anchor
+        full_ids = [p.place_id for p in pool if full_day_place(p) and p.place_id in set(selected_ids)
+                    and not any(full_day_place(parent) and confirmed_coverage(parent,p) for parent in pool)]
+        # Only required full-day occupancy is a proved request conflict.
+        # Search may drop excess optional full-day choices, keeping Musts first.
+        full_ids.sort(key=lambda pid: (pid not in must_ids, ranks.get(pid, 1000), pid))
+        remote_ids = [p.place_id for p in pool if p.place_id in must_ids and coupling_context is not None
+                      and remote_anchor([p],coupling_context.urban_core)[0] is not None and p.place_id not in full_ids]
+        configs = []
+        for candidate in ([*full_ids,*remote_ids][:request.days], full_ids,
+                          *[list(dict.fromkeys([*full_ids,*long_ids[:n]]))[:request.days]
+                            for n in range(1,min(request.days,len(long_ids))+1)]):
+            if candidate not in configs:
+                configs.append(candidate)
         # Round-robin across anchors before spending repair slots on any anchor.
         for config in configs:
+            split_options = []
             for option_index in range(len(options)):
                 if exhausted: break
                 builder = lambda groups, i=option_index: make_plan(groups,i)
-                groups=_v2_seed_groups(request,pool,selection,must_ids,config,builder,deadline)
+                paired_required = set()
+                groups=_v2_seed_groups(request,pool,selection,must_ids,config,builder,deadline,
+                                      pair_required=True,paired_required=paired_required,
+                                      coverage_context=coverage_context)
+                await consider(groups,"initial" if not config else "singleton_configuration",option_index,paired_required)
+                if paired_required:
+                    split_options.append(option_index)
+            # Learned traffic may reject a locally feasible required pair.
+            # Keep the original split search, within the same trial/deadline caps,
+            # after every anchor has had its first grouped configuration.
+            for option_index in split_options:
+                if exhausted: break
+                if search_budget_exhausted():
+                    exhausted=True; break
+                builder = lambda groups, i=option_index: make_plan(groups,i)
+                groups=_v2_seed_groups(request,pool,selection,must_ids,config,builder,deadline,
+                                      coverage_context=coverage_context)
                 await consider(groups,"initial" if not config else "singleton_configuration",option_index)
             if exhausted: break
         for repair_round in range(V2_MAX_REPAIR_ROUNDS):
             if exhausted or best_search is None: break
-            def proposals_for(i):
-                return _v2_repair_proposals(search_by_option[i][1],request,pool,must_ids,selection,{
+            def branch_search(branch):
+                i, paired = branch
+                if paired:
+                    return refresh_paired_search(i)
+                return search_by_option[i]
+            def proposals_for(branch):
+                search = branch_search(branch)
+                if search is None:
+                    return []
+                i, _ = branch
+                return _v2_repair_proposals(search[1],request,pool,must_ids,selection,{
                     "make_plan": lambda groups: make_plan(groups,i), "known": known,
-                    "deadline": deadline, "metrics": metrics})
-            batches = {i:proposals_for(i) for i in sorted(search_by_option)}
+                    "deadline": deadline, "metrics": metrics,
+                    "membership_ids": membership_ids, "supplement_ids": supplement_ids,
+                    "frozen_eligible_ids": tuple(frozen_ids),
+                    "hard_applicable_ids": tuple(hard_ids),
+                    "places_by_id": places_by_id,
+                    "proved_conflicts": metrics.route_v2_proved_conflicts})
+            # Paired and ordinary branches share the existing eight trials per
+            # round, global preview cap and deadline. Split routes remain legal.
+            branches = [(i, paired) for paired in (True, False)
+                        for i in sorted(search_by_option)
+                        if not paired or i in paired_search_by_option]
+            batches = {branch:proposals_for(branch) for branch in branches}
             if not any(batches.values()): break
             metrics.route_v2_repair_rounds=repair_round+1
             previous=metrics.route_v2_trial_count
             refreshed = False
-            last_option = -1
+            last_branch = None
             for _ in range(V2_MAX_PROPOSALS):
                 # Already evaluated signatures do not consume another trial or hide later actions.
-                for i,batch in batches.items():
-                    batches[i] = [(a,g) for a,g in batch if signature_for(g,i) not in evaluated]
-                available = [i for i,batch in batches.items() if batch]
+                for branch,batch in batches.items():
+                    batches[branch] = [(a,g) for a,g in batch if signature_for(g,branch[0]) not in evaluated]
+                available = [branch for branch,batch in batches.items() if batch]
                 if not available: break
-                option_index = next((i for i in available if i > last_option), available[0])
-                last_option = option_index
-                action,groups = batches[option_index].pop(0)
-                prior_distance = search_by_option[option_index][0][:3]
+                start = branches.index(last_branch) + 1 if last_branch is not None else 0
+                branch = next((b for b in branches[start:] if b in available), available[0])
+                last_branch = branch
+                option_index = branch[0]
+                action,groups = batches[branch].pop(0)
+                search = branch_search(branch)
+                if search is None:
+                    batches[branch] = []
+                    continue
+                prior_distance = search[0][:3]
                 await consider(groups,action,option_index)
                 if exhausted: break
                 # One extra batch per round, within the same eight full trials: repair
                 # newly reduced violations now instead of waiting for the next round.
-                if (not refreshed and best_valid is None
-                        and search_by_option[option_index][0][:3] > prior_distance):
-                    batches[option_index] = proposals_for(option_index)
+                search = branch_search(branch)
+                if (not refreshed and best_valid is None and search is not None
+                        and search[0][:3] > prior_distance):
+                    batches[branch] = proposals_for(branch)
                     refreshed = True
             if metrics.route_v2_trial_count==previous: break
-        exhausted = exhausted or metrics.route_v2_trial_count >= V2_MAX_TRIALS
-        # Newly learned precise facts also invalidate an earlier best if they disagree.
+        if (
+            provider is not None
+            and not search_budget_exhausted()
+            and not _v2_preview_blocked(metrics, deadline)
+            and not _plan_has_verified_commute(best_valid)
+        ):
+            guided = await _v2_route_acquired_groups(
+                request, pool, selection, must_ids, eligible, provider, known, make_plan,
+                metrics, deadline, retrieval.city, citycode,
+                None if coupling_context else accommodation_coord,
+                places_by_id, frozen_ids, hard_ids, metrics.route_v2_proved_conflicts,
+                known_access, attempted_access,
+                access_walk_rejections=access_walk_rejections,
+            )
+            if guided and not search_budget_exhausted():
+                await consider(guided, "route_acquired_seed")
+        exhausted = exhausted or search_budget_exhausted()
+        if best_valid is None and metrics.route_v2_repair_rounds >= V2_MAX_REPAIR_ROUNDS:
+            exhausted = True
+        # Re-check the refreshed plan against facts already learned. Report only.
+        coverage_check = {
+            "selection": selection,
+            "frozen_ids": tuple(frozen_ids),
+            "hard_ids": tuple(hard_ids),
+            "places_by_id": places_by_id,
+            "proved_conflicts": metrics.route_v2_proved_conflicts,
+            "search_exhausted": exhausted,
+        }
         refreshed_valid = []
         for option_index,candidate in valid_candidates:
             refreshed = make_plan([d.places for d in candidate.day_groups], option_index)
-            if not _v2_plan_violations(refreshed, request, must_ids, eligible):
+            if not _v2_plan_violations(
+                refreshed, request, must_ids, eligible, coverage=coverage_check,
+            ):
                 refreshed_valid.append(refreshed)
-        best_valid = max(refreshed_valid, key=lambda plan: _v2_valid_key(plan, request, selection, must_ids), default=None)
-        if best_valid is None and metrics.route_v2_repair_rounds >= V2_MAX_REPAIR_ROUNDS:
-            exhausted = True
+        best_valid = None
+        for refreshed in refreshed_valid:
+            if _v2_prefer_selected_plan(
+                refreshed, best_valid, request, selection, must_ids,
+                places_by_id, frozen_ids, hard_ids,
+            ):
+                best_valid = refreshed
+        def publish_coverage(plan, *, plan_feasible):
+            plan_ids = [] if plan is None else [p.place_id for day in plan.day_groups for p in day.places]
+            _v2_prove_singleton_conflicts(
+                plan_ids, request, selection, places_by_id, frozen_ids, hard_ids,
+                make_plan, metrics.route_v2_proved_conflicts,
+                coupling_context=coupling_context,
+            )
+            metrics.route_v2_coverage_report = _coverage_rows_for_ids(
+                plan_ids, request, selection, places_by_id, frozen_ids, hard_ids,
+                proved_conflicts=metrics.route_v2_proved_conflicts,
+                search_exhausted=exhausted,
+                plan_feasible=plan_feasible,
+            )[:_COVERAGE_TRACE_LIMIT]
         if best_valid is None:
             metrics.route_v2_stop_reason="search_budget_exhausted" if exhausted else "qualified_pool_exhausted"
-            raise RoutePlanInvariantError([metrics.route_v2_stop_reason],best_search.day_groups if best_search else [])
+            publish_coverage(best_search, plan_feasible=False)
+            reasons = [metrics.route_v2_stop_reason]
+            raise RoutePlanInvariantError(list(dict.fromkeys(reasons)),best_search.day_groups if best_search else [])
+        if provider is not None:
+            await _v2_apply_accepted_walk_proof(
+                best_valid,
+                request=request,
+                provider=provider,
+                known=known,
+                known_access=known_access,
+                attempted_access=attempted_access,
+                access_walk_rejections=access_walk_rejections,
+                city=retrieval.city,
+                citycode=citycode,
+                deadline=deadline,
+                generation_mode=mode,
+                metrics=metrics,
+            )
+        # Search admitted this plan on the facts it had then. Actual walking
+        # can be slower than a fast transit leg. Reject that plan before any
+        # success coverage, ledger close, or return. Keep the new facts.
+        final_violations = list(dict.fromkeys(_v2_plan_violations(
+            best_valid, request, must_ids, eligible, coverage=coverage_check,
+        )))
+        if final_violations:
+            metrics.route_v2_stop_reason = "final_facts_infeasible"
+            publish_coverage(best_valid, plan_feasible=False)
+            raise RoutePlanInvariantError(
+                final_violations, list(best_valid.day_groups),
+            )
+        publish_coverage(best_valid, plan_feasible=True)
+        best_valid.preference_coverage = metrics.route_v2_coverage_report
         winning_index = next((i for i,a in enumerate(options) if a == best_valid.accommodation_anchor),0)
         metrics.route_v2_accepted_action = candidate_actions[signature_for([d.places for d in best_valid.day_groups],winning_index)]
         if coupling_context:
             from src.agents.accommodation_policy import recommendation_reason
-            if best_valid.accommodation_anchor and best_valid.accommodation_anchor.suggestion.source == "auto_recommended":
+            if settings.accommodation_route_coupling_enabled and best_valid.accommodation_anchor and best_valid.accommodation_anchor.suggestion.source == "auto_recommended":
                 best_valid.accommodation_anchor.suggestion.reason = recommendation_reason(best_valid)
             metrics.accommodation_metrics.update(selected_option=winning_index, recommendation_changed=winning_index!=0)
         used=route_plan_place_ids(best_valid)
         by_id={p.place_id:p for p in retrieval.candidates+retrieval.route_planning_candidates}
         _close_selection_ledger(best_valid,selection=selection,candidates_by_id=by_id,
             supplement_reasons={pid:"REPLACE_DROPPED" for pid in used-set(selected_ids)},
-            selected_drop_reasons={pid:("HARD_INELIGIBLE" if pid not in eligible else "NOT_CHOSEN_FOR_FINAL_ROUTE")
+            selected_drop_reasons={pid:("HARD_INELIGIBLE" if pid not in hard_ids else "NOT_CHOSEN_FOR_FINAL_ROUTE")
                                    for pid in selected_ids if pid not in used},request=request)
         metrics.route_v2_stop_reason="best_valid_at_limit" if exhausted else "complete"
         metrics.plan_count=1;metrics.day_count=request.days
         metrics.commute_leg_count=sum(len(day.commute_legs) for day in best_valid.day_groups)
         metrics.record_membership_ledger(best_valid.membership_ledger)
         metrics.route_quality=build_route_quality_metrics(request,retrieval,[best_valid],selected_reason="route_v2_feasibility")
+        from src.agents.preferences import route_preference_snapshot
+        snapshot = route_preference_snapshot(best_valid, request)
+        for row in best_valid.preference_coverage:
+            row["snapshot"] = snapshot
         return [best_valid]
     finally:
+        _PREFERENCE_COMPARISON.reset(comparison_token)
+        if estimate_token is not None:
+            _SHORT_TRANSIT_ESTIMATE_WALK_SPEED.reset(estimate_token)
         metrics.access_route_attempt_count = len(attempted_access)
         metrics.access_route_fact_count = len(known_access)
         if coupling_context:
@@ -8953,6 +11261,7 @@ async def plan_routes(
     selection: PoiSelectionResult | None = None,
     accommodation_source: str = "auto_recommended",
     accommodation_context=None,
+    selector_input=None,
 ) -> list[RoutePlan]:
     """Plan one selected route, or read the historical grouped compatibility path."""
     route_start = time.monotonic()
@@ -9018,7 +11327,8 @@ async def plan_routes(
             request, retrieval, selection, qualified_pool, provider, metrics,
             accommodation_coord, accommodation_source, citycode,
             effective_deadline, route_start,
-            accommodation_context if settings.accommodation_route_coupling_enabled else None,
+            accommodation_context,
+            selector_input=selector_input,
         )
     if selection is not None:
         plans = [
@@ -9131,7 +11441,7 @@ async def plan_routes(
 
     own_provider = (
         provider is None
-        and bool(settings.amap_api_key)
+        and amap_keys_configured(settings)
         and settings.amap_route_enabled
     )
     active_provider = provider
@@ -9405,7 +11715,19 @@ def route_plan_violations(
     narrative** first-hit canonical place-id sequences must ordered-equal that
     list. Day titles are validated separately so a correct title cannot mask a
     reordered body (ADR 0017).
+
+    v0.15.1 article mode (D3): the article may name any place; naming is not
+    visiting. The body read here is the backend skeleton (day titles and stop
+    labels), so every caller checks the same route lines.
     """
+    from src.config import get_settings
+    if str(getattr(get_settings(), "writer_prompt_version", "") or "").strip() == "article":
+        from src.agents.article_writer import article_skeleton
+        plans = [
+            plan.model_copy(update={"plan_text": article_skeleton(plan.plan_text, route_plans[index])})
+            if index < len(route_plans) else plan
+            for index, plan in enumerate(plans)
+        ]
     violations = []
     if len(plans) != len(route_plans):
         violations.append({
@@ -9734,6 +12056,8 @@ def authorized_commute_mask_strings(
                         duration_minutes=int(leg.duration_minutes or 0)
                     )
                 )
+    from src.agents.preference_notices import notice_mask_strings
+    masks.extend(notice_mask_strings(route_plan, day=day))
     # Longest first so nested authorized phrases mask completely.
     unique = sorted({value for value in masks if value}, key=lambda item: (-len(item), item))
     return unique
@@ -10061,101 +12385,3 @@ def _parenthetical_base_name(name: str) -> str:
         if len(base) >= 2:
             return base
     return ""
-
-
-ROUTE_NIGHT_HINT_PREFIX = "夜游："
-
-
-def route_night_visit_intervals(day_group, request=None) -> dict[int, tuple[int, int]]:
-    """Public routes do not publish clocked night intervals.
-
-    Preference checks treat a missing interval as unscheduled instead of
-    inventing a visit window.
-    """
-    del day_group, request
-    return {}
-
-
-def route_night_hint(place, interval) -> str:
-    start, end = interval
-    return f"{ROUTE_NIGHT_HINT_PREFIX}{place.name} {int(start)}-{int(end)}"
-
-
-def route_night_gap(day, request=None):
-    """No clocked evening slot exists to miss on the public planner."""
-    del day, request
-    return None
-
-
-async def _v2_verify_traffic(
-    route,
-    *,
-    request,
-    provider,
-    known,
-    known_access,
-    attempted_access,
-    access_walk_rejections,
-    city,
-    citycode,
-    deadline,
-    mode,
-    metrics,
-    must_ids,
-    eligible_ids,
-    coverage=None,
-):
-    """Upgrade estimated legs with the existing Amap resolver, then re-check the day.
-
-    Already quoted facts in ``known`` / ``known_access`` win. A missing provider
-    leaves the estimates in place.
-    """
-    del access_walk_rejections, must_ids, eligible_ids, coverage
-    settings = get_settings()
-    known = {} if known is None else known
-    known_access = {} if known_access is None else known_access
-    if provider is not None:
-        await _v2_resolve_access(
-            route,
-            provider,
-            known_access,
-            attempted_access,
-            city=city,
-            citycode=citycode,
-            deadline=deadline,
-        )
-        for day in route.day_groups:
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            if not day.commute_legs:
-                continue
-            remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else 60
-            daily_budget = (
-                day.traffic_policy.daily_limit_minutes
-                if day.traffic_policy is not None
-                else daily_commute_budget_minutes(request, settings)
-            )
-            day.commute_legs = await _resolve_precise_legs(
-                day,
-                day.commute_legs,
-                city=city,
-                citycode=citycode,
-                generation_mode=mode,
-                requested_commute_mode=request.commute_mode,
-                daily_budget=daily_budget,
-                single_leg_max=single_leg_max_minutes(mode, settings),
-                provider=provider,
-                metrics=metrics,
-                known_precise_legs=known,
-                concurrency=settings.amap_route_enrichment_concurrency,
-                timeout_seconds=min(
-                    remaining,
-                    max(settings.amap_route_timeout, 1) * max(1, len(day.commute_legs)),
-                ),
-            )
-    for day in route.day_groups:
-        day.commute_legs = [
-            known.get((leg.from_place_id, leg.to_place_id, leg.mode), leg).model_copy(deep=True)
-            for leg in day.commute_legs
-        ]
-        _v2_finalize_day(day, request)

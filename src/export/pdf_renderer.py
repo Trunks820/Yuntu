@@ -42,6 +42,7 @@ from src.export.cost_estimate import (
     validate_artifact_cost_estimate,
 )
 from src.export.public_text import public_items, public_text
+from src.export.source_contract import validate_export_result_contract
 
 FONT_NAME = "YunTuTravelCJK"
 FONT_ENV_KEYS = (
@@ -202,8 +203,10 @@ def _validated_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("result")
     if not isinstance(result, dict):
         raise PdfRenderError("INVALID_EXPORT_SOURCE")
-    if result.get("schema_version") not in {"2.0", "2.1", "2.2"}:
-        raise PdfRenderError("INVALID_EXPORT_SOURCE")
+    try:
+        validate_export_result_contract(result)
+    except (TypeError, ValueError) as exc:
+        raise PdfRenderError("INVALID_EXPORT_SOURCE") from exc
 
     request = result.get("request")
     city = result.get("city")
@@ -1308,7 +1311,9 @@ def _place_text(index: int, place: dict[str, Any]) -> str:
     category = _text(place.get("category"))
     role = _text(place.get("role"))
     optional = "可选" if bool(place.get("optional")) else "必排"
-    brief = _text(place.get("brief"))
+    # v0.15.1: the Writer's paragraph for this stop when the result has one.
+    note = " ".join(str(place.get("activity_note") or "").split())
+    brief = _text(note or place.get("brief"))
     attrs = " / ".join(part for part in (category, role, optional) if part)
     if brief:
         return f"{index}. {name}｜{attrs}｜{brief}" if attrs else f"{index}. {name}｜{brief}"

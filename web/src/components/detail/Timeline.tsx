@@ -19,21 +19,12 @@ const PERIOD_BADGE_CLASS: Record<string, string> = {
   晚上: "bg-indigo-50 text-indigo-600",
 };
 
-/** md 及以上默认展开攻略；手机默认折叠。切 Day 时按当前断点重置。 */
-function useDesktopOpenDefault(dayKey: number) {
-  const [open, setOpen] = useState(() =>
-    typeof window !== "undefined" ? window.matchMedia("(min-width: 768px)").matches : true,
-  );
+export function Timeline({ day, activePlaceId, onPlaceClick }: TimelineProps) {
+  const [narrativeOpen, setNarrativeOpen] = useState(true);
 
   useEffect(() => {
-    setOpen(window.matchMedia("(min-width: 768px)").matches);
-  }, [dayKey]);
-
-  return [open, setOpen] as const;
-}
-
-export function Timeline({ day, activePlaceId, onPlaceClick }: TimelineProps) {
-  const [narrativeOpen, setNarrativeOpen] = useDesktopOpenDefault(day.day);
+    setNarrativeOpen(true);
+  }, [day.day]);
 
   return (
     <div className="px-5 py-5">
@@ -129,7 +120,7 @@ export function Timeline({ day, activePlaceId, onPlaceClick }: TimelineProps) {
                     />
                   </div>
 
-                  {/* 精确时间：仅受治理来源（reservation/event/transport/verified_venue_rule） */}
+                  {/* 精确时间：仅受治理来源（reservation/event/transport/verified_venue_rule/planned） */}
                   {exact && (
                     <div className="mt-1 flex items-center gap-1.5 pl-5 text-[11px] font-medium text-gray-600 tabular-nums">
                       <Clock size={12} aria-hidden="true" />
@@ -142,7 +133,7 @@ export function Timeline({ day, activePlaceId, onPlaceClick }: TimelineProps) {
 
                   {/* activity_note：本条路线中该地点的体验说明（1.5）；旧结果回退 brief */}
                   {note ? (
-                    <p className="mt-0.5 line-clamp-2 pl-5 text-[12px] leading-relaxed text-gray-500">
+                    <p className="mt-0.5 whitespace-pre-line pl-5 text-[12px] leading-relaxed text-gray-500">
                       {note}
                     </p>
                   ) : (
@@ -223,7 +214,7 @@ export function Timeline({ day, activePlaceId, onPlaceClick }: TimelineProps) {
         })}
       </div>
 
-      {/* 当日攻略正文：时间轴之后，不改写内容；手机默认折叠、桌面默认展开 */}
+      {/* 当天概述：时间轴之后，默认展开，不改写内容 */}
       {day.narrative && (
         <div className="mt-6 rounded-2xl border border-amber-100/50 bg-amber-50/60 p-4">
           <button
@@ -234,7 +225,7 @@ export function Timeline({ day, activePlaceId, onPlaceClick }: TimelineProps) {
           >
             <span className="flex items-center gap-2 text-[14px] font-bold text-amber-800">
               <Lightbulb size={18} className="text-amber-500" aria-hidden="true" />
-              {narrativeOpen ? "当日游玩贴士" : "查看当日游玩贴士"}
+              当天怎么玩
             </span>
             <ChevronDown
               size={12}

@@ -341,6 +341,7 @@ MVP 阶段只使用小红书可直接提供的 fact_type：`recommendation` / `w
 | avg_price | NUMERIC(8,2) | 聚合人均 |
 | opening_hours | VARCHAR(200) | 营业时间 |
 | top_reasons | JSONB | 推荐理由列表 |
+| cleaned_evidence | JSONB | 离线清洗后的推荐理由（优先于 top_reasons） |
 | warnings | JSONB | 避坑提醒列表 |
 | hot_score | NUMERIC(10,2) | 热度分 |
 | quality_score | NUMERIC(3,1) | 数据质量分 0-10 |

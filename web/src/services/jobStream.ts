@@ -3,12 +3,16 @@ import { mapBackendStage, STAGE_MAP, TOTAL_STAGES } from "@/constants/stages";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
+import type { PublicGenerationDelivery } from "@/types/trip";
+
 interface RawStreamEvent {
   status?: string;
   stage_progress?: { code: string; step: number; total: number };
   result_record_id?: string | number | null;
   error?: { code: string; message: string } | null;
   current_stage?: string | null;
+  delivery?: PublicGenerationDelivery | null;
+  generation_policy_version?: string | null;
 }
 
 interface StreamHandlers {
@@ -69,6 +73,8 @@ function toJobResponse(
       status === "FAILED"
         ? (raw.error ?? { code: "GENERATION_FAILED", message: "生成失败" })
         : null,
+    delivery: raw.delivery ?? null,
+    generation_policy_version: raw.generation_policy_version ?? null,
   };
 }
 

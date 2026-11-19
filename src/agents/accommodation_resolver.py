@@ -26,7 +26,6 @@ from src.pipeline.poi_resolve import (
 logger = logging.getLogger(__name__)
 
 COORDINATE_ONLY_ACCOMMODATION_NAME = "用户指定住宿位置"
-AUTO_RECOMMENDATION_REASON = "步行可达多数主景点"
 _MATCHABLE_PLACE_TYPES = frozenset({
     "accommodation_area",
     "business_area",
@@ -393,15 +392,16 @@ async def resolve_accommodation(
     )
     if best_area is None:
         return None
+    # No reason is claimed: proximity scoring does not verify walking access
+    # (area-level recommendation reasons belong to v0.14).
     return _suggestion_from_place(
         best_area,
         source="auto_recommended",
-        reason=AUTO_RECOMMENDATION_REASON,
         user_input_unmatched=unmatched,
     )
 
 
-async def resolve_accommodation_context(trip_request, retrieval, session):
+async def resolve_accommodation_context(trip_request, retrieval, session, *, coupling_enabled=True):
     """Coupled path: failed explicit input never enters automatic recommendation."""
     from src.agents.schema import AccommodationAnchor, AccommodationPlanningContext
     from src.agents.accommodation_policy import urban_core, distance_km
@@ -423,6 +423,10 @@ async def resolve_accommodation_context(trip_request, retrieval, session):
     anchors = [AccommodationAnchor(suggestion=_suggestion_from_place(a,source="auto_recommended"),
                place_id=a.place_id,location_precision="area") for a in areas]
     core = urban_core(anchors)
+    if not coupling_enabled:
+        suggestion = await resolve_accommodation(trip_request, retrieval, session)
+        locked = [AccommodationAnchor(suggestion=suggestion, location_precision="point" if trip_request.accommodation else "area")] if suggestion else []
+        return AccommodationPlanningContext(state="fixed" if locked else "auto_unavailable", anchors=locked, urban_core=core)
     request = trip_request.accommodation
     explicit = request is not None and (bool((request.name or "").strip()) or
         request.place_id is not None or request.latitude is not None or request.longitude is not None)

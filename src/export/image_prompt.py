@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 
 
-SHARE_IMAGE_PROMPT_VERSION = "v0.8.10.1-r10"
+SHARE_IMAGE_PROMPT_VERSION = "v0.15-r12"
 SHARE_IMAGE_PROMPT_LAYOUT_VERSION = "ai-full-context-compact-visible-v1"
 SHARE_REFERENCE_CONTEXT_MAX_CHARS = 14_000
 SHARE_VISIBLE_SCRIPT_THREE_DAY_MAX_CHARS = 2400
@@ -46,7 +46,6 @@ class ShareImageSummary:
     core_place_chips: tuple[str, ...]
     suitable_for: str
     compression_mode: str
-    cost_lines: tuple[str, ...] = field(default_factory=tuple)
     notes: str = ""
     plan_title: str = ""
     plan_summary: str = ""
@@ -66,44 +65,94 @@ class SharePosterPrompt:
 
 _CITY_ATMOSPHERE: dict[str, str] = {
     "北京": (
-        "Beijing, a historic imperial capital, broad axial boulevards, "
-        "old hutong texture, cypress courtyards, layered palace rooflines, crisp light"
+        "Beijing, China's capital, Forbidden City palace rooflines, old hutong lanes, cypress courtyards, broad axial boulevards, crisp northern light"
     ),
     "上海": (
-        "Shanghai, a modern riverside metropolis, refined urban energy, "
-        "the Bund skyline, plane-tree avenues, soft skyline light"
+        "Shanghai, a modern riverside metropolis, the Bund facing the Lujiazui towers across the Huangpu River, plane-tree avenues, soft skyline light"
     ),
     "重庆": (
-        "Chongqing, a mountainous river metropolis in southwest China, "
-        "layered streets, elevated walkways, warm evening mist, river lights"
+        "Chongqing, a mountainous river metropolis in southwest China where the Yangtze meets the Jialing, stacked hillside streets, stilted houses, elevated walkways, warm evening mist, river lights"
     ),
     "成都": (
-        "Chengdu, a relaxed inland city, tea-house courtyards, leafy avenues, "
-        "slow lanes, soft humid light, grounded local life"
+        "Chengdu, Sichuan, a relaxed inland city, bamboo tea-house courtyards, Kuanzhai Alley grey-brick lanes, leafy avenues, soft humid light"
     ),
     "杭州": (
-        "Hangzhou, a calm lakeside city, West Lake reflections, willow edges, "
-        "green hills, soft poetic morning light"
+        "Hangzhou, Zhejiang, a calm lakeside city, West Lake reflections, willow-lined causeways, Leifeng Pagoda, green tea hills, soft poetic morning light"
     ),
     "西安": (
-        "Xi'an, an ancient Chinese capital with warm grey city walls, "
-        "layered traditional rooflines, broad avenues, cinematic dusk light"
+        "Xi'an, Shaanxi, an ancient Chinese capital, the Ming city wall, the Bell Tower, the Big Wild Goose Pagoda, layered traditional rooflines, cinematic dusk light"
     ),
     "南京": (
-        "Nanjing, a historic capital city, stone city walls, parasol-tree boulevards, "
-        "Qinhuai riverside mood, calm amber evening light"
+        "Nanjing, Jiangsu, a historic capital city, stone city walls, Qinhuai River lantern evenings, parasol-tree boulevards, Purple Mountain, calm amber light"
     ),
     "长沙": (
-        "Changsha, a lively riverside city, youthful night energy, warm street glow, "
-        "dense urban texture, riverfront atmosphere"
+        "Changsha, Hunan, a lively riverside city, the Xiang River and Orange Isle, Yuelu Mountain, warm night street glow, dense urban texture"
     ),
     "青岛": (
-        "Qingdao, a seaside city with red-roof architecture, granite coastlines, "
-        "sea breeze, bright blue water, clear coastal light"
+        "Qingdao, Shandong, a seaside city, red-roof European-era houses, Zhanqiao Pier, granite coastline on the Yellow Sea, clear coastal light"
     ),
     "桂林": (
-        "Guilin, a landscape city of limestone karst peaks, Li River reflections, "
-        "misty hills, soft humid light, serene natural atmosphere"
+        "Guilin, Guangxi, limestone karst peaks along the Li River, bamboo rafts, misty hills, soft humid light, serene natural atmosphere"
+    ),
+    "广州": (
+        "Guangzhou, Guangdong, the Pearl River and Canton Tower, arcaded qilou shophouse streets, old banyan trees, warm subtropical evening"
+    ),
+    "武汉": (
+        "Wuhan, Hubei, a great city on the Yangtze River, the Yellow Crane Tower, long river bridges, East Lake, broad river light"
+    ),
+    "苏州": (
+        "Suzhou, Jiangsu, classical Chinese gardens, quiet canals under arched stone bridges, whitewashed walls and black-tiled roofs, soft rain light"
+    ),
+    "厦门": (
+        "Xiamen, Fujian, a subtropical island city, Gulangyu villas among banyan trees, seaside boulevards, bright blue sea and sky"
+    ),
+    "昆明": (
+        "Kunming, Yunnan, the Spring City on the high plateau, Dianchi Lake, the Western Hills, flower markets, clear blue plateau sky"
+    ),
+    "三亚": (
+        "Sanya, Hainan, a tropical beach city, white sand bays, coconut palms, turquoise South China Sea, bright sunshine, resort coastline"
+    ),
+    "大理": (
+        "Dali, Yunnan, Erhai Lake under the Cangshan Mountains, the Three Pagodas, whitewashed Bai village houses, clear highland light"
+    ),
+    "丽江": (
+        "Lijiang, Yunnan, the Naxi old town of wooden houses and tiled roofs along stone canals, Jade Dragon Snow Mountain, clear highland light"
+    ),
+    "哈尔滨": (
+        "Harbin, Heilongjiang, a snowy northern city, the onion-domed St. Sophia Cathedral, Russian-style Central Street, the frozen Songhua River, ice-lantern glow"
+    ),
+    "洛阳": (
+        "Luoyang, Henan, an ancient capital, the Longmen Grottoes Buddhist carvings on the Yi River cliffs, peony gardens, old city gates"
+    ),
+    "泉州": (
+        "Quanzhou, Fujian, a maritime silk road port, Kaiyuan Temple's twin stone pagodas, red-brick Minnan houses with swallowtail roofs"
+    ),
+    "福州": (
+        "Fuzhou, Fujian, the Three Lanes and Seven Alleys of whitewashed walls, giant banyan trees, the Min River, humid warm light"
+    ),
+    "天津": (
+        "Tianjin, a northern port city, the Haihe River, European-style villas of the Five Avenues, the Tianjin Eye Ferris wheel"
+    ),
+    "深圳": (
+        "Shenzhen, Guangdong, a modern bay city, glass skyscrapers, seaside parks, lush subtropical greenery, bright clean light"
+    ),
+    "珠海": (
+        "Zhuhai, Guangdong, a garden city on the sea, the Lovers' Road coastline, green islands, calm blue bay"
+    ),
+    "威海": (
+        "Weihai, Shandong, a clean seaside city, winding coastal roads, Liugong Island, clear blue water and sky"
+    ),
+    "张家界": (
+        "Zhangjiajie, Hunan, towering quartz-sandstone pillars rising from misty forest, deep green valleys, dramatic mountain light"
+    ),
+    "大同": (
+        "Datong, Shanxi, the Yungang Grottoes Buddhist cliff carvings, restored ancient city walls, northern plateau light"
+    ),
+    "乌鲁木齐": (
+        "Urumqi, Xinjiang, at the foot of the snow-capped Tianshan Mountains, the Grand Bazaar's domes and arches, wide northwestern sky"
+    ),
+    "开封": (
+        "Kaifeng, Henan, an old Song dynasty capital, the Iron Pagoda, Qingming riverside streets of the Song style, lantern-lit night markets"
     ),
 }
 
@@ -150,8 +199,7 @@ def build_share_image_prompt_payload(summary: ShareImageSummary) -> SharePosterP
         "red, deep navy and tea-brown accents. Lock the composition to this preferred layout: a large "
         "brush title at upper left and an unmistakable city hero at upper right; three prominent "
         "horizontal Day modules, each with one large scene on the left, compact text in the middle, "
-        "and 2-4 small attraction or food picture vignettes on the right; after all Day modules add "
-        "one compact 行程消费预估 appendix containing every supplied scenario/category line, then "
+        "and 2-4 small attraction or food picture vignettes on the right; "
         "finish with travel tags at the bottom. For trips not exactly three days, preserve this visual rhythm "
         "while fitting every supplied Day. Never use dense long paragraphs, tables, spreadsheet-like "
         "rows, or the crowded second-poster layout. The returned image is final and receives no backend "
@@ -160,7 +208,9 @@ def build_share_image_prompt_payload(summary: ShareImageSummary) -> SharePosterP
         "VISIBLE TEXT. Copy those values accurately without quote marks. Never render field labels such as "
         "标题, 行程, 路线, 日, 摘, 点, or 标签; do not render punctuation outside quotes, full narratives, "
         "commute text, place briefs, or reference-context "
-        "prose. Do not invent facts, places, dates, people, prices or brands. No logo, URL, watermark, QR "
+        "prose. Do not invent facts, places, dates, people, prices or brands. Never render any monetary "
+        "amount, currency symbol, budget figure or expense text anywhere on the poster. "
+        "No logo, URL, watermark, QR "
         "code, pseudo-Chinese or explanatory copy.\n\n"
         "--- REFERENCE CONTEXT - NEVER RENDER VERBATIM ---\n"
         f"{reference_context}\n"
@@ -224,9 +274,6 @@ def _visible_poster_script(summary: ShareImageSummary) -> str:
                 _visible_text_instruction(f"点{day.day}", "｜".join(places))
             )
 
-    for index, cost_line in enumerate(summary.cost_lines, start=1):
-        lines.append(_visible_text_instruction(f"费用{index}", cost_line))
-
     tags = _poster_tags(
         summary,
         count=limits["tag_count"],
@@ -284,8 +331,6 @@ def _reference_context(summary: ShareImageSummary) -> tuple[str, bool]:
         tail.append(_reference_line(f"Weather {index}", value))
     for index, value in enumerate(summary.time_preference_lines, start=1):
         tail.append(_reference_line(f"Time preference {index}", value))
-    for index, value in enumerate(summary.cost_lines, start=1):
-        tail.append(_reference_line(f"Cost estimate {index}", value))
     if summary.suitable_for:
         tail.append(_reference_line("Suitable audience", summary.suitable_for))
 
@@ -530,9 +575,11 @@ def _city_atmosphere(city: str) -> str:
     ascii_city = _ascii_only(city)
     if ascii_city:
         return f"{ascii_city}, global city travel atmosphere"
+    # No English entry yet: name the city itself so the image shows that place,
+    # not an anonymous old town.
     return (
-        "a Chinese travel city, river light, walkable neighborhoods, "
-        "local culture, calm cinematic atmosphere"
+        f"the Chinese city of {city}, showing its own real landmarks, terrain "
+        "and architecture rather than a generic old town, calm cinematic atmosphere"
     )
 
 

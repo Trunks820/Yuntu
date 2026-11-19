@@ -10,7 +10,14 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, PrivateAttr, ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 from sqlalchemy import text
 
 from src.agents.pretrip_advice import project_public_plan_advice
@@ -24,8 +31,10 @@ from src.agents.schema import (
     TransitStep,
     TravelTip,
 )
+from src.agents.itinerary_lines import strip_itinerary
 from src.agents.weather_advisory import is_weather_line
 from src.api.public_guard import verify_public_api_client
+from src.api.result_stops import activity_note, split_day_text, stop_fields
 from src.config import get_settings
 from src.cost_estimate.public import (
     CostEstimateProjectionError,
@@ -33,6 +42,7 @@ from src.cost_estimate.public import (
     project_cost_estimate_summary,
 )
 from src.pipeline.db import get_session_factory
+from src.jobs.generation_delivery import GenerationDelivery, GenerationPolicyVersion, validate_delivery_for_job
 
 router = APIRouter(dependencies=[Depends(verify_public_api_client)])
 logger = logging.getLogger(__name__)
@@ -80,6 +90,16 @@ class ResultPace(BaseModel):
     total_commute_minutes: int
 
 
+class ResultSchedule(BaseModel):
+    period: Literal["morning", "afternoon", "evening", "night"]
+    exact_start: str | None = None
+    exact_end: str | None = None
+    # "planned" (v0.15.1): the route's own clock rounded to 15 minutes.
+    exact_time_source: Literal[
+        "reservation", "event", "transport", "verified_venue_rule", "planned"
+    ] | None = None
+
+
 class ResultPlace(BaseModel):
     place_id: int
     name: str
@@ -89,6 +109,19 @@ class ResultPlace(BaseModel):
     role: str = "filler"
     optional: bool = False
     brief: str = ""
+    # v0.15.1 card fields; the BFF and web already read them. Omitted when
+    # empty, so results without them serialize exactly as before.
+    stay_minutes: int | None = None
+    activity_note: str | None = None
+    schedule: ResultSchedule | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_card_fields(self, handler):
+        payload = handler(self)
+        for key in ("stay_minutes", "activity_note", "schedule"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
+        return payload
 
 
 class ResultCommuteLeg(BaseModel):
@@ -163,27 +196,44 @@ class ResultDay(BaseModel):
 
 
 class ResultLodgingDisplayGroup(BaseModel):
-    kind: str
+    kind: Literal["economy", "mid", "high", "homestay"]
     label: str
-    hotels: list[str] = Field(default_factory=list)
+    hotels: list[str]
     nightly_low_cny: int | None = None
     nightly_high_cny: int | None = None
 
+    @model_validator(mode="after")
+    def _nightly_prices_together(self) -> "ResultLodgingDisplayGroup":
+        if (self.nightly_low_cny is None) != (self.nightly_high_cny is None):
+            raise ValueError(
+                "nightly_low_cny and nightly_high_cny must both be set or both be None"
+            )
+        return self
+
 
 class ResultLodgingDisplayNotice(BaseModel):
-    kind: str
-    text: str = ""
+    kind: Literal["user_lodging_unmatched", "holiday"]
+    text: str
 
 
 class ResultLodgingDisplay(BaseModel):
-    layout: Literal["user_lodging", "homestay", "tiers", "brands", "area_only"]
+    layout: Literal["tiers", "homestay", "brands", "user_lodging", "area_only"]
     area_label: str
     caption: str = ""
     groups: list[ResultLodgingDisplayGroup] = Field(default_factory=list)
-    notices: list[ResultLodgingDisplayNotice] = Field(default_factory=list)
     round_trip_minutes_low: int | None = None
     round_trip_minutes_high: int | None = None
-    price_status: Literal["sourced", "待核实"] = "待核实"
+    notices: list[ResultLodgingDisplayNotice] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _round_trip_together(self) -> "ResultLodgingDisplay":
+        if (self.round_trip_minutes_low is None) != (
+            self.round_trip_minutes_high is None
+        ):
+            raise ValueError(
+                "round_trip_minutes_low and round_trip_minutes_high must both be set or both be None"
+            )
+        return self
 
 
 class ResultAccommodation(BaseModel):
@@ -193,6 +243,13 @@ class ResultAccommodation(BaseModel):
     source: Literal["user_specified", "auto_recommended"]
     reason: str | None = None
     display: ResultLodgingDisplay | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_display(self, handler):
+        payload = handler(self)
+        if payload.get("display") is None:
+            payload.pop("display", None)
+        return payload
 
 
 class ResultTransportOption(BaseModel):
@@ -246,9 +303,11 @@ class ResultPlan(BaseModel):
 
 
 class TripResultResponse(BaseModel):
-    schema_version: Literal["2.1", "2.2"]
+    schema_version: Literal["2.1", "2.2", "2.3"]
     published_variant: PublishedVariant
     delivery_status: DeliveryStatus
+    generation_policy_version: GenerationPolicyVersion | None = None
+    delivery: GenerationDelivery | None = None
     result_id: int
     city: ResultCity
     request: ResultRequest
@@ -259,6 +318,14 @@ class TripResultResponse(BaseModel):
     _artifact_request: ResultArtifactRequest = PrivateAttr(
         default_factory=ResultArtifactRequest
     )
+
+    @model_serializer(mode="wrap")
+    def serialize_policy_fields(self, handler):
+        payload = handler(self)
+        if self.schema_version != "2.3":
+            payload.pop("generation_policy_version", None)
+            payload.pop("delivery", None)
+        return payload
 
 
 def _coerce_json(raw: Any, default: Any) -> Any:
@@ -337,6 +404,8 @@ def _short_text(text_value: str, *, limit: int) -> str:
 def _clean_summary_fragment(value: str) -> str:
     text_value = re.sub(r"\*\*|`|#+|---", " ", value)
     text_value = re.sub(r"\bDay\s*\d+\b|第\s*\d+\s*天", " ", text_value, flags=re.I)
+    # "（18:44 左右日落）" goes whole, not as an empty "（ 左右日落）"
+    text_value = re.sub(r"[（(][^（）()]*\d{1,2}\s*[:：]\s*\d{2}[^（）()]*[）)]", " ", text_value)
     text_value = re.sub(r"\d{1,2}\s*[:：]\s*\d{2}", " ", text_value)
     text_value = re.sub(r"^\s*[｜|·・、,，:：;；.。\-—>→~～/\\]+\s*", " ", text_value)
     text_value = _strip_weather_reminders(text_value)
@@ -360,7 +429,8 @@ def _plan_summary(plan: dict[str, Any]) -> str:
     # deterministic template below is the fallback for dropped/legacy rows.
     writer_summary = str(plan.get("summary") or "").strip()
     if writer_summary:
-        return _short_text(_clean_summary_fragment(writer_summary), limit=90)
+        # v0.15.1: the Writer may write up to 150 characters.
+        return _short_text(_clean_summary_fragment(writer_summary), limit=160)
 
     route_plan = plan.get("route_plan") or {}
     blueprint = plan.get("composition_blueprint") or {}
@@ -408,54 +478,6 @@ def _assert_result_contract(condition: bool, reason: str) -> None:
         raise ResultContractUnsupported(reason)
 
 
-def _display_has_sourced_price(display: dict[str, Any] | None) -> bool:
-    if not isinstance(display, dict):
-        return False
-    if display.get("price_status") == "sourced":
-        return True
-    for group in display.get("groups") or []:
-        if not isinstance(group, dict):
-            continue
-        if group.get("nightly_low_cny") is not None and group.get("nightly_high_cny") is not None:
-            return True
-    return False
-
-
-def _pending_lodging_display(raw: dict[str, Any]) -> dict[str, Any]:
-    """No priced hotel API. Missing nightly bounds stay 待核实."""
-    from src.agents.lodging_section import build_lodging_display
-    from src.agents.schema import AccommodationSuggestion
-
-    try:
-        suggestion = AccommodationSuggestion.model_validate(
-            {
-                "name": raw.get("name"),
-                "latitude": raw.get("latitude"),
-                "longitude": raw.get("longitude"),
-                "source": raw.get("source"),
-                "reason": raw.get("reason") or "",
-                "user_input_unmatched": raw.get("user_input_unmatched") or "",
-            }
-        )
-        display = build_lodging_display(accommodation=suggestion).model_dump(mode="json")
-    except Exception:
-        display = {
-            "layout": "area_only",
-            "area_label": str(raw.get("name") or "").strip(),
-            "caption": "",
-            "groups": [],
-            "notices": [],
-        }
-    display["price_status"] = "待核实"
-    display["groups"] = [
-        {**group, "nightly_low_cny": None, "nightly_high_cny": None}
-        if isinstance(group, dict)
-        else group
-        for group in display.get("groups") or []
-    ]
-    return display
-
-
 def _project_accommodation(plan: dict[str, Any]) -> ResultAccommodation | None:
     raw = plan.get("accommodation")
     if raw is None:
@@ -468,16 +490,20 @@ def _project_accommodation(plan: dict[str, Any]) -> ResultAccommodation | None:
         bool(str(raw.get("name") or "").strip()),
         "plan accommodation name is required",
     )
-    projected = dict(raw)
-    existing = projected.get("display") if isinstance(projected.get("display"), dict) else None
-    if _display_has_sourced_price(existing):
-        projected["display"] = {**existing, "price_status": "sourced"}
-    else:
-        projected["display"] = _pending_lodging_display(projected)
+    payload = dict(raw)
+    display_raw = payload.pop("display", None)
     try:
-        return ResultAccommodation.model_validate(projected)
+        accommodation = ResultAccommodation.model_validate(payload)
     except ValidationError as exc:
         raise ResultContractUnsupported("plan accommodation is invalid") from exc
+    if display_raw is None:
+        return accommodation
+    try:
+        display = ResultLodgingDisplay.model_validate(display_raw)
+    except ValidationError:
+        logger.warning("dropping invalid lodging display")
+        return accommodation
+    return accommodation.model_copy(update={"display": display})
 
 
 def _transport_price(value: Any) -> str | None:
@@ -697,33 +723,70 @@ def _clean_public_brief(value: str) -> str:
     return _short_text(text_value, limit=80) if text_value else ""
 
 
-def _extract_day_narrative(
-    plan_text: str,
-    day_number: int,
-    *,
-    total_days: int,
-) -> str:
+def _day_section(plan_text: str, day_number: int, *, total_days: int) -> tuple[str, str] | None:
+    """(heading title, body) of one day in the delivered text."""
     if not plan_text.strip():
-        return ""
+        return None
     matches = list(_DAY_HEADING_RE.finditer(plan_text))
     if not matches:
         if total_days == 1 and day_number == 1:
-            return _clean_day_narrative("", plan_text)
-        return ""
+            return "", plan_text
+        return None
 
     for index, match in enumerate(matches):
         if _heading_day(match) != day_number:
             continue
         next_match = matches[index + 1] if index + 1 < len(matches) else None
         body = plan_text[match.end(): next_match.start() if next_match else len(plan_text)]
-        return _clean_day_narrative(_heading_title(match), body)
-    return ""
+        return _heading_title(match), body
+    return None
+
+
+def _extract_day_narrative(
+    plan_text: str,
+    day_number: int,
+    *,
+    total_days: int,
+) -> str:
+    section = _day_section(plan_text, day_number, total_days=total_days)
+    return _clean_day_narrative(*section) if section is not None else ""
+
+
+def _day_narrative_and_notes(
+    plan_text: str,
+    day_number: int,
+    *,
+    total_days: int,
+    place_names: dict[int, str],
+) -> tuple[str, dict[int, str]]:
+    """v0.15.1: place paragraphs move to their cards; the day keeps the rest.
+
+    Without any place paragraph (an unexpected text shape) the narrative is
+    the whole day as before, so no prose is lost.
+    """
+    section = _day_section(plan_text, day_number, total_days=total_days)
+    if section is None:
+        return "", {}
+    title, body = section
+    kept, notes = split_day_text(_strip_weather_reminders(body.replace("---", "\n")), place_names)
+    if not notes:
+        return _clean_day_narrative(title, body), {}
+    cleaned_title = _clean_summary_fragment(title)
+    if re.search(r"(?:->|→|·|・)", cleaned_title):
+        cleaned_title = ""
+    lines = [re.sub(r"^\s*[｜|·・、,，:：;；.。\-—>→~～/\\]+\s*", "", line) for line in [cleaned_title, *kept]]
+    narrative = "\n".join(line for line in lines if line)
+    if len(narrative) > 1500:
+        narrative = narrative[:1499].rstrip() + "…"
+    return narrative, notes
 
 
 def _place_brief(place: dict[str, Any], stop: dict[str, Any] | None) -> str:
-    reasons = place.get("top_reasons") or []
-    if reasons and isinstance(reasons[0], dict):
-        reason = str(reasons[0].get("reason") or "").strip()
+    # v0.15.1: the first reason that is not a blogger's day route.
+    for item in place.get("top_reasons") or []:
+        if not isinstance(item, dict):
+            break
+        reason = strip_itinerary(str(item.get("reason") or "").strip())
         if reason:
             return _clean_public_brief(reason)
     return ""
@@ -827,7 +890,23 @@ def _budget_days(plan: dict[str, Any]) -> dict[int, dict[str, Any]]:
     return by_day
 
 
+def _model_route_budget_already_checked(budget_day: dict[str, Any] | None) -> bool:
+    """A sealed model day was accepted under the new commute caps.
+
+    The number stored in ``budget_minutes`` is still the old daily budget.
+    Comparing them again would mark a delivered day over limit.
+    """
+    if not isinstance(budget_day, dict):
+        return False
+    return (
+        str(budget_day.get("status") or "").lower() == "within_budget"
+        and str(budget_day.get("reason") or "") == "locked_model_route"
+    )
+
+
 def _day_pace_status(day_group: dict[str, Any], budget_day: dict[str, Any] | None) -> PaceStatus:
+    if _model_route_budget_already_checked(budget_day):
+        return "WITHIN_LIMIT"
     if budget_day:
         status = str(budget_day.get("status") or "").lower()
         if status in {"relaxed_exception", "infeasible"}:
@@ -841,7 +920,21 @@ def _day_pace_status(day_group: dict[str, Any], budget_day: dict[str, Any] | Non
     return "WITHIN_LIMIT"
 
 
-def _project_days(plan: dict[str, Any]) -> list[ResultDay]:
+def _day_clock(day_group: dict[str, Any]):
+    """The clock the route planner stored for one day; None for estimates too.
+
+    Cards show only a clock the scheduler computed. Selector routes and older
+    rows keep "第 N 站" rather than an estimate presented as the plan.
+    """
+    from src.agents.route_timeline import stored_timeline
+
+    try:
+        return stored_timeline(RouteDayGroup.model_validate(day_group))
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def _project_days(plan: dict[str, Any], *, cards: bool = True) -> list[ResultDay]:
     route_plan = plan.get("route_plan") or {}
     day_groups = route_plan.get("day_groups") or []
     _assert_result_contract(isinstance(day_groups, list) and bool(day_groups), "day_groups are required")
@@ -850,6 +943,7 @@ def _project_days(plan: dict[str, Any]) -> list[ResultDay]:
     day_titles = _composition_day_titles(plan)
     budget_by_day = _budget_days(plan)
     total_days = len(day_groups)
+    planned_time = bool(getattr(get_settings(), "result_planned_time_enabled", False))
 
     days: list[ResultDay] = []
     for index, day_group in enumerate(day_groups, 1):
@@ -857,14 +951,25 @@ def _project_days(plan: dict[str, Any]) -> list[ResultDay]:
         day_number = _to_int(day_group.get("day"), index) or index
         raw_places = day_group.get("places") or []
         _assert_result_contract(isinstance(raw_places, list) and bool(raw_places), "day places are required")
-        places = [
-            _project_place(
-                place,
-                stop=stop_by_place_id.get(_to_int(place.get("place_id"))),
+        place_dicts = [place for place in raw_places if isinstance(place, dict)]
+        if cards:
+            narrative, notes = _day_narrative_and_notes(
+                plan_text, day_number, total_days=total_days,
+                place_names={_to_int(p.get("place_id")): str(p.get("name") or "").strip() for p in place_dicts},
             )
-            for place in raw_places
-            if isinstance(place, dict)
-        ]
+            clock = stop_fields(_day_clock(day_group), planned_time=planned_time)
+        else:
+            narrative, notes, clock = _extract_day_narrative(plan_text, day_number, total_days=total_days), {}, {}
+        places = []
+        for place in place_dicts:
+            place_id = _to_int(place.get("place_id"))
+            projected = _project_place(place, stop=stop_by_place_id.get(place_id))
+            card = clock.get(place_id, {})
+            places.append(projected.model_copy(update={
+                "stay_minutes": card.get("stay_minutes"),
+                "schedule": ResultSchedule(**card["schedule"]) if card.get("schedule") else None,
+                "activity_note": activity_note(notes[place_id], place) if place_id in notes else None,
+            }))
         _assert_result_contract(bool(places), "projected day places are required")
         raw_commute_legs = day_group.get("commute_legs") or []
         _assert_result_contract(isinstance(raw_commute_legs, list), "commute_legs must be a list")
@@ -892,6 +997,10 @@ def _project_days(plan: dict[str, Any]) -> list[ResultDay]:
                 [(l.from_place_id, l.to_place_id) for l in locked_v2.commute_legs] == list(zip(ids, ids[1:])),
                 "v2 POI legs must match the locked order",
             )
+            # ``feasible`` is the stored verdict. A model route stores the
+            # new-rule verdict (old load, leg and day-structure codes are not
+            # in violations). The checks below are fact agreement, for both
+            # selector and model routes.
             _assert_result_contract(
                 locked_v2.day_feasibility is not None and locked_v2.day_feasibility.feasible
                 and locked_v2.day_feasibility.ordered_place_ids == ids,
@@ -946,11 +1055,7 @@ def _project_days(plan: dict[str, Any]) -> list[ResultDay]:
                 day_group,
                 budget_by_day.get(day_number),
             ),
-            narrative=_extract_day_narrative(
-                plan_text,
-                day_number,
-                total_days=total_days,
-            ),
+            narrative=narrative,
         ))
     return days
 
@@ -965,9 +1070,10 @@ def _project_plan(
     from_city_present: bool,
     requested_commute_mode: Literal["driving", "transit", "cycling"],
     schema_22_enabled: bool | None = None,
+    cards: bool = False,
 ) -> ResultPlan:
     _assert_result_contract(isinstance(plan, dict), "plan must be an object")
-    days = _project_days(plan)
+    days = _project_days(plan, cards=cards)
     _assert_result_contract(bool(days), "plan days are required")
     _assert_result_contract(
         len(days) == expected_days,
@@ -1180,7 +1286,41 @@ def project_trip_result(row: Any) -> TripResultResponse:
     plans = _coerce_plan_json(row.plan_json)
     _assert_result_contract(bool(plans), "plan_json must contain at least one plan")
     quality_metrics = row.quality_metrics if isinstance(row.quality_metrics, dict) else {}
+    job_policy = getattr(row, "generation_policy_version", None) or "legacy"
+    persisted_policy = quality_metrics.get("generation_policy_version")
+    delivery: GenerationDelivery | None = None
+    if job_policy == "v0.12":
+        if persisted_policy != "v0.12":
+            raise ResultContractUnsupported("v0.12 result policy metadata is missing")
+        if not {"published_variant", "delivery_status"}.issubset(quality_metrics):
+            raise ResultContractUnsupported("v0.12 result delivery fields are missing")
     published_variant, delivery_status = project_delivery_metadata(quality_metrics)
+    if job_policy == "v0.12":
+        try:
+            delivery = GenerationDelivery.model_validate(quality_metrics.get("delivery"))
+            validate_delivery_for_job(
+                delivery,
+                status="SUCCESS",
+                result_type="PLAN_READY",
+                result_record_id=int(row.id),
+                published_variant=published_variant,
+                delivery_status=delivery_status,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise ResultContractUnsupported("invalid v0.12 delivery metadata") from exc
+        if delivery.outcome not in {"DETAILED", "BASIC"}:
+            raise ResultContractUnsupported("v0.12 result is not deliverable")
+        raw_job_delivery = getattr(row, "job_delivery_json", None)
+        if raw_job_delivery is None:
+            raise ResultContractUnsupported("v0.12 job delivery metadata is missing")
+        try:
+            job_delivery = GenerationDelivery.model_validate(raw_job_delivery)
+        except ValidationError as exc:
+            raise ResultContractUnsupported("invalid v0.12 job delivery") from exc
+        if job_delivery != delivery:
+            raise ResultContractUnsupported("job and result delivery metadata conflict")
+    elif persisted_policy not in {None, "legacy"}:
+        raise ResultContractUnsupported("result policy conflicts with its job")
     city = str(row.to_city or "")
     _assert_result_contract(bool(city.strip()), "to_city is required")
     expected_days = _to_int(row.days, 0)
@@ -1203,14 +1343,18 @@ def project_trip_result(row: Any) -> TripResultResponse:
             from_city_present=from_city_present,
             requested_commute_mode=requested_commute_mode,
             schema_22_enabled=schema_22_enabled,
+            # v0.15.1 cards are a Schema 2.3 (v0.12 policy) addition.
+            cards=job_policy == "v0.12",
         )
         for index, plan in enumerate(plans)
     ]
     _assert_result_contract(len(projected_plans) == len(plans), "all plans must project")
     result = TripResultResponse(
-        schema_version="2.2" if schema_22_enabled else "2.1",
+        schema_version=("2.3" if job_policy == "v0.12" else ("2.2" if schema_22_enabled else "2.1")),
         published_variant=published_variant,
         delivery_status=delivery_status,
+        generation_policy_version=("v0.12" if job_policy == "v0.12" else None),
+        delivery=delivery,
         result_id=int(row.id),
         city=ResultCity(name=city),
         request=ResultRequest(
@@ -1260,6 +1404,32 @@ async def get_trip_result(
                                plan.days, plan.people_count,
                                plan.preferences, plan.avoid, plan.notes,
                                plan.plan_json, plan.quality_metrics,
+                               COALESCE((
+                                   SELECT job.generation_policy_version
+                                   FROM travel_trip_job AS job
+                                   WHERE job.result_record_id = plan.id
+                                     AND job.status = 'SUCCESS'
+                                     AND job.result_type = 'PLAN_READY'
+                                     AND (
+                                         CAST(:job_id AS VARCHAR) IS NULL
+                                         OR job.job_id = CAST(:job_id AS VARCHAR)
+                                     )
+                                   ORDER BY job.id ASC
+                                   LIMIT 1
+                               ), 'legacy') AS generation_policy_version,
+                               (
+                                   SELECT job.delivery_json
+                                   FROM travel_trip_job AS job
+                                   WHERE job.result_record_id = plan.id
+                                     AND job.status = 'SUCCESS'
+                                     AND job.result_type = 'PLAN_READY'
+                                     AND (
+                                         CAST(:job_id AS VARCHAR) IS NULL
+                                         OR job.job_id = CAST(:job_id AS VARCHAR)
+                                     )
+                                   ORDER BY job.id ASC
+                                   LIMIT 1
+                               ) AS job_delivery_json,
                                EXISTS (
                                    SELECT 1
                                    FROM travel_trip_job AS job

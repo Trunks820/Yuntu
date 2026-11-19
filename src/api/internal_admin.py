@@ -16,7 +16,6 @@ from fastapi.responses import FileResponse, JSONResponse
 from src.agents.role_relay_store import (
     CONTROLLED_ROLES,
     ENDPOINT_NAME_MAX,
-    POOLED_ROLES,
     RecoverError,
     RecoverSuccess,
     PostgresRoleRelayStore,
@@ -963,19 +962,65 @@ def _writer_models() -> dict[str, str]:
     }
 
 
-def _pooled_models(role: str) -> dict[str, str]:
-    config = _role_config_or_none(role)
-    if config is None or not config.relay_pool:
+def _direct_endpoints(role: str):
+    """Return configured v0.12 endpoints without exposing credentials in projections."""
+    from src.agents.llm import RelayEndpoint, RoleConfig
+
+    if role not in {"selector", "review"}:
         return {}
-    return {
-        endpoint.name: str(endpoint.model or config.model)
-        for endpoint in config.relay_pool
+    settings = get_settings()
+    value = lambda name, default="": getattr(settings, name, default)
+    if role == "selector":
+        # The selector's two legs come from src/model_routes.py. The runtime
+        # endpoint is built the same way the order path builds it, so listing
+        # or probing never changes the endpoint's recorded identity.
+        from src.agents.generation_model_routing import table_endpoint
+
+        result = {}
+        for slot in ("primary", "backup"):
+            runtime = table_endpoint(settings, agent="selector", slot=slot)
+            if not runtime.base_url or not runtime.api_key:
+                continue
+            wire = "openai_responses" if runtime.wire_api == "responses" else "openai_chat"
+            endpoint = RelayEndpoint(name=runtime.endpoint_id, base_url=runtime.base_url,
+                                     api_key=runtime.api_key, wire_api=wire, model=runtime.model)
+            config = RoleConfig(provider=runtime.provider, model=runtime.model,
+                                api_key=runtime.api_key, base_url=runtime.base_url, wire_api=wire)
+            result[runtime.endpoint_id] = (
+                endpoint, config, runtime.provider, runtime.failure_domain, runtime)
+        return result
+    specs = {
+        "review": (
+            ("review-glm", "command", value("v012_review_glm_base_url"),
+             value("v012_review_glm_api_key"), value("v012_review_glm_model"),
+             value("v012_command_failure_domain")),
+            ("review-luna", "command", value("v012_review_luna_base_url"),
+             value("v012_review_luna_api_key"), value("v012_review_luna_model"),
+             value("v012_command_failure_domain")),
+            ("review-official-ds", "deepseek", value("v012_official_ds_base_url"),
+             value("v012_official_ds_api_key"), value("v012_official_ds_model"),
+             value("v012_official_ds_failure_domain")),
+        ),
     }
+    result = {}
+    for name, provider, url, key, model, domain in specs.get(role, ()):
+        if not url or not key:
+            continue
+        endpoint = RelayEndpoint(name=name, base_url=url, api_key=key,
+                                 wire_api="openai_chat", model=model)
+        config = RoleConfig(provider=provider, model=model, api_key=key,
+                            base_url=url, wire_api="openai_chat")
+        result[name] = (endpoint, config, provider, domain, None)
+    return result
 
 
 def _endpoint_lookup(role: str, endpoint_name: str):
     from src.agents import llm
 
+    direct = _direct_endpoints(role)
+    for name, values in direct.items():
+        if name.lower() == endpoint_name.lower():
+            return values[0], values[1]
     config = _role_config_or_none(role)
     if config is None:
         return None, None
@@ -1002,8 +1047,6 @@ def _endpoint_lookup(role: str, endpoint_name: str):
 
 
 async def _list_llm_endpoints() -> list[dict]:
-    from src.agents import llm
-
     items: list[SafeEndpoint] = []
     writer_models = _writer_models()
     if writer_models:
@@ -1015,21 +1058,27 @@ async def _list_llm_endpoints() -> list[dict]:
             except ValueError:
                 pass
         items.extend(await _writer_runtime().list_safe_projections(writer_models))
-    for role in POOLED_ROLES:
-        models = _pooled_models(role)
-        if not models:
+    # v0.12 current-operation inventory contains only active Selector/Review
+    # routing inputs. Persisted legacy pool rows remain available as history.
+    for role in ("review", "selector"):
+        from src.agents.generation_model_routing import (
+            ModelEndpoint, endpoint_runtime_fingerprint,
+        )
+        direct = _direct_endpoints(role)
+        if not direct:
             continue
-        config = _role_config_or_none(role)
-        if config is None:
-            continue
-        fingerprints = {
-            endpoint.name: llm.pooled_endpoint_fingerprint(
-                role, config.relay_profile, endpoint, config.model
+        for name, (_endpoint, _config, provider, domain, runtime) in direct.items():
+            runtime_endpoint = runtime or ModelEndpoint(
+                provider=provider, model=_endpoint.model,
+                base_url=_endpoint.base_url, api_key=_endpoint.api_key,
+                failure_domain=domain, endpoint_id=name,
             )
-            for endpoint in config.relay_pool
-        }
-        await _role_runtime().synchronize(role, fingerprints)
-        items.extend(await _role_runtime().list_projections(role, models))
+            await _role_runtime().synchronize_direct(
+                role, name, provider=provider, failure_domain=domain,
+                fingerprint=endpoint_runtime_fingerprint(runtime_endpoint, role=role),
+            )
+        current_models = {name: value[0].model for name, value in direct.items()}
+        items.extend(await _role_runtime().list_projections(role, current_models))
     return [item.to_api() for item in items]
 
 
@@ -1136,6 +1185,24 @@ async def recover_llm_endpoint_endpoint(
                 model=str(endpoint.model or config.model or WRITER_MODEL),
             )
         else:
+            direct_values = _direct_endpoints(normalized_role).get(canonical_name)
+            if direct_values is not None:
+                from src.agents.generation_model_routing import (
+                    ModelEndpoint, endpoint_runtime_fingerprint,
+                )
+                _direct_endpoint, _direct_config, provider, domain, runtime = direct_values
+                runtime_endpoint = runtime or ModelEndpoint(
+                    provider=provider, model=_direct_endpoint.model,
+                    base_url=_direct_endpoint.base_url, api_key=_direct_endpoint.api_key,
+                    failure_domain=domain, endpoint_id=canonical_name,
+                )
+                await _role_runtime().synchronize_direct(
+                    normalized_role, canonical_name, provider=provider,
+                    failure_domain=domain,
+                    fingerprint=endpoint_runtime_fingerprint(
+                        runtime_endpoint, role=normalized_role
+                    ),
+                )
             fingerprints = {
                 item.name: llm.pooled_endpoint_fingerprint(
                     normalized_role, config.relay_profile, item, config.model

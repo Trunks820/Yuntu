@@ -10,26 +10,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
 
 from src.pipeline.db import get_session_factory
+from src.agents.model_failure_policy import LONG_FAILURE_CLASSES, cooldown_seconds
 
 logger = logging.getLogger(__name__)
 
 CONTROLLED_ROLES = ("writer", "review", "grouping", "selector")
 POOLED_ROLES = ("review", "grouping", "selector")
 ROLES_WITH_CAPACITY = frozenset({"writer"})
-COOLDOWN_SECONDS = (60, 120, 300)
+COOLDOWN_SECONDS = (120, 120, 120)
 TRANSIENT_FAILURE_THRESHOLD = 2
 TRANSIENT_FAILURE_CLASSES = frozenset(
-    {"TRANSPORT", "TIMEOUT", "HTTP_5XX", "WIRE_INVALID"}
+    {"TRANSPORT", "TIMEOUT", "HTTP_5XX", "WIRE_INVALID", "UNKNOWN", "POLICY_REJECTION", "MODEL_PERMISSION"}
 )
-IMMEDIATE_OPEN_FAILURE_CLASSES = frozenset({"RATE_LIMIT"})
-QUARANTINE_FAILURE_CLASSES = frozenset({"AUTH", "POLICY_REJECTION"})
+IMMEDIATE_OPEN_FAILURE_CLASSES = frozenset({"RATE_LIMIT", "TRANSPORT", "TIMEOUT", "HTTP_5XX", "UNKNOWN", "POLICY_REJECTION", "MODEL_PERMISSION"}) | LONG_FAILURE_CLASSES
+SINGLE_PATH_ORDINARY_FAILURES = (TRANSIENT_FAILURE_CLASSES | IMMEDIATE_OPEN_FAILURE_CLASSES) - LONG_FAILURE_CLASSES
+QUARANTINE_FAILURE_CLASSES = frozenset()
+DURABLE_ROLES = (*CONTROLLED_ROLES, "intent", "extract", "route_planner")
 PROBE_LEASE_SECONDS = 60
 ENDPOINT_NAME_MAX = 64
 
@@ -66,6 +69,18 @@ class SafeEndpoint:
     inflight: int | None
     max_inflight: int | None
     updated_at: datetime
+    provider: str = "unknown"
+    failure_domain: str = ""
+    availability: str = "UNVERIFIED"
+    availability_reason: str = "NO_RUNTIME_EVIDENCE"
+    last_success_at: datetime | None = None
+    last_failure_at: datetime | None = None
+    last_failure_code: str | None = None
+    last_probe_at: datetime | None = None
+    last_probe_status: str | None = None
+    incident_id: uuid.UUID | None = None
+    incident_started_at: datetime | None = None
+    incident_resolved_at: datetime | None = None
 
     def to_api(self) -> dict[str, Any]:
         return {
@@ -83,6 +98,17 @@ class SafeEndpoint:
                 self.max_inflight if self.role in ROLES_WITH_CAPACITY else None
             ),
             "updated_at": _iso(self.updated_at),
+            "provider": self.provider,
+            "availability": self.availability,
+            "availability_reason": self.availability_reason,
+            "last_success_at": _iso(self.last_success_at),
+            "last_failure_at": _iso(self.last_failure_at),
+            "last_failure_code": self.last_failure_code,
+            "last_probe_at": _iso(self.last_probe_at),
+            "last_probe_status": self.last_probe_status,
+            "incident_id": str(self.incident_id) if self.incident_id else None,
+            "incident_started_at": _iso(self.incident_started_at),
+            "incident_resolved_at": _iso(self.incident_resolved_at),
         }
 
 
@@ -101,6 +127,10 @@ class _PooledEndpoint:
     qualification: str = "QUALIFIED"
     circuit: str = "CLOSED"
     fingerprint: str = ""
+    provider: str = "unknown"
+    failure_domain: str = ""
+    last_failure_code: str | None = None
+    last_failure_at: datetime | None = None
     transient_failures: int = 0
     cooldown_level: int = 0
     cooldown_until: datetime | None = None
@@ -208,6 +238,45 @@ def _to_safe_pooled(
     )
 
 
+def _runtime_availability(row: Any) -> tuple[str, str]:
+    if not bool(row.get("configured", True)) or str(row.get("participation")) == "DISABLED":
+        return "UNAVAILABLE", "DISABLED"
+    circuit = str(row.get("circuit_state") or "CLOSED")
+    if circuit in {"OPEN", "QUARANTINED", "HALF_OPEN"}:
+        return "UNAVAILABLE", "CIRCUIT_OPEN"
+    if str(row.get("qualification_state") or "UNQUALIFIED") != "QUALIFIED":
+        return "UNVERIFIED", "QUALIFICATION_REQUIRED"
+    success = row.get("last_success_at")
+    failure = row.get("last_failure_at")
+    if success is not None and (failure is None or success >= failure):
+        return "AVAILABLE", "LAST_CALL_SUCCEEDED"
+    if failure is not None:
+        return "UNAVAILABLE", "LAST_CALL_FAILED"
+    return "UNVERIFIED", "NO_RUNTIME_EVIDENCE"
+
+
+def _safe_from_db(row: Any, *, model: str, now: datetime, half_open: bool) -> SafeEndpoint:
+    mapped = _PooledEndpoint(
+        role=str(row["role"]), name=str(row["endpoint_name"]),
+        configured=bool(row["configured"]), participation=str(row["participation"]),
+        qualification=str(row["qualification_state"]), circuit=str(row["circuit_state"]),
+        cooldown_until=row["cooldown_until"],
+        manual_retry_not_before=row["manual_retry_not_before"], updated_at=row["updated_at"],
+    )
+    base = _to_safe_pooled(mapped, model=model, now=now, half_open=half_open)
+    availability, reason = _runtime_availability(row)
+    return replace(
+        base, provider=str(row.get("provider") or "unknown"),
+        failure_domain=str(row.get("failure_domain") or ""),
+        availability=availability, availability_reason=reason,
+        last_success_at=row.get("last_success_at"), last_failure_at=row.get("last_failure_at"),
+        last_failure_code=row.get("last_failure_code"), last_probe_at=row.get("last_probe_at"),
+        last_probe_status=row.get("last_probe_status"), incident_id=row.get("incident_id"),
+        incident_started_at=row.get("incident_started_at"),
+        incident_resolved_at=row.get("incident_resolved_at"),
+    )
+
+
 def _replay_error(code: str, retry_after: datetime | None = None) -> dict[str, Any]:
     status, message = _safe_error(code)
     payload: dict[str, Any] = {
@@ -267,6 +336,17 @@ def _endpoint_from_api(payload: dict[str, Any]) -> SafeEndpoint:
         inflight=payload.get("inflight"),
         max_inflight=payload.get("max_inflight"),
         updated_at=datetime.fromisoformat(str(updated).replace("Z", "+00:00")),
+        provider=str(payload.get("provider") or "unknown"),
+        availability=str(payload.get("availability") or "UNVERIFIED"),
+        availability_reason=str(payload.get("availability_reason") or "NO_RUNTIME_EVIDENCE"),
+        last_success_at=(datetime.fromisoformat(str(payload["last_success_at"]).replace("Z", "+00:00")) if payload.get("last_success_at") else None),
+        last_failure_at=(datetime.fromisoformat(str(payload["last_failure_at"]).replace("Z", "+00:00")) if payload.get("last_failure_at") else None),
+        last_failure_code=payload.get("last_failure_code"),
+        last_probe_at=(datetime.fromisoformat(str(payload["last_probe_at"]).replace("Z", "+00:00")) if payload.get("last_probe_at") else None),
+        last_probe_status=payload.get("last_probe_status"),
+        incident_id=uuid.UUID(str(payload["incident_id"])) if payload.get("incident_id") else None,
+        incident_started_at=(datetime.fromisoformat(str(payload["incident_started_at"]).replace("Z", "+00:00")) if payload.get("incident_started_at") else None),
+        incident_resolved_at=(datetime.fromisoformat(str(payload["incident_resolved_at"]).replace("Z", "+00:00")) if payload.get("incident_resolved_at") else None),
     )
 
 
@@ -296,7 +376,7 @@ class PostgresRoleRelayStore:
         self, role: str, fingerprints: dict[str, str]
     ) -> None:
         role = normalize_role(role)
-        if role not in POOLED_ROLES:
+        if role not in DURABLE_ROLES:
             return
         ordered = sorted(fingerprints.items())
         async with self._session_factory() as session, session.begin():
@@ -311,7 +391,7 @@ class PostgresRoleRelayStore:
                                    configuration_fingerprint, circuit_state,
                                    active_operation_id, state_generation
                             FROM travel_role_relay_endpoint_state
-                            WHERE role = :role
+                            WHERE role = :role AND provider = 'unknown'
                             FOR UPDATE
                             """
                         ),
@@ -406,6 +486,117 @@ class PostgresRoleRelayStore:
                     ),
                     {"role": role, "name": name},
                 )
+
+    async def synchronize_direct(
+        self, role: str, name: str, *, provider: str, failure_domain: str,
+        fingerprint: str, qualified_initial: bool = False, has_alternatives: bool = False,
+    ) -> None:
+        """Register a v0.12 direct endpoint without treating config as qualification."""
+        role = normalize_role(role)
+        if role not in DURABLE_ROLES:
+            return
+        async with self._session_factory() as session, session.begin():
+            await self._lock_role(session, role)
+            await session.execute(text("""
+                INSERT INTO travel_role_relay_endpoint_state (
+                    role, endpoint_name, provider, failure_domain, configured,
+                    participation, qualification_state, circuit_state,
+                    configuration_fingerprint
+                ) VALUES (
+                    :role, :name, :provider, :domain, TRUE, 'ACTIVE',
+                    :initial_qualification, 'CLOSED', :fingerprint
+                )
+                ON CONFLICT (role, endpoint_name) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    failure_domain = EXCLUDED.failure_domain,
+                    configured = TRUE,
+                    qualification_state = CASE
+                        WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint
+                        THEN 'UNQUALIFIED' ELSE travel_role_relay_endpoint_state.qualification_state END,
+                    circuit_state = CASE
+                        WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint
+                        THEN 'CLOSED' ELSE travel_role_relay_endpoint_state.circuit_state END,
+                    last_success_at = CASE
+                        WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint
+                        THEN NULL ELSE travel_role_relay_endpoint_state.last_success_at END,
+                    last_failure_at = CASE
+                        WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint
+                        THEN NULL ELSE travel_role_relay_endpoint_state.last_failure_at END,
+                    last_failure_code = CASE
+                        WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint
+                        THEN NULL ELSE travel_role_relay_endpoint_state.last_failure_code END,
+                    probe_kind = CASE WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint THEN NULL ELSE travel_role_relay_endpoint_state.probe_kind END,
+                    probe_owner = CASE WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint THEN NULL ELSE travel_role_relay_endpoint_state.probe_owner END,
+                    probe_lease_expires_at = CASE WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint THEN NULL ELSE travel_role_relay_endpoint_state.probe_lease_expires_at END,
+                    recovery_origin_circuit_state = CASE WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint THEN NULL ELSE travel_role_relay_endpoint_state.recovery_origin_circuit_state END,
+                    active_operation_id = CASE WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint THEN NULL ELSE travel_role_relay_endpoint_state.active_operation_id END,
+                    state_generation = CASE WHEN travel_role_relay_endpoint_state.configuration_fingerprint
+                             <> EXCLUDED.configuration_fingerprint
+                        THEN travel_role_relay_endpoint_state.state_generation + 1
+                        ELSE travel_role_relay_endpoint_state.state_generation END,
+                    configuration_fingerprint = EXCLUDED.configuration_fingerprint,
+                    updated_at = NOW()
+            """), {"role": role, "name": name, "provider": provider[:64],
+                    "domain": failure_domain[:128], "fingerprint": fingerprint[:64],
+                    "initial_qualification": "QUALIFIED" if qualified_initial else "UNQUALIFIED"})
+            if not has_alternatives:
+                # Undo only the former single-path runtime short cooldown. Old
+                # configuration/manual isolation and confirmed account faults
+                # remain authoritative; no pool is inferred from its provider.
+                await session.execute(text("""
+                    UPDATE travel_role_relay_endpoint_state
+                    SET circuit_state='CLOSED', cooldown_until=NULL, cooldown_level=0,
+                        state_generation=state_generation + 1, updated_at=NOW()
+                    WHERE role=:role AND endpoint_name=:name
+                      AND configuration_fingerprint=:fingerprint AND configured
+                      AND participation IN ('ACTIVE', 'CANARY') AND circuit_state='OPEN'
+                      AND last_failure_at IS NOT NULL AND last_failure_code=ANY(:ordinary)
+                      AND manual_retry_not_before IS NULL AND manual_retry_level=0
+                      AND probe_kind IS NULL AND probe_owner IS NULL
+                      AND active_operation_id IS NULL
+                    """), {"role": role, "name": name, "fingerprint": fingerprint,
+                             "ordinary": list(SINGLE_PATH_ORDINARY_FAILURES)})
+
+    async def record_direct_attempt(
+        self, role: str, name: str, *, success: bool,
+        failure_class: str | None = None, failure_scope: str | None = None,
+        trial: bool = False, generation: int | None = None,
+        retry_after_seconds: int | None = None,
+        has_alternatives: bool = False,
+    ) -> None:
+        await self.record_attempt(
+            role, name, success=success, failure_class=failure_class,
+            failure_scope=failure_scope, trial=trial, generation=generation,
+            retry_after_seconds=retry_after_seconds,
+            has_alternatives=has_alternatives,
+        )
+
+    async def release_direct_trial(self, role: str, name: str, *, generation: int) -> None:
+        """Release a lease when no provider request was completed or cancelled."""
+        role = normalize_role(role)
+        async with self._session_factory() as session, session.begin():
+            await self._lock_role(session, role)
+            await session.execute(text("""
+                UPDATE travel_role_relay_endpoint_state SET
+                    circuit_state=CASE WHEN qualification_state='UNQUALIFIED'
+                                       THEN 'CLOSED'
+                                       ELSE COALESCE(recovery_origin_circuit_state, 'OPEN') END,
+                    probe_kind=NULL, probe_owner=NULL, probe_lease_expires_at=NULL,
+                    recovery_origin_circuit_state=NULL, active_operation_id=NULL,
+                    state_generation=state_generation + 1, updated_at=NOW()
+                WHERE role=:role AND endpoint_name=:name
+                  AND circuit_state='HALF_OPEN' AND state_generation=:generation
+            """), {"role": role, "name": name, "generation": generation})
 
     async def _reclaim_expired(self, session, role: str | None = None) -> None:
         params: dict[str, Any] = {}
@@ -638,20 +829,7 @@ class PostgresRoleRelayStore:
             model = models.get(name)
             if not model:
                 continue
-            mapped = _PooledEndpoint(
-                role=role,
-                name=name,
-                configured=bool(row["configured"]),
-                participation=str(row["participation"]),
-                qualification=str(row["qualification_state"]),
-                circuit=str(row["circuit_state"]),
-                cooldown_until=row["cooldown_until"],
-                manual_retry_not_before=row["manual_retry_not_before"],
-                updated_at=row["updated_at"],
-            )
-            items.append(
-                _to_safe_pooled(mapped, model=model, now=now, half_open=half_open)
-            )
+            items.append(_safe_from_db(row, model=model, now=now, half_open=half_open))
         return items
 
     async def admit(
@@ -660,10 +838,10 @@ class PostgresRoleRelayStore:
         names: tuple[str, ...],
         *,
         allow_recovery: bool = True,
-    ) -> tuple[tuple[str, ...], str | None, int | None]:
+    ) -> tuple[tuple[str, ...], str | None, int | dict[str, int] | None]:
         """Return closed names plus optional automatic HALF_OPEN trial."""
         role = normalize_role(role)
-        if role not in POOLED_ROLES or not names:
+        if role not in DURABLE_ROLES or not names:
             return names, None, None
         async with self._session_factory() as session, session.begin():
             await self._lock_role(session, role)
@@ -675,7 +853,7 @@ class PostgresRoleRelayStore:
                             """
                             SELECT endpoint_name, configured, participation,
                                    qualification_state, circuit_state,
-                                   cooldown_until, state_generation
+                                   cooldown_until, state_generation, provider
                             FROM travel_role_relay_endpoint_state
                             WHERE role = :role AND endpoint_name = ANY(:names)
                             FOR UPDATE
@@ -702,28 +880,40 @@ class PostgresRoleRelayStore:
                 )
             )
             closed: list[str] = []
+            closed_generations: dict[str, int] = {}
             recovery: list[str] = []
+            qualification_trials: list[str] = []
             for name in names:
                 row = by_name.get(name)
                 if row is None or not bool(row["configured"]):
                     continue
                 if str(row["participation"]) == "DISABLED":
                     continue
-                if str(row["qualification_state"]) != "QUALIFIED":
+                if (
+                    str(row["qualification_state"]) != "QUALIFIED"
+                    and str(row.get("provider") or "unknown") != "unknown"
+                    and str(row["circuit_state"]) == "CLOSED"
+                    and not half_open_exists
+                ):
+                    qualification_trials.append(name)
+                    continue
+                if str(row["qualification_state"]) != "QUALIFIED" and str(row["circuit_state"]) != "OPEN":
                     continue
                 circuit = str(row["circuit_state"])
                 cooldown = row["cooldown_until"]
                 cooldown_ready = cooldown is None or cooldown <= _utcnow()
                 if circuit == "CLOSED":
                     closed.append(name)
+                    closed_generations[name] = int(row["state_generation"])
                 elif (
                     circuit == "OPEN"
                     and cooldown_ready
                     and not half_open_exists
                 ):
                     recovery.append(name)
-            if allow_recovery and recovery:
-                selected = recovery[0]
+            candidates = qualification_trials or recovery
+            if allow_recovery and candidates:
+                selected = candidates[0]
                 owner = f"automatic:{uuid.uuid4()}"
                 updated = (
                     (
@@ -741,7 +931,7 @@ class PostgresRoleRelayStore:
                                     state_generation = state_generation + 1,
                                     updated_at = NOW()
                                 WHERE role = :role AND endpoint_name = :name
-                                  AND circuit_state = 'OPEN'
+                                  AND circuit_state IN ('OPEN', 'CLOSED')
                                 RETURNING state_generation
                                 """
                             ),
@@ -763,7 +953,10 @@ class PostgresRoleRelayStore:
                         selected,
                     )
                     return (selected,), selected, int(updated["state_generation"])
-            return tuple(closed), None, None
+            generation = (
+                closed_generations.get(closed[0]) if len(closed) == 1 else closed_generations
+            )
+            return tuple(closed), None, generation
 
     async def record_attempt(
         self,
@@ -772,21 +965,24 @@ class PostgresRoleRelayStore:
         *,
         success: bool,
         failure_class: str | None = None,
+        failure_scope: str | None = None,
+        retry_after_seconds: int | None = None,
         trial: bool = False,
         generation: int | None = None,
+        has_alternatives: bool = True,
     ) -> None:
         role = normalize_role(role)
         async with self._session_factory() as session, session.begin():
             await self._lock_role(session, role)
-            await self._reclaim_expired(session, role)
+            if has_alternatives:
+                await self._reclaim_expired(session, role)
             row = await self._load_row(session, role, name)
             if row is None:
                 return
-            if (
-                trial
-                and generation is not None
-                and int(row["state_generation"]) != generation
-            ):
+            if generation is not None and int(row["state_generation"]) != generation:
+                return
+            if not trial and str(row["circuit_state"]) != "CLOSED":
+                # An already dispatched request cannot undo a newer stop or trial.
                 return
             if success:
                 await session.execute(
@@ -833,6 +1029,11 @@ class PostgresRoleRelayStore:
                             active_operation_id = CASE
                                 WHEN :trial THEN NULL ELSE active_operation_id
                             END,
+                            last_success_at = NOW(),
+                            last_failure_code = NULL,
+                            incident_resolved_at = CASE
+                                WHEN incident_id IS NOT NULL THEN NOW()
+                                ELSE incident_resolved_at END,
                             state_generation = CASE
                                 WHEN :trial THEN state_generation + 1
                                 ELSE state_generation
@@ -845,7 +1046,48 @@ class PostgresRoleRelayStore:
                 )
                 return
             failure_class = str(failure_class or "TRANSPORT")
-            quarantine = failure_class in QUARANTINE_FAILURE_CLASSES
+            if not has_alternatives and failure_class not in LONG_FAILURE_CLASSES:
+                if trial and str(row["probe_kind"] or "") != "automatic":
+                    return
+                await session.execute(text("""
+                    UPDATE travel_role_relay_endpoint_state
+                    SET circuit_state='CLOSED', cooldown_until=NULL, cooldown_level=0,
+                        last_failure_at=NOW(), last_failure_code=:failure,
+                        consecutive_transient_failures=consecutive_transient_failures + 1,
+                        probe_kind=CASE WHEN :trial THEN NULL ELSE probe_kind END,
+                        probe_owner=CASE WHEN :trial THEN NULL ELSE probe_owner END,
+                        probe_lease_expires_at=CASE WHEN :trial THEN NULL ELSE probe_lease_expires_at END,
+                        recovery_origin_circuit_state=CASE WHEN :trial THEN NULL ELSE recovery_origin_circuit_state END,
+                        state_generation=CASE WHEN :trial THEN state_generation + 1 ELSE state_generation END,
+                        updated_at=NOW()
+                    WHERE role=:role AND endpoint_name=:name
+                    """), {"role": role, "name": name, "failure": failure_class[:80], "trial": trial})
+                return
+            failure_scope = str(failure_scope or "UNKNOWN").upper()
+            configured_domain = str(row.get("failure_domain") or "")
+            incident_scope = (
+                failure_scope if failure_scope in {"PROVIDER", "ACCOUNT"}
+                else "MODEL" if failure_scope == "MODEL" else "ENDPOINT"
+            )
+            incident_domain = (
+                configured_domain
+                if failure_scope in {"PROVIDER", "ACCOUNT"} and configured_domain
+                else f"endpoint:{role}:{name}"
+            )
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"role-relay-incident-{incident_domain}"},
+            )
+            incident_id = await session.scalar(text("""
+                SELECT incident_id FROM travel_role_relay_endpoint_state
+                WHERE incident_id IS NOT NULL AND incident_resolved_at IS NULL
+                  AND incident_scope=:incident_scope
+                  AND incident_domain=:incident_domain
+                ORDER BY incident_started_at LIMIT 1
+            """), {"incident_scope": incident_scope,
+                    "incident_domain": incident_domain})
+            incident_id = incident_id or uuid.uuid4()
+            quarantine = False
             counted = failure_class in TRANSIENT_FAILURE_CLASSES
             immediate = failure_class in IMMEDIATE_OPEN_FAILURE_CLASSES
             transient = int(row["consecutive_transient_failures"])
@@ -917,8 +1159,17 @@ class PostgresRoleRelayStore:
                         active_operation_id = CASE
                             WHEN :trial THEN NULL ELSE active_operation_id
                         END,
+                        last_failure_at = NOW(),
+                        last_failure_code = :failure_class,
+                        incident_id = :incident_id,
+                        incident_scope = :incident_scope,
+                        incident_domain = :incident_domain,
+                        incident_started_at = CASE
+                            WHEN incident_id = :incident_id AND incident_started_at IS NOT NULL
+                            THEN incident_started_at ELSE NOW() END,
+                        incident_resolved_at = NULL,
                         state_generation = CASE
-                            WHEN :trial THEN state_generation + 1
+                            WHEN :trial OR :open_circuit THEN state_generation + 1
                             ELSE state_generation
                         END,
                         updated_at = NOW()
@@ -932,12 +1183,18 @@ class PostgresRoleRelayStore:
                     "target": target,
                     "quarantine": quarantine,
                     "open_circuit": open_circuit or trial,
-                    "cooldown_seconds": COOLDOWN_SECONDS[min(cooldown_level, 2)],
+                    "cooldown_seconds": (
+                        cooldown_seconds(failure_class, retry_after_seconds)
+                    ),
                     "manual_seconds": COOLDOWN_SECONDS[
                         min(int(row["manual_retry_level"]), 2)
                     ],
                     "trial": trial,
                     "is_manual": is_manual,
+                    "failure_class": failure_class[:80],
+                    "incident_id": incident_id,
+                    "incident_scope": incident_scope,
+                    "incident_domain": incident_domain,
                 },
             )
 
@@ -1010,6 +1267,8 @@ class PostgresRoleRelayStore:
                                     + make_interval(secs => :lease),
                                 recovery_origin_circuit_state = :origin,
                                 active_operation_id = :operation_id,
+                                last_probe_at = NOW(),
+                                last_probe_status = 'RUNNING',
                                 state_generation = state_generation + 1,
                                 updated_at = NOW()
                             WHERE role = :role AND endpoint_name = :name
@@ -1121,19 +1380,8 @@ class PostgresRoleRelayStore:
                 row = await self._load_row(session, role, name)
                 if success:
                     assert endpoint is not None
-                    finished = SafeEndpoint(
-                        role=role,
-                        endpoint_id=name,
-                        display_name=name,
-                        model=endpoint.model,
-                        participation=str(row["participation"]),
-                        qualification=str(row["qualification_state"]),
-                        circuit_state=str(row["circuit_state"]),
-                        recoverable=False,
-                        cooldown_until=None,
-                        inflight=None,
-                        max_inflight=None,
-                        updated_at=row["updated_at"],
+                    finished = _safe_from_db(
+                        row, model=endpoint.model, now=_utcnow(), half_open=False
                     )
                     await self._complete_operation(
                         session,
@@ -1198,6 +1446,13 @@ class PostgresRoleRelayStore:
                         probe_lease_expires_at = NULL,
                         recovery_origin_circuit_state = NULL,
                         active_operation_id = NULL,
+                        last_probe_at = NOW(),
+                        last_probe_status = 'SUCCESS',
+                        last_success_at = NOW(),
+                        last_failure_code = NULL,
+                        incident_resolved_at = CASE
+                            WHEN incident_id IS NOT NULL THEN NOW()
+                            ELSE incident_resolved_at END,
                         state_generation = state_generation + 1,
                         updated_at = NOW()
                     WHERE role = :role AND endpoint_name = :name
@@ -1210,7 +1465,7 @@ class PostgresRoleRelayStore:
         failure_class = str(failure_class or "TRANSPORT")
         quarantine = failure_class in QUARANTINE_FAILURE_CLASSES
         origin = str(row["recovery_origin_circuit_state"] or "OPEN")
-        target = "QUARANTINED" if quarantine or origin == "QUARANTINED" else origin
+        target = "QUARANTINED" if origin == "QUARANTINED" and failure_class not in LONG_FAILURE_CLASSES else "OPEN"
         cooldown_level = int(row["cooldown_level"])
         manual_level = int(row["manual_retry_level"])
         await session.execute(
@@ -1239,6 +1494,10 @@ class PostgresRoleRelayStore:
                     probe_lease_expires_at = NULL,
                     recovery_origin_circuit_state = NULL,
                     active_operation_id = NULL,
+                    last_probe_at = NOW(),
+                    last_probe_status = 'FAILED',
+                    last_failure_at = NOW(),
+                    last_failure_code = :failure_class,
                     state_generation = state_generation + 1,
                     updated_at = NOW()
                 WHERE role = :role AND endpoint_name = :name
@@ -1250,9 +1509,10 @@ class PostgresRoleRelayStore:
                 "name": name,
                 "target": target,
                 "threshold": TRANSIENT_FAILURE_THRESHOLD,
-                "cooldown_seconds": COOLDOWN_SECONDS[min(cooldown_level, 2)],
-                "manual_seconds": COOLDOWN_SECONDS[min(manual_level, 2)],
+                "cooldown_seconds": cooldown_seconds(failure_class),
+                "manual_seconds": cooldown_seconds(failure_class),
                 "generation": generation,
+                "failure_class": failure_class[:80],
             },
         )
 
@@ -1463,6 +1723,44 @@ class InMemoryRoleRelayStore:
         self.endpoints: dict[tuple[str, str], _PooledEndpoint] = {}
         self.operations: dict[uuid.UUID, _Operation] = {}
 
+    async def synchronize_direct(self, role: str, name: str, *, provider: str, failure_domain: str, fingerprint: str, qualified_initial: bool = False, has_alternatives: bool = False) -> None:
+        role = normalize_role(role)
+        async with self._lock:
+            previous = self.endpoints.get((role, name))
+            if previous is None or previous.fingerprint != fingerprint:
+                self.endpoints[(role, name)] = _PooledEndpoint(
+                    role=role, name=name, provider=provider, failure_domain=failure_domain,
+                    fingerprint=fingerprint, qualification="QUALIFIED" if previous is None and qualified_initial else "UNQUALIFIED",
+                    generation=(previous.generation + 1) if previous else 0,
+                )
+            row = self.endpoints[(role, name)]
+            if (not has_alternatives and row.configured
+                    and row.participation in {"ACTIVE", "CANARY"} and row.circuit == "OPEN"
+                    and row.last_failure_at is not None
+                    and row.last_failure_code in SINGLE_PATH_ORDINARY_FAILURES
+                    and row.manual_retry_not_before is None and row.manual_retry_level == 0
+                    and row.probe_kind is None and row.probe_owner is None
+                    and row.active_operation_id is None):
+                row.circuit = "CLOSED"
+                row.cooldown_until = None
+                row.cooldown_level = 0
+                row.generation += 1
+                row.updated_at = _utcnow()
+
+    async def record_direct_attempt(self, role: str, name: str, **kwargs) -> None:
+        kwargs.setdefault("has_alternatives", False)
+        await self.record_attempt(role, name, **kwargs)
+
+    async def release_direct_trial(self, role: str, name: str, *, generation: int) -> None:
+        async with self._lock:
+            row = self.endpoints.get((normalize_role(role), name))
+            if row is not None and row.circuit == "HALF_OPEN" and row.generation == generation:
+                row.circuit = row.recovery_origin or "OPEN"
+                if row.qualification == "UNQUALIFIED" and row.cooldown_until is None:
+                    row.circuit = "CLOSED"
+                self._clear_probe(row)
+                row.generation += 1
+
     async def synchronize(self, role: str, fingerprints: dict[str, str]) -> None:
         role = normalize_role(role)
         now = _utcnow()
@@ -1590,7 +1888,7 @@ class InMemoryRoleRelayStore:
         names: tuple[str, ...],
         *,
         allow_recovery: bool = True,
-    ) -> tuple[tuple[str, ...], str | None, int | None]:
+    ) -> tuple[tuple[str, ...], str | None, int | dict[str, int] | None]:
         role = normalize_role(role)
         now = _utcnow()
         async with self._lock:
@@ -1607,13 +1905,14 @@ class InMemoryRoleRelayStore:
                     row is None
                     or not row.configured
                     or row.participation == "DISABLED"
-                    or row.qualification != "QUALIFIED"
                 ):
                     continue
                 cooldown_ready = (
                     row.cooldown_until is None or row.cooldown_until <= now
                 )
-                if row.circuit == "CLOSED":
+                if row.circuit == "CLOSED" and row.qualification != "QUALIFIED" and row.provider != "unknown" and not half_open:
+                    recovery.append(name)
+                elif row.circuit == "CLOSED" and row.qualification == "QUALIFIED":
                     closed.append(name)
                 elif row.circuit == "OPEN" and cooldown_ready and not half_open:
                     recovery.append(name)
@@ -1629,7 +1928,11 @@ class InMemoryRoleRelayStore:
                 row.generation += 1
                 row.updated_at = now
                 return (selected,), selected, row.generation
-            return tuple(closed), None, None
+            generation = (
+                self.endpoints[(role, closed[0])].generation if len(closed) == 1
+                else {name: self.endpoints[(role, name)].generation for name in closed}
+            )
+            return tuple(closed), None, generation
 
     async def record_attempt(
         self,
@@ -1638,17 +1941,23 @@ class InMemoryRoleRelayStore:
         *,
         success: bool,
         failure_class: str | None = None,
+        failure_scope: str | None = None,
+        retry_after_seconds: int | None = None,
         trial: bool = False,
         generation: int | None = None,
+        has_alternatives: bool = True,
     ) -> None:
         role = normalize_role(role)
         now = _utcnow()
         async with self._lock:
-            self._reclaim(role, now)
+            if has_alternatives:
+                self._reclaim(role, now)
             row = self.endpoints.get((role, name))
             if row is None:
                 return
-            if trial and generation is not None and row.generation != generation:
+            if generation is not None and row.generation != generation:
+                return
+            if not trial and row.circuit != "CLOSED":
                 return
             if success:
                 row.transient_failures = 0
@@ -1662,8 +1971,23 @@ class InMemoryRoleRelayStore:
                     self._clear_probe(row)
                     row.generation += 1
                 row.updated_at = now
+                row.last_failure_code = None
                 return
             failure_class = str(failure_class or "TRANSPORT")
+            if not has_alternatives and failure_class not in LONG_FAILURE_CLASSES:
+                if trial and row.probe_kind != "automatic":
+                    return
+                row.circuit = "CLOSED"
+                row.cooldown_until = None
+                row.cooldown_level = 0
+                row.last_failure_at = now
+                row.last_failure_code = failure_class
+                row.transient_failures += 1
+                if trial:
+                    self._clear_probe(row)
+                    row.generation += 1
+                row.updated_at = now
+                return
             quarantine = failure_class in QUARANTINE_FAILURE_CLASSES
             counted = failure_class in TRANSIENT_FAILURE_CLASSES
             immediate = failure_class in IMMEDIATE_OPEN_FAILURE_CLASSES
@@ -1687,7 +2011,7 @@ class InMemoryRoleRelayStore:
                 row.circuit = "OPEN"
             if open_circuit or trial:
                 row.cooldown_until = now + timedelta(
-                    seconds=COOLDOWN_SECONDS[min(row.cooldown_level, 2)]
+                    seconds=cooldown_seconds(failure_class, retry_after_seconds)
                 )
                 row.cooldown_level = min(2, row.cooldown_level + 1)
             if trial and row.probe_kind == "manual":
@@ -1695,8 +2019,11 @@ class InMemoryRoleRelayStore:
                     seconds=COOLDOWN_SECONDS[min(row.manual_retry_level, 2)]
                 )
                 row.manual_retry_level = min(2, row.manual_retry_level + 1)
+            row.last_failure_code = failure_class
+            row.last_failure_at = now
             if trial:
                 self._clear_probe(row)
+            if trial or open_circuit:
                 row.generation += 1
             row.updated_at = now
 
@@ -1866,20 +2193,20 @@ class InMemoryRoleRelayStore:
                 return RecoverSuccess(finished)
             failure_class = str(failure_class or "TRANSPORT")
             origin = row.recovery_origin or "OPEN"
-            if failure_class in QUARANTINE_FAILURE_CLASSES or origin == "QUARANTINED":
+            if origin == "QUARANTINED" and failure_class not in LONG_FAILURE_CLASSES:
                 row.circuit = "QUARANTINED"
                 row.qualification = "UNQUALIFIED"
             else:
-                row.circuit = origin
+                row.circuit = "OPEN"
             row.transient_failures = max(
                 row.transient_failures, TRANSIENT_FAILURE_THRESHOLD
             )
             row.cooldown_until = now + timedelta(
-                seconds=COOLDOWN_SECONDS[min(row.cooldown_level, 2)]
+                seconds=cooldown_seconds(failure_class)
             )
             row.cooldown_level = min(2, row.cooldown_level + 1)
             row.manual_retry_not_before = now + timedelta(
-                seconds=COOLDOWN_SECONDS[min(row.manual_retry_level, 2)]
+                seconds=cooldown_seconds(failure_class)
             )
             row.manual_retry_level = min(2, row.manual_retry_level + 1)
             self._clear_probe(row)

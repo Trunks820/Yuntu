@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from src.agents.llm import (
@@ -39,6 +40,7 @@ from src.jobs.trip_store import (
     ensure_terminal_observation_step,
     enrich_latest_trip_job_step_observation,
     expire_stale_trip_jobs,
+    purge_expired_route_replays,
     get_recent_successful_plan_place_ids,
     mark_trip_job_failed,
     mark_trip_job_rejected,
@@ -62,6 +64,7 @@ from src.jobs.trip_failed_draft import (
     persist_failed_draft_if_eligible,
     project_failed_draft_plans,
 )
+from src.jobs.generation_delivery import GenerationDelivery
 from src.agents.safe_plan_renderer import SafeRenderError
 from src.agents.writer_relay_router import WriterRelayError
 from src.agents.dispatch_resolver import STRUCTURAL_INCOMPLETE_REASONS
@@ -75,6 +78,72 @@ CITY_CLARIFICATION_FALLBACK_MESSAGE = (
     "可以直接发“成都3天美食”或“福州3天想去平潭”，"
     "我再继续帮你规划。"
 )
+
+
+def _terminal_delivery_for_failure(
+    policy: str,
+    reason_code: str,
+) -> GenerationDelivery | None:
+    if policy != "v0.12":
+        return None
+    normalized = re.sub(r"[^A-Z0-9]+", "_", reason_code.upper()).strip("_")
+    normalized = normalized[:80] or "WORKFLOW_FAILED"
+    return GenerationDelivery(
+        outcome="FAILED",
+        review_state="NOT_RUN",
+        reason_code=normalized,
+        selector_source="NOT_RUN",
+    )
+
+
+def _terminal_delivery_for_result(
+    policy: str,
+    result,
+) -> GenerationDelivery | None:
+    if policy != "v0.12":
+        return None
+    metrics = result.quality_metrics if isinstance(result.quality_metrics, dict) else {}
+    selector_metrics = metrics.get("poi_selection")
+    selector_value = (
+        selector_metrics.get("selection_source")
+        if isinstance(selector_metrics, dict) else None
+    )
+    selector_source = (
+        "LLM" if selector_value == "LLM"
+        else "DETERMINISTIC_FALLBACK" if selector_value else "NOT_RUN"
+    )
+    if result.result_type in {"NO_CANDIDATES", "NO_USABLE_ROUTE"}:
+        return GenerationDelivery(
+            outcome="NO_ROUTE",
+            review_state="NOT_RUN",
+            reason_code=result.result_type,
+            selector_source=selector_source,
+        )
+    if metrics.get("published_variant") == "safe":
+        return GenerationDelivery(
+            outcome="BASIC",
+            review_state=metrics.get("v012_review_state", "ISSUES_UNRESOLVED"),
+            reason_code=metrics.get(
+                "v012_basic_reason", "REVIEW_ISSUES_UNRESOLVED"
+            ),
+            selector_source=selector_source,
+        )
+    review_state = metrics.get("v012_review_state")
+    from src.agents.review_availability import (
+        has_current_unreviewed_receipt, has_current_pruning_receipt,
+    )
+    if review_state != "MODEL_PASSED" and not (
+        review_state == "CODE_ONLY" and (
+            has_current_unreviewed_receipt(result.plans, metrics)
+            or has_current_pruning_receipt(result.plans, metrics)
+        )
+    ):
+        raise ValueError("v0.12 detailed result lacks an approved review decision")
+    return GenerationDelivery(
+        outcome="DETAILED",
+        review_state=review_state,
+        selector_source=selector_source,
+    )
 
 _SAFE_FAILURE_REASON_CODES = frozenset({
     "activity_content_missing", "ambiguous_alias", "blueprint_integrity_violation",
@@ -476,6 +545,12 @@ class TripWorker:
                         )
                         if expired:
                             logger.warning("trip worker expired stale jobs count=%s", expired)
+                        purged_replays = await purge_expired_route_replays()
+                        if purged_replays:
+                            logger.info(
+                                "trip worker purged route replays count=%s",
+                                purged_replays,
+                            )
                         next_stale_sweep = (
                             now + settings.trip_stale_sweep_interval_seconds
                         )
@@ -486,6 +561,9 @@ class TripWorker:
 
                     job = await claim_next_pending_trip_job(
                         max_concurrency=settings.trip_worker_concurrency,
+                        allow_v012=bool(getattr(
+                            settings, "v012_trip_worker_enabled", False
+                        )),
                     )
                     if job is None:
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -509,6 +587,9 @@ class TripWorker:
     async def _execute_job(self, job: TripJobRecord) -> None:
         settings = get_settings()
         job_id = job.job_id
+        generation_policy_version = getattr(
+            job, "generation_policy_version", "legacy"
+        )
         logger.info("trip worker executing job_id=%s", job_id)
         execute_t0 = time.monotonic()
         workflow_deadline_monotonic = (
@@ -816,6 +897,7 @@ class TripWorker:
                         on_writer_output=on_writer_output,
                         must_include_resolution=must_include_resolution,
                         workflow_deadline_monotonic=workflow_deadline_monotonic,
+                        generation_policy_version=generation_policy_version,
                     ),
                     timeout=remaining_seconds,
                 )
@@ -851,6 +933,9 @@ class TripWorker:
                 error_detail=detail,
                 step_metadata=observation_meta,
                 ensure_terminal_step=True,
+                delivery=_terminal_delivery_for_failure(
+                    generation_policy_version, "TIMEOUT"
+                ),
             )
             await persist_captured_failed_draft()
             return
@@ -885,6 +970,9 @@ class TripWorker:
                 error_detail=detail,
                 step_metadata=observation_meta,
                 ensure_terminal_step=True,
+                delivery=_terminal_delivery_for_failure(
+                    generation_policy_version, "CANCELLED"
+                ),
             )
             await persist_captured_failed_draft()
             raise
@@ -933,6 +1021,9 @@ class TripWorker:
                         else {"llm_observation": flushed, "llm_usage": usage}
                     ),
                     ensure_terminal_evidence=not enriched,
+                    delivery=_terminal_delivery_for_failure(
+                        generation_policy_version, exc.decision.status
+                    ),
                 )
                 if polish_cancelled:
                     raise asyncio.CancelledError
@@ -940,6 +1031,9 @@ class TripWorker:
                 await mark_trip_job_rejected(
                     job_id,
                     error_code=exc.decision.status,
+                    delivery=_terminal_delivery_for_failure(
+                        generation_policy_version, exc.decision.status
+                    ),
                 )
             return
         except Exception as exc:
@@ -1040,6 +1134,9 @@ class TripWorker:
                 error_detail=detail,
                 step_metadata=observation_meta,
                 ensure_terminal_step=True,
+                delivery=_terminal_delivery_for_failure(
+                    generation_policy_version, error_code
+                ),
             )
             await persist_captured_failed_draft()
             if polish_cancelled:
@@ -1053,6 +1150,9 @@ class TripWorker:
         plan_count = len(result.plans)
 
         try:
+            delivery = _terminal_delivery_for_result(
+                generation_policy_version, result
+            )
             await _mark_trip_job_success_with_retry(
                 job_id=job_id,
                 reply_text=reply_text,
@@ -1066,6 +1166,9 @@ class TripWorker:
                        in {"ACCOMMODATION_UNRESOLVED", "ROUTE_SEARCH_EXHAUSTED"} else {}),
                     **({"city_notice_code": city_notice_code} if city_notice_code else {}),
                 },
+                delivery=delivery,
+                route_diagnostics=result.route_diagnostics,
+                route_replay_data=result.route_replay_data,
             )
         except Exception as exc:
             logger.exception("trip worker persistence failed job_id=%s", job_id)
@@ -1076,6 +1179,9 @@ class TripWorker:
                 error_code=error_code,
                 error_message=error_message,
                 error_detail=str(exc),
+                delivery=_terminal_delivery_for_failure(
+                    generation_policy_version, error_code
+                ),
             )
             await persist_captured_failed_draft()
             return
@@ -1095,6 +1201,9 @@ async def _mark_trip_job_success_with_retry(
     result_type: str,
     result_record_id: int | None,
     trip_request_json: dict,
+    delivery: GenerationDelivery | None = None,
+    route_diagnostics: dict | None = None,
+    route_replay_data: dict | None = None,
 ) -> None:
     last_error: Exception | None = None
     for attempt in range(1, SUCCESS_PERSIST_RETRIES + 1):
@@ -1106,6 +1215,9 @@ async def _mark_trip_job_success_with_retry(
                 result_type=result_type,
                 result_record_id=result_record_id,
                 trip_request_json=trip_request_json,
+                delivery=delivery,
+                route_diagnostics=route_diagnostics,
+                route_replay_data=route_replay_data,
             )
             return
         except Exception as exc:

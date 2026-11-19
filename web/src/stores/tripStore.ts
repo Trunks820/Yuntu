@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import type { TripFormData } from "@/types/form";
+import type { TripSubmitRequest } from "@/types/tripRequest";
 import type { JobStatus, StageProgress, TripResult } from "@/types/trip";
 
 // 结果绑定 resultId+jobId 身份，页面据此判断 store 缓存是否属于当前 URL，
@@ -12,8 +12,8 @@ export interface StoredResult {
 }
 
 interface TripStore {
-  formData: TripFormData | null;
-  setFormData: (data: TripFormData) => void;
+  formData: TripSubmitRequest | null;
+  setFormData: (data: TripSubmitRequest) => void;
 
   currentJobId: string | null;
   jobStatus: JobStatus | null;

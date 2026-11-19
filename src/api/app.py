@@ -24,6 +24,7 @@ from src.api.destinations import router as destinations_router
 from src.api.internal_city import router as internal_city_router
 from src.api.internal_crawl import router as internal_crawl_router
 from src.api.internal_feedback import router as internal_feedback_router
+from src.api.internal_model_calls import router as internal_model_calls_router
 from src.api.public_guard import verify_public_api_client
 from src.api.trip_artifacts import router as trip_artifacts_router
 from src.api.trip_async import router as trip_async_router
@@ -44,6 +45,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    from src.model_routes import key_problems
+
+    for problem in key_problems(settings):
+        logger.error("model route config: %s", problem)
     trip_worker = TripWorker()
     crawl_worker = CrawlWorker()
     city_batch_worker = CityBatchWorker()
@@ -122,6 +127,7 @@ app.include_router(internal_trip_places_router)
 app.include_router(internal_city_router)
 app.include_router(internal_crawl_router)
 app.include_router(internal_feedback_router)
+app.include_router(internal_model_calls_router)
 
 
 class TripRequest(BaseModel):

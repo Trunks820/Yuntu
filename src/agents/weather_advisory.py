@@ -747,7 +747,32 @@ def is_weather_line(text: str) -> bool:
     stripped = (text or "").strip()
     if not stripped:
         return False
+    if str(getattr(get_settings(), "writer_prompt_version", "") or "").strip() == "article":
+        # v0.15.1 article: seasonal advice ("8月防晒") and conditions ("如果遇到阴天")
+        # help; only a claim about the trip day's weather can contradict the card.
+        return is_weather_forecast_claim(stripped)
     return any(marker in stripped for marker in WEATHER_LINE_MARKERS)
+
+
+_WEATHER_STATE = re.compile(
+    r"晴天|放晴|晴朗|多云|阴天|下雨|有雨|降雨|阵雨|雷雨|小雨|中雨|大雨|暴雨|雨天|"
+    r"下雪|降雪|雪天|大雾|雾霾|台风|冰雹|高温预警")
+_WEATHER_DAY = re.compile(
+    r"当天|今天|明天|后天|这天|那天|这一天|当日|这几天|那几天|"
+    r"周[一二三四五六日天]|星期[一二三四五六日天]|\d{1,2}\s*月\s*\d{1,2}\s*日|"
+    r"第[一二三四五六七八九十\d]+天|预计|将会|会下|会有")
+_WEATHER_CONDITION = re.compile(
+    r"如果|若是|万一|遇到|遇上|碰上|的话|以防|备用|备着|防止|可能|容易|常有|多雨|雨季|季节|"
+    r"一般|通常|往往|偶尔|时常|有时")
+
+
+def is_weather_forecast_claim(text: str) -> bool:
+    """A sentence that states the weather of a trip day, which only the weather card may do."""
+    value = text or ""
+    if "天气预报" in value or "天气提醒" in value:
+        return True
+    return bool(_WEATHER_STATE.search(value) and _WEATHER_DAY.search(value)
+                and not _WEATHER_CONDITION.search(value))
 
 
 def weather_review_issues(

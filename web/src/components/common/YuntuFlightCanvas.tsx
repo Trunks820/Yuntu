@@ -104,7 +104,7 @@ export const YuntuFlightCanvas: React.FC<YuntuFlightCanvasProps> = ({ interactiv
         // 飞机头部光斑
         ctx.beginPath();
         ctx.arc(currX, currY, 3, 0, Math.PI * 2);
-        ctx.fillStyle = '#0f766e';
+        ctx.fillStyle = '#166c5b';
         ctx.fill();
       });
 

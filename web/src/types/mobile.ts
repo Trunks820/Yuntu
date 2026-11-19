@@ -352,5 +352,3 @@ export interface MobileSubmission {
   status: "pending_confirmation" | "confirmed" | "integrity_error";
   job_id?: string | null;
 }
-
-

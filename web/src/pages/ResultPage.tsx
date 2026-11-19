@@ -1,16 +1,31 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { PlanSummaryCard } from "@/components/result/PlanSummaryCard";
-import { MobilePlanView } from "@/pages/mobile/MobilePlanView";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { DetailSkeleton } from "@/components/skeleton/DetailSkeleton";
 import { ShareDialog } from "@/components/share/ShareDialog";
 import { SafeDeliveryNotice } from "@/components/result/SafeDeliveryNotice";
+import { QuotaSettlementNotice } from "@/components/result/QuotaSettlementNotice";
 import { useTripStore } from "@/stores/tripStore";
-import { fetchResult, ApiRequestError } from "@/services/api";
+import { fetchResult } from "@/services/api";
 import { useCityPhotos } from "@/hooks/useCityPhotos";
+import {
+  classifyResultOpenError,
+  missingLinkError,
+  type ResultOpenError,
+} from "@/utils/planLinkError";
 import type { TripResult } from "@/types/trip";
-import { Share2, Heart, SlidersHorizontal, MapPin, Lightbulb } from "lucide-react";
+import {
+  Share2,
+  Heart,
+  SlidersHorizontal,
+  MapPin,
+  Lightbulb,
+  Link2Off,
+  SearchX,
+  FileClock,
+  TriangleAlert,
+  Map,
+} from "lucide-react";
 
 export default function ResultPage() {
   const { resultId } = useParams<{ resultId: string }>();
@@ -26,7 +41,6 @@ export default function ResultPage() {
   const queryString = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
 
   const navigate = useNavigate();
-  const isMobile = useIsMobileViewport();
   const storeResult = useTripStore((s) => s.result);
   const setResult = useTripStore((s) => s.setResult);
 
@@ -42,8 +56,8 @@ export default function ResultPage() {
   );
   const images = useCityPhotos(result?.city.name ?? "");
   const [loading, setLoading] = useState(!matched);
-  // notfound=攻略不存在(404)；unsupported=旧版本生成不兼容(422)；generic=其他
-  const [error, setError] = useState<{ kind: "notfound" | "unsupported" | "generic"; message: string } | null>(null);
+  // notfound=攻略不存在(404)；unsupported=旧版本生成不兼容(422)；invalidlink=缺参数或422参数校验失败；generic=其他
+  const [error, setError] = useState<ResultOpenError | null>(null);
   const [shareOpen, setShareOpen] = useState(isShareParam);
 
   useEffect(() => {
@@ -64,29 +78,25 @@ export default function ResultPage() {
       return;
     }
     setLocal(null);
-    if (!resultId) return;
+    // 旧书签/损坏链接：缺 resultId 或 job_id 时不发请求，也不把后端 422 原文当人话展示。
+    // job_id 是 BFF 的必填查询参数（GET /api/trip/results/{result_record_id}）。
+    if (!resultId || !jobId) {
+      setError(missingLinkError());
+      setLoading(false);
+      return;
+    }
 
     let cancelled = false;
     setLoading(true);
-    fetchResult(resultId, jobId ?? "")
+    fetchResult(resultId, jobId)
       .then((data) => {
         if (cancelled) return;
         setLocal(data);
-        setResult(resultId, jobId ?? "", data);
+        setResult(resultId, jobId, data);
       })
       .catch((err) => {
         if (cancelled) return;
-        if (err instanceof ApiRequestError) {
-          if (err.status === 404) {
-            setError({ kind: "notfound", message: "攻略不存在" });
-          } else if (err.status === 422 && err.code === "RESULT_CONTRACT_UNSUPPORTED") {
-            setError({ kind: "unsupported", message: "该攻略由旧版本生成，暂不支持打开，请重新生成" });
-          } else {
-            setError({ kind: "generic", message: err.message });
-          }
-        } else {
-          setError({ kind: "generic", message: "加载失败" });
-        }
+        setError(classifyResultOpenError(err));
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -104,57 +114,49 @@ export default function ResultPage() {
 
   if (error || !result || result.plans.length === 0) {
     const kind = error?.kind;
-    const icon = kind === "notfound" ? "🔍" : kind === "unsupported" ? "🕰️" : error ? "😵" : "🗺️";
+    // 缺参数的旧链接用中性 lucide 图标 + 人话；其它分支保持原有单一按钮行为
+    const Icon =
+      kind === "invalidlink"
+        ? Link2Off
+        : kind === "notfound"
+          ? SearchX
+          : kind === "unsupported"
+            ? FileClock
+            : error
+              ? TriangleAlert
+              : Map;
     return (
-      <div className="empty-state animate-fade-in">
-        <span className="empty-state-icon">{icon}</span>
+      <div className="empty-state animate-fade-in px-5">
+        <span className="empty-state-icon" aria-hidden="true">
+          <Icon size={40} strokeWidth={1.5} />
+        </span>
         <p className="max-w-xs text-sm font-medium text-primary-700">
           {error?.message ?? "暂时无法生成方案，请稍后重试"}
         </p>
-        <button onClick={() => navigate("/")} className="btn-primary mt-2">
-          {kind === "unsupported" ? "重新生成" : "重新规划"}
-        </button>
+        {kind === "invalidlink" ? (
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-3">
+            <button
+              onClick={() => navigate("/history")}
+              className="btn-primary"
+            >
+              回到历史记录
+            </button>
+            <button onClick={() => navigate("/")} className="btn-secondary">
+              重新规划
+            </button>
+          </div>
+        ) : (
+          <button onClick={() => navigate("/")} className="btn-primary mt-2">
+            {kind === "unsupported" ? "重新生成" : "重新规划"}
+          </button>
+        )}
       </div>
     );
   }
 
-  const { city, request, plans } = result;
+  if (result.plans.length === 1) return <DetailSkeleton />;
 
-  if (isMobile && plans.length === 1) {
-    const plan = plans[0];
-    const timePref = result.time_preferences;
-    const timePrefText =
-      timePref?.daily_start || timePref?.daily_end
-        ? `${timePref.daily_start ?? "出发"}–${timePref.daily_end ?? "返回"}`
-        : null;
-    return (
-      <>
-        <MobilePlanView
-          result={result}
-          plan={plan}
-          jobId={jobId}
-          cityCovers={images}
-          weatherDays={result.weather?.days}
-          timePrefText={timePrefText}
-          packing={plan.packing_checklist ?? []}
-          tips={plan.travel_tips ?? []}
-          transportSlot={null}
-          costSlot={null}
-          pdfLoading={false}
-          onPdf={() => navigate(`/plan/${resultId}/${plan.plan_id}${queryString}`)}
-          onShare={() => setShareOpen(true)}
-          onBack={() => navigate("/")}
-          onOpenPlace={() => navigate(`/plan/${resultId}/${plan.plan_id}${queryString}`)}
-        />
-        <ShareDialog
-          open={shareOpen}
-          onClose={() => setShareOpen(false)}
-          recordId={String(result.result_id)}
-          jobId={jobId ?? undefined}
-        />
-      </>
-    );
-  }
+  const { city, request, plans } = result;
 
   return (
     <div className="relative min-h-screen">
@@ -166,7 +168,7 @@ export default function ResultPage() {
         aria-hidden="true"
         className="pointer-events-none fixed inset-0 -z-10 h-full w-full object-cover object-top"
       />
-      <div className="pointer-events-none fixed inset-0 -z-10 bg-gradient-to-b from-[rgba(255,251,245,0.85)] via-[rgba(238,249,247,0.92)] to-[#f3faf8]" />
+      <div className="pointer-events-none fixed inset-0 -z-10 bg-gradient-to-b from-[rgba(255,254,249,0.85)] via-[rgba(247,245,239,0.92)] to-[#f7f5ef]" />
 
       <main className="relative mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
         {/* 操作栏 */}
@@ -224,8 +226,9 @@ export default function ResultPage() {
           ))}
         </div>
 
-        <div className="mx-auto mt-10 max-w-4xl">
+        <div className="mx-auto mt-10 max-w-4xl space-y-4">
           <SafeDeliveryNotice result={result} jobId={jobId} />
+          <QuotaSettlementNotice delivery={result.delivery} />
         </div>
 
         {/* 手写签名收尾 */}

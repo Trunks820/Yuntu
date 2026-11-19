@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 
 from src.pipeline.db import get_session_factory
+from src.pipeline.place_merge import materialize_alias_intents
 
 RULE_VERSION = "v0.6.16-onboarding-v1"
 AUTO_PLACE_TYPES = frozenset({
@@ -105,6 +106,7 @@ async def onboard_city(city: str, *, crawl_run_ids: list[int] | None = None) -> 
             JOIN travel_content AS c ON c.id = mention.content_id
             JOIN travel_raw_item AS raw ON raw.id = c.raw_item_id
             WHERE p.city = :city
+              AND p.merged_into_place_id IS NULL
               AND p.poi_resolution_status = 'resolved'
               AND p.latitude IS NOT NULL
               AND p.longitude IS NOT NULL
@@ -141,6 +143,7 @@ async def onboard_city(city: str, *, crawl_run_ids: list[int] | None = None) -> 
                     SELECT *
                     FROM travel_canonical_place
                     WHERE amap_poi_id = :amap_poi_id
+                      AND is_active = TRUE
                     ORDER BY place_id
                     LIMIT 1
                     FOR UPDATE
@@ -151,6 +154,7 @@ async def onboard_city(city: str, *, crawl_run_ids: list[int] | None = None) -> 
                     SELECT *
                     FROM travel_canonical_place
                     WHERE city = :city AND canonical_name = :name
+                      AND is_active = TRUE
                     FOR UPDATE
                 """), {"city": city, "name": row.name})).one_or_none()
                 if (
@@ -230,7 +234,6 @@ async def onboard_city(city: str, *, crawl_run_ids: list[int] | None = None) -> 
                 else:
                     pending_review += 1
             else:
-                linked += 1
                 if (
                     auto_eligible
                     and canonical.trust_level == "candidate"
@@ -261,10 +264,13 @@ async def onboard_city(city: str, *, crawl_run_ids: list[int] | None = None) -> 
                     auto_accepted += 1
 
             canonical_id = int(canonical.place_id)
-            await session.execute(text("""
+            link_result = await session.execute(text("""
                 UPDATE travel_place_summary
                 SET canonical_place_id = :canonical_id
                 WHERE place_id = :source_place_id
+                  AND canonical_place_id IS NULL
+                  AND EXISTS (SELECT 1 FROM travel_place p WHERE p.id=:source_place_id
+                              AND p.merged_into_place_id IS NULL)
                   AND NOT EXISTS (
                       SELECT 1
                       FROM travel_place_summary AS existing
@@ -275,6 +281,8 @@ async def onboard_city(city: str, *, crawl_run_ids: list[int] | None = None) -> 
                 "canonical_id": canonical_id,
                 "source_place_id": row.source_place_id,
             })
+            linked += max(link_result.rowcount or 0, 0)
+            await materialize_alias_intents(session, int(row.source_place_id))
             if row.name != canonical.canonical_name:
                 await session.execute(text("""
                     INSERT INTO travel_place_alias (

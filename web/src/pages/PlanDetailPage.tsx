@@ -15,14 +15,17 @@ import { CollapsibleSection } from "@/components/detail/CollapsibleSection";
 import { DayCard } from "@/components/detail/DayCard";
 import { ShareDialog } from "@/components/share/ShareDialog";
 import { useTripStore } from "@/stores/tripStore";
-import { fetchResult, ApiRequestError } from "@/services/api";
+import { fetchResult } from "@/services/api";
 import { CostEstimateCard } from "@/components/detail/CostEstimateCard";
 import { PreTripAdviceSection } from "@/components/detail/PreTripAdviceSection";
 import { filterPackingChecklist, filterTravelTips } from "@/utils/preTripAdvice";
 import { MustIncludeNotice } from "@/components/detail/MustIncludeNotice";
 import { SafeDeliveryNotice } from "@/components/result/SafeDeliveryNotice";
+import { QuotaSettlementNotice } from "@/components/result/QuotaSettlementNotice";
 import { getScenarioCostStatus, type CostScenarioSummary } from "@/types/cost";
 import { useArtifact } from "@/hooks/useArtifact";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { MobilePlanView } from "@/pages/mobile/MobilePlanView";
 import { saveBlob } from "@/utils/download";
 import { showToast } from "@/stores/toastStore";
 import { useCityPhotos } from "@/hooks/useCityPhotos";
@@ -32,6 +35,11 @@ import {
   cleanSummary,
 } from "@/utils/format";
 import { timePreferencesLabel } from "@/utils/schedule";
+import {
+  classifyResultOpenError,
+  missingLinkError,
+  type ResultOpenError,
+} from "@/utils/planLinkError";
 import type { TripDay, TripPlace, TripPlan, TripResult, WeatherDay } from "@/types/trip";
 import {
   Compass,
@@ -44,6 +52,10 @@ import {
   CloudSun,
   Map,
   X,
+  Link2Off,
+  SearchX,
+  FileClock,
+  TriangleAlert,
 } from "lucide-react";
 
 gsap.registerPlugin(ScrollTrigger);
@@ -76,12 +88,10 @@ export default function PlanDetailPage() {
   const storeResult = useTripStore((s) => s.result);
   const setResult = useTripStore((s) => s.setResult);
 
+  const isMobile = useIsMobileViewport();
   const [fetchedResult, setFetchedResult] = useState<TripResult | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<{
-    kind: "notfound" | "unsupported" | "generic";
-    message: string;
-  } | null>(null);
+  const [error, setError] = useState<ResultOpenError | null>(null);
 
   const [activeTab, setActiveTab] = useState("overview");
   const [showMap, setShowMap] = useState(false);
@@ -142,6 +152,7 @@ export default function PlanDetailPage() {
 
   const [isScrolled, setIsScrolled] = useState(false);
   const leftBrandRef = useRef<HTMLDivElement>(null);
+  const rightUserMenuRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -153,7 +164,7 @@ export default function PlanDetailPage() {
   }, []);
 
   useEffect(() => {
-    if (!leftBrandRef.current) return;
+    if (!leftBrandRef.current || !rightUserMenuRef.current) return;
     const isMobile = window.innerWidth < 768;
     if (isMobile) return;
 
@@ -166,10 +177,26 @@ export default function PlanDetailPage() {
         ease: "back.out(1.4)",
         overwrite: "auto",
       });
+      gsap.to(rightUserMenuRef.current, {
+        opacity: 1,
+        x: 0,
+        scale: 1,
+        duration: 0.45,
+        ease: "back.out(1.4)",
+        overwrite: "auto",
+      });
     } else {
       gsap.to(leftBrandRef.current, {
         opacity: 0,
         x: -16,
+        scale: 0.9,
+        duration: 0.25,
+        ease: "power2.in",
+        overwrite: "auto",
+      });
+      gsap.to(rightUserMenuRef.current, {
+        opacity: 0,
+        x: 16,
         scale: 0.9,
         duration: 0.25,
         ease: "power2.in",
@@ -199,35 +226,25 @@ export default function PlanDetailPage() {
       return;
     }
     setFetchedResult(null);
-    if (!resultId) return;
+    // 旧书签/损坏链接：缺 resultId 或 job_id 时不发请求，也不把后端 422 原文当人话展示。
+    // job_id 是 BFF 的必填查询参数（GET /api/trip/results/{result_record_id}）。
+    if (!resultId || !jobId) {
+      setError(missingLinkError());
+      setLoading(false);
+      return;
+    }
 
     let cancelled = false;
     setLoading(true);
-    fetchResult(resultId, jobId ?? "")
+    fetchResult(resultId, jobId)
       .then((data) => {
         if (cancelled) return;
         setFetchedResult(data);
-        setResult(resultId, jobId ?? "", data);
+        setResult(resultId, jobId, data);
       })
       .catch((err) => {
         if (cancelled) return;
-        if (err instanceof ApiRequestError) {
-          if (err.status === 404) {
-            setError({ kind: "notfound", message: "攻略不存在" });
-          } else if (
-            err.status === 422 &&
-            err.code === "RESULT_CONTRACT_UNSUPPORTED"
-          ) {
-            setError({
-              kind: "unsupported",
-              message: "该攻略由旧版本生成，暂不支持打开，请重新生成",
-            });
-          } else {
-            setError({ kind: "generic", message: err.message });
-          }
-        } else {
-          setError({ kind: "generic", message: "加载失败" });
-        }
+        setError(classifyResultOpenError(err));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -316,7 +333,7 @@ export default function PlanDetailPage() {
       showToast(`PDF 导出失败: ${pdf.error.message}`, "error");
       pdf.reset();
     }
-  }, [pdf.phase, pdf.blob, pdf.error, city, plan?.title, pdf, navigate]);
+  }, [pdf.phase, pdf.blob, pdf.error, city, plan?.title, pdf]);
   const cityCovers = useCityPhotos(city || "");
   const weatherDays =
     result?.weather?.status === "ok" && result.weather.days.length > 0
@@ -511,17 +528,98 @@ export default function PlanDetailPage() {
 
   if (error || !result || !plan) {
     const kind = error?.kind ?? "generic";
-    const icon =
-      kind === "notfound" ? "🔍" : kind === "unsupported" ? "🕰️" : "📋";
+    // 缺参数的旧链接用中性 lucide 图标 + 人话；其它分支保持原有单一按钮行为
+    const Icon =
+      kind === "invalidlink"
+        ? Link2Off
+        : kind === "notfound"
+          ? SearchX
+          : kind === "unsupported"
+            ? FileClock
+            : TriangleAlert;
     const message = error?.message ?? "方案未找到";
     return (
-      <div className="empty-state animate-fade-in">
-        <span className="empty-state-icon">{icon}</span>
+      <div className="empty-state animate-fade-in px-5">
+        <span className="empty-state-icon" aria-hidden="true">
+          <Icon size={40} strokeWidth={1.5} />
+        </span>
         <p className="max-w-xs text-sm font-medium text-primary-700">{message}</p>
-        <button onClick={() => navigate("/")} className="btn-primary mt-2">
-          {kind === "unsupported" ? "重新生成" : "重新规划"}
-        </button>
+        {kind === "invalidlink" ? (
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-3">
+            <button
+              onClick={() => navigate("/history")}
+              className="btn-primary"
+            >
+              回到历史记录
+            </button>
+            <button onClick={() => navigate("/")} className="btn-secondary">
+              重新规划
+            </button>
+          </div>
+        ) : (
+          <button onClick={() => navigate("/")} className="btn-primary mt-2">
+            {kind === "unsupported" ? "重新生成" : "重新规划"}
+          </button>
+        )}
       </div>
+    );
+  }
+
+  if (isMobile) {
+    return (
+      <>
+        <MobilePlanView
+          result={result}
+          plan={plan}
+          jobId={jobId}
+          cityCovers={cityCovers}
+          weatherDays={weatherDays}
+          timePrefText={timePrefText}
+          packing={validPackingList}
+          tips={validTips}
+          transportSlot={
+            plan.transport ? (
+              <TransportCard
+                data={plan.transport}
+                selectedMode={selectedTransportMode}
+                onSelectMode={handleTransportModeSelect}
+              />
+            ) : null
+          }
+          costSlot={
+            /* A5：同一张卡片的手机形态，只换颜色和字体，不重排结构 */
+            <CostEstimateCard
+              variant="mobile"
+              costEstimate={plan.cost_estimate}
+              activeScenarioId={activeScenarioId}
+              onScenarioSelect={setActiveScenarioId}
+            />
+          }
+          pdfLoading={pdf.loading}
+          onPdf={() => pdf.start()}
+          onShare={() => setShareOpen(true)}
+          onBack={() => navigate(searchParams.get("from") === "history" ? "/history" : "/")}
+          onOpenPlace={openPlace}
+        />
+        <PlaceDetailModal
+          place={detailPlace}
+          isMustInclude={Boolean(
+            detailPlace &&
+              result.must_include?.some(
+                (mi) => mi.status === "scheduled" && mi.place_id != null && mi.place_id === detailPlace.place_id,
+              ),
+          )}
+          onClose={() => setDetailPlace(null)}
+        />
+        {resultId && (
+          <ShareDialog
+            open={shareOpen}
+            onClose={() => setShareOpen(false)}
+            recordId={resultId}
+            jobId={jobId ?? undefined}
+          />
+        )}
+      </>
     );
   }
 
@@ -548,8 +646,23 @@ export default function PlanDetailPage() {
               <Compass size={11} className="text-gray-400" />
               <span>行程规划</span>
             </Link>
+            <Link
+              to="/history"
+              className="inline-flex items-center gap-1.5 text-gray-600 hover:text-gray-900 px-3 py-1.5 rounded-lg hover:bg-sand-100 transition-colors"
+            >
+              <MapPinned size={11} className="text-gray-400" />
+              <span>我的行程</span>
+            </Link>
           </div>
         </div>
+
+        <Link
+          to="/history"
+          className="inline-flex items-center gap-1.5 rounded-full border border-sand-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-sand-50 transition-colors"
+        >
+          <MapPinned size={12} className="text-primary-600" />
+          <span>我的行程</span>
+        </Link>
       </nav>
 
       {/* Hero */}
@@ -703,6 +816,20 @@ export default function PlanDetailPage() {
               <span className="sm:hidden">分享</span>
             </button>
 
+            {/* 桌面端向下滚动后，GSAP 物理弹性滑出我的行程入口 */}
+            <div
+              ref={rightUserMenuRef}
+              className="hidden border-l border-gray-200/80 pl-2.5 opacity-0 md:block"
+              style={{ transform: "translateX(16px) scale(0.9)" }}
+            >
+              <Link
+                to="/history"
+                className="inline-flex h-8 items-center gap-1 rounded-full border border-gray-200 bg-white px-3 text-[11px] font-bold text-gray-700 shadow-2xs transition-colors hover:bg-gray-50"
+              >
+                <MapPinned size={12} className="text-primary-600" aria-hidden="true" />
+                <span>我的行程</span>
+              </Link>
+            </div>
           </div>
         </div>
       </div>
@@ -831,8 +958,10 @@ export default function PlanDetailPage() {
             onScenarioSelect={setActiveScenarioId}
           />
         </section>
-
-        <SafeDeliveryNotice result={result} jobId={jobId} />
+        <div className="space-y-4">
+          <SafeDeliveryNotice result={result} jobId={jobId} />
+          <QuotaSettlementNotice delivery={result.delivery} />
+        </div>
       </main>
 
         {/* 行程脊柱 (PC ≥1280px) 放置在 DOM 顺序后方，但在视觉上呈现在正文左侧并固定跟随滑动 */}
@@ -853,7 +982,7 @@ export default function PlanDetailPage() {
       </div>
 
       {/* 地图 FAB */}
-      <div className="fixed bottom-8 right-5 z-50 flex flex-col items-end gap-3 sm:right-8">
+      <div className="fixed bottom-8 right-5 z-50 flex flex-col items-end gap-3 sm:right-8" style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}>
         <button
           type="button"
           onClick={() => {
