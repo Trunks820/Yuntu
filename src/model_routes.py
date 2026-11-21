@@ -341,6 +341,15 @@ def _clean_str(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _normalize_legacy_model(model: str, provider: str, default_model: str) -> str:
+    cleaned = _clean_str(model)
+    if not cleaned or cleaned == "gpt-5.5":
+        return default_model
+    if cleaned == "gemini-flash-latest":
+        return "gemini-2.5-flash" if provider == "gemini" else default_model
+    return cleaned
+
+
 def _provider_account(provider: str) -> str:
     if provider == "deepseek":
         return DS_OFFICIAL
@@ -357,6 +366,12 @@ def _infer_global_provider_and_key(settings: Any) -> tuple[str, str, str, str]:
     ds_key = _clean_str(getattr(settings, "deepseek_api_key", ""))
     gemini_key = _clean_str(getattr(settings, "gemini_api_key", ""))
     openai_key = _clean_str(getattr(settings, "openai_api_key", ""))
+    if ds_key:
+        return "deepseek", ds_key, _DS_URL, ""
+    if gemini_key:
+        return "gemini", gemini_key, _GEMINI_OPENAI_URL, ""
+    if openai_key:
+        return "openai", openai_key, _OPENAI_URL, ""
 
     # 2. Infer from per-role settings if user configured e.g. WRITER_* or INTENT_* only
     role_candidates = ("writer", "intent", "extract", "review", "grouping")
@@ -373,12 +388,6 @@ def _infer_global_provider_and_key(settings: Any) -> tuple[str, str, str, str]:
                 r_model,
             )
 
-    if ds_key:
-        return "deepseek", ds_key, _DS_URL, ""
-    if gemini_key:
-        return "gemini", gemini_key, _GEMINI_OPENAI_URL, ""
-    if openai_key:
-        return "openai", openai_key, _OPENAI_URL, ""
     return "", "", "", ""
 
 
@@ -456,7 +465,7 @@ def resolve_open_source_leg(
             provider = "openai"
         base_url = role_base_url or PROVIDER_DEFAULT_BASE_URLS.get(provider, leg.base_url)
         default_model = PROVIDER_DEFAULT_MODELS.get(provider, {}).get(agent, leg.model)
-        model = role_model or default_model
+        model = _normalize_legacy_model(role_model, provider, default_model)
         return ResolvedLegConfig(
             agent=agent,
             slot=slot,
@@ -494,7 +503,7 @@ def resolve_open_source_leg(
         base_url = role_base_url or g_base_url or PROVIDER_DEFAULT_BASE_URLS.get(provider, leg.base_url)
         default_model = PROVIDER_DEFAULT_MODELS.get(provider, {}).get(agent, leg.model)
         # Only inherit sibling role's custom model if providers match and role has no default
-        model = role_model or default_model or g_model
+        model = _normalize_legacy_model(role_model, provider, default_model or g_model)
         return ResolvedLegConfig(
             agent=agent,
             slot=slot,

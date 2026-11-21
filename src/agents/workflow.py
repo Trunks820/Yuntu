@@ -809,7 +809,7 @@ async def run_trip_workflow(
     on_writer_output: WriterOutputCallback | None = None,
     must_include_resolution: MustIncludeResolution | None = None,
     workflow_deadline_monotonic: float | None = None,
-    generation_policy_version: str = "legacy",
+    generation_policy_version: str = "v0.12",
 ) -> WorkflowResult:
     if trip_request is None:
         # Keep the legacy Intent Parser implementation for a future product
@@ -892,7 +892,7 @@ async def _run_trip_workflow_inner(
     cost_prefetches: list[IntercityCostPrefetch] | None = None,
     amap_handles: list[AmapPoiDetailTaskHandle] | None = None,
     lodging_price_handles: list[LodgingPriceTaskHandle] | None = None,
-    generation_policy_version: str = "legacy",
+    generation_policy_version: str = "v0.12",
 ) -> WorkflowResult:
     """Full pipeline: parse -> retrieve -> route -> write/review -> persist.
 

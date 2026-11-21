@@ -167,9 +167,15 @@ async def trip(req: TripRequest) -> TripResponse:
             raise CityGateRejected(decision)
 
     try:
+        from src.agents.intent_parser import parse_intent_with_metadata
+
+        trip_req, _ = await parse_intent_with_metadata(message)
+        await on_trip_request(trip_req)
         result = await run_trip_workflow(
             message,
+            trip_request=trip_req,
             on_trip_request=on_trip_request,
+            generation_policy_version="v0.12",
         )
     except CityGateRejected as exc:
         return JSONResponse(

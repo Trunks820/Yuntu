@@ -643,6 +643,10 @@ CREATE TABLE travel_plan_record (
     model_name      VARCHAR(50),
     quality_feedback TEXT,
     quality_metrics JSONB,
+    accommodation_name TEXT,
+    accommodation_lat DOUBLE PRECISION,
+    accommodation_lng DOUBLE PRECISION,
+    accommodation_source TEXT,
     created_time    TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
@@ -1763,6 +1767,12 @@ COMMENT ON TABLE travel_canonical_place_image IS
     'Public WebP variants for lazy Canonical POI detail galleries; no raw source URLs or private master keys';
 
 -- D1 additions only; existing schema drift is intentionally retained.
+ALTER TABLE travel_plan_record
+    ADD COLUMN IF NOT EXISTS accommodation_name TEXT,
+    ADD COLUMN IF NOT EXISTS accommodation_lat DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS accommodation_lng DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS accommodation_source TEXT;
+
 ALTER TABLE travel_place ADD COLUMN IF NOT EXISTS merged_into_place_id BIGINT
     REFERENCES travel_place(id);
 DO $$ BEGIN

@@ -24,7 +24,11 @@ async def main(query: str) -> None:
     print("=" * 60)
 
     print("\n[2/2] 开始执行全链路旅行规划与排程引擎...")
-    result = await run_trip_workflow(query, trip_request=trip_req)
+    result = await run_trip_workflow(
+        query,
+        trip_request=trip_req,
+        generation_policy_version="v0.12",
+    )
 
     print("\n" + "=" * 60)
     print(f"目的地: {result.trip_request.to_city}  天数: {result.trip_request.days}")

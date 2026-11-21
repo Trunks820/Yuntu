@@ -709,6 +709,11 @@ def _request_payload(
             "generation_config": {"max_output_tokens": max_tokens,
                                   "thinking_level": "low", "thinking_summaries": "none"},
         }
+    effective_max_tokens = (
+        8192
+        if endpoint.provider == "deepseek" and endpoint.model == "deepseek-chat" and max_tokens > 8192
+        else max_tokens
+    )
     payload: dict[str, Any] = {
         "model": endpoint.model,
         "messages": [
@@ -716,7 +721,7 @@ def _request_payload(
             {"role": "user", "content": user},
         ],
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_tokens": effective_max_tokens,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}

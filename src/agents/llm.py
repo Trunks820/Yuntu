@@ -1166,6 +1166,16 @@ def resolve_role_config(role: str) -> RoleConfig:
             f"No API key for role {role!r}. "
             f"Set {role.upper()}_API_KEY, GEMINI_API_KEY, or DEEPSEEK_API_KEY in .env"
         )
+    if model == "gpt-5.5":
+        model = (
+            "deepseek-chat"
+            if provider == "deepseek"
+            else "gemini-2.5-flash"
+            if provider == "gemini"
+            else "gpt-4.1-mini"
+        )
+    elif model == "gemini-flash-latest":
+        model = "gemini-2.5-flash" if provider == "gemini" else "deepseek-chat"
     return RoleConfig(
         provider=provider,
         model=model,
@@ -2484,6 +2494,8 @@ async def _openai_chat_completion(
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     if max_tokens is not None:
+        if config.provider == "deepseek" and config.model == "deepseek-chat" and max_tokens > 8192:
+            max_tokens = 8192
         kwargs["max_tokens"] = max_tokens
     if (
         config.provider == "deepseek"

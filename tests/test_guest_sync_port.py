@@ -91,3 +91,36 @@ def test_preferences_normalize_known_labels():
     assert FOOD in normalized.scoring_dimensions
     assert "night_view" in normalized.scoring_dimensions
     assert "随便看看" in normalized.unknown_labels
+
+
+def test_schema_sql_includes_plan_record_accommodation_columns():
+    from pathlib import Path
+
+    schema_sql = (Path(__file__).resolve().parent.parent / "sql" / "schema.sql").read_text(encoding="utf-8")
+    for col in (
+        "accommodation_name",
+        "accommodation_lat",
+        "accommodation_lng",
+        "accommodation_source",
+    ):
+        assert col in schema_sql
+
+
+def test_legacy_model_names_and_workflow_policy_default(monkeypatch):
+    import inspect
+    from src.agents.workflow import run_trip_workflow
+
+    sig = inspect.signature(run_trip_workflow)
+    assert sig.parameters["generation_policy_version"].default == "v0.12"
+
+    settings = Settings(
+        _env_file=None,
+        deepseek_api_key="sk-ds",
+        selector_model="gpt-5.5",
+        review_provider="gemini",
+        review_model="gemini-flash-latest",
+        review_api_key="gem-key",
+    )
+    monkeypatch.setattr(llm, "get_settings", lambda: settings)
+    assert resolve_open_source_leg(settings, "selector").model == "deepseek-chat"
+    assert llm.resolve_role_config("review").model == "gemini-2.5-flash"
