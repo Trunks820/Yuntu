@@ -107,9 +107,9 @@
 - 高德开放平台 Key（可选：后端算真实通勤需要 **Web 服务 Key**；前端显示互动地图需要 **Web 端 JS API Key**）
 
 > [!NOTE]
-> **为什么开源仓库默认只带了【重庆】的数据？**
-> 线上站已有 **27 座城市**，但为了让大家克隆仓库后不用下载庞大的全国数据库就能跑通全流程，`sql/seed_chongqing.sql` 里默认内置了**重庆**的 27 个精选景点/餐厅坐标、推荐理由摘要和实景配图，前端也默认聚焦重庆。
-> 如果你想自己加别的城市（比如成都、西安、北京等），只要把对应城市的地点导入 `travel_canonical_place` 和 `travel_place_summary` 表，再在 [`src/api/destinations.py`](src/api/destinations.py) 里加上这座城市就行。
+> **开源版内置了哪些城市的数据？**
+> 线上站已有 **27 座城市**，开源仓库这次放开了最具代表性的 **5 座旗舰城市全量种子数据（重庆、北京、上海、成都、杭州）**——由 [`sql/seed_chongqing.sql`](sql/seed_chongqing.sql) 与 [`sql/seed_cities.sql`](sql/seed_cities.sql) 共同构成，涵盖 **573 个高德核验 POI、50 个核心住宿商圈、客观推荐摘要与 340 张实景配图**；配套的费用目录与城市封图 JSON 也已同步瘦身至这 5 城，克隆后本地跑通完整选城、滑卡灵感、预算估算与导出链路，又不至于拖着几十兆无关数据。
+> 如果你还想补充更多城市（比如西安、南京、厦门等），只要把对应城市的数据导入 `travel_canonical_place` / `travel_place_summary` 表，再在 [`src/api/destinations.py`](src/api/destinations.py) 里登记即可。
 
 ---
 
@@ -133,7 +133,7 @@ playwright install --with-deps chromium
 # 如果在云服务器上碰到默认下载源 403 或偏慢，可换国内镜像再装：
 # PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright playwright install --with-deps chromium
 
-# 初始化数据库表并导入重庆种子数据（含地点、推荐摘要与图鉴配图）
+# 初始化数据库表并导入 5 城全量种子数据（重庆、北京、上海、成都、杭州）
 python -m scripts.init_db
 
 # 启动后端服务
@@ -223,9 +223,10 @@ Yuntu/
 │   └── model_routes.py      # 模型路由与单 Key 自动复用逻辑
 ├── sql/
 │   ├── schema.sql           # PostgreSQL 建表脚本
-│   └── seed_chongqing.sql   # 重庆种子数据（含 27 个精选地点、推荐摘要与实景配图）
+│   ├── seed_chongqing.sql   # 重庆全量种子数据（136 个验证地点、10 个商圈与实景图集）
+│   └── seed_cities.sql      # 北京/上海/成都/杭州全量种子数据（437 个验证地点、40 个商圈与实景图集）
 ├── scripts/
-│   ├── init_db.py           # 一键建表并导入重庆种子数据
+│   ├── init_db.py           # 一键建表并导入上述 5 城种子数据
 │   ├── trip.py              # 命令行单次规划体验脚本
 │   └── stress_test.py       # 批量回归与压力测试脚本
 ├── tests/                   # 自动化测试套件

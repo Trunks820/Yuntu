@@ -1,14 +1,14 @@
 -- ============================================================
--- Yuntu - 重庆精选真实种子数据 (Chongqing Seed Data)
--- 包含：城市激活状态、25+ 核心经典地点/美食/文化点、住宿商圈
+-- Yuntu - 重庆全量精选种子数据 (POI / 商圈 / 摘要 / 图鉴)
 -- ============================================================
 
 BEGIN;
 
--- 1. 激活重庆城市记录
+-- 1. 激活城市状态
 INSERT INTO travel_city (canonical_name, status, active_confirmed_time, created_time, updated_time)
-VALUES ('重庆', 'ACTIVE', NOW(), NOW(), NOW())
-ON CONFLICT (canonical_name) DO UPDATE 
+VALUES
+('重庆', 'ACTIVE', NOW(), NOW(), NOW())
+ON CONFLICT (canonical_name) DO UPDATE
 SET status = 'ACTIVE', active_confirmed_time = NOW();
 
 -- 2. 住宿推荐商圈 (accommodation_area)
@@ -17,48 +17,160 @@ INSERT INTO travel_canonical_place (
     amap_poi_id, place_type, category_tags, source_type, trust_level,
     review_status, is_active, contextual_only, geo_status, base_priority
 ) VALUES
-('解放碑(商圈)', '重庆', '渝中区', '渝中区民权路', '500103', 29.556728, 106.576880, 'B0FFGI0JVF', 'accommodation_area', '["商圈", "市中心", "地标"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 100),
-('观音桥商圈', '重庆', '江北区', '江北区观音桥步行街', '500105', 29.576104, 106.533919, 'B0FFHOSTJ8', 'accommodation_area', '["商圈", "繁华", "美食"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 95),
-('南坪商圈', '重庆', '南岸区', '南岸区江南大道', '500108', 29.525042, 106.567212, 'B0LUPR3PAF', 'accommodation_area', '["商圈", "交通便利"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 90),
-('沙坪坝商圈', '重庆', '沙坪坝区', '沙坪坝区小龙坎新街', '500106', 29.554318, 106.457829, 'B0FFH1Q73E', 'accommodation_area', '["商圈", "高校区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 85)
+('解放碑(商圈)', '重庆', '渝中区', '渝中区民权路', '500103', 29.556728, 106.576880, 'B0FFGI0JVF', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 100),
+('观音桥商圈', '重庆', '江北区', '江北区观音桥步行街', '500105', 29.576104, 106.533919, 'B0FFHOSTJ8', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 95),
+('南坪商圈', '重庆', '南岸区', '南岸区江南大道', '500108', 29.525042, 106.567212, 'B0LUPR3PAF', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 90),
+('沙坪坝商圈', '重庆', '沙坪坝区', '沙坪坝区小龙坎新街', '500106', 29.554318, 106.457829, 'B0FFH1Q73E', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 85),
+('较场口商圈', '重庆', '渝中区', '渝中区', '500103', 29.553616, 106.573307, 'B0KUNCL621', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 70),
+('磁器口', '重庆', '沙坪坝区', '沙坪坝区', '500106', 29.581060, 106.450363, 'B00178XHPW', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 50),
+('三峡广场片区', '重庆', '沙坪坝区', '沙坪坝区', '500106', 29.555583, 106.461269, 'B0L2U7EQWY', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 40),
+('星汇天街片区', '重庆', '九龙坡区', '九龙坡区', '500107', 29.529570, 106.485102, 'B0L2U7FA0F', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 30),
+('大坪', '重庆', '渝中区', '渝中区', '500103', 29.539411, 106.516461, 'B00178XHP9', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 20),
+('沙正街', '重庆', '沙坪坝区', '沙坪坝区', '500106', 29.564457, 106.464577, 'B0FFFDRWY5', 'accommodation_area', '["商圈", "住宿片区"]'::jsonb, 'amap', 'trusted', 'auto_accepted', TRUE, TRUE, 'resolved', 10)
 ON CONFLICT DO NOTHING;
 
--- 3. 核心精选 POI 地点
+-- 3. 精选与全量核心地点池 (travel_canonical_place)
 INSERT INTO travel_canonical_place (
     canonical_name, city, district, address, adcode, latitude, longitude,
     amap_poi_id, place_type, category_tags, typical_visit_minutes, typical_visit_source,
     source_type, trust_level, review_status, is_active, contextual_only, geo_status, base_priority
 ) VALUES
--- 渝中区 (核心母城)
-('洪崖洞民俗风貌区', '重庆', '渝中区', '渝中区嘉陵江滨江路88号', '500103', 29.562914, 106.582236, 'B0FFG8Y2L6', 'attraction', '["夜景", "吊脚楼", "网红打卡", "必去"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 100),
-('解放碑步行街', '重庆', '渝中区', '渝中区民族路177号', '500103', 29.557218, 106.577132, 'B0FFG0N645', 'attraction', '["地标", "历史纪念碑", "购物", "步行街"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 98),
-('长江索道', '重庆', '渝中区', '渝中区新华路151号', '500103', 29.558312, 106.584321, 'B001783TNL', 'attraction', '["索道", "江景", "空中巴士", "地标"]'::jsonb, 45, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 95),
-('山城步道', '重庆', '渝中区', '渝中区中兴路234号', '500103', 29.551829, 106.570129, 'B0FFH7Q1A9', 'attraction', '["Citywalk", "老重庆", "江景", "步道"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 92),
-('十八梯传统风貌区', '重庆', '渝中区', '渝中区中兴路1号', '500103', 29.552431, 106.573512, 'B0J1K9L0M1', 'attraction', '["老街", "历史风貌", "夜景", "小吃"]'::jsonb, 75, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
-('李子坝轻轨穿楼', '重庆', '渝中区', '渝中区李子坝正街39号', '500103', 29.553924, 106.539218, 'B0FFH8M4P2', 'photo_spot', '["轻轨穿楼", "魔幻地形", "拍照打卡"]'::jsonb, 40, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 95),
-('戴家巷崖壁步道', '重庆', '渝中区', '渝中区戴家巷', '500103', 29.563412, 106.580219, 'B0J2K3L4M5', 'photo_spot', '["悬崖步道", "咖啡馆", "江景", "文艺"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
-('白象居', '重庆', '渝中区', '渝中区白象街4号', '500103', 29.556213, 106.586129, 'B0FFJ7K9L2', 'photo_spot', '["魔幻居民楼", "索道同框", "机位打卡"]'::jsonb, 50, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 87),
-('湖广会馆', '重庆', '渝中区', '渝中区长滨路芭蕉园1号', '500103', 29.555219, 106.589124, 'B001783T6H', 'museum', '["古建筑群", "移民文化", "黄色封火墙", "历史"]'::jsonb, 75, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 85),
-('重庆中国三峡博物馆', '重庆', '渝中区', '渝中区人民路236号', '500103', 29.565412, 106.550219, 'B001783U2L', 'museum', '["国家一级博物馆", "巴渝文化", "三峡历史"]'::jsonb, 120, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
-('重庆市人民大礼堂', '重庆', '渝中区', '渝中区人民路173号', '500103', 29.564819, 106.551912, 'B001783TNM', 'attraction', '["传统民族宫殿建筑", "地标", "广场"]'::jsonb, 45, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 86),
-('罗汉寺', '重庆', '渝中区', '渝中区罗汉寺街7号', '500103', 29.560124, 106.581291, 'B001783TO1', 'attraction', '["千年古刹", "疯狂的石头取景地", "闹市净土"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 82),
-
--- 渝中区/江北区 美食代表
-('八一好吃街', '重庆', '渝中区', '渝中区八一路177号', '500103', 29.556214, 106.576129, 'B0FFH9N2K1', 'market', '["小吃街", "酸辣粉", "山城小汤圆", "串串"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 92),
-('大井巷社区火锅', '重庆', '渝中区', '渝中区大井巷老居民楼下', '500103', 29.555812, 106.578192, 'B0J3K4L5M6', 'restaurant', '["老火锅", "社区美食", "地道市井"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 85),
-('杨记隆府(解放碑总店)', '重庆', '渝中区', '渝中区临江支路30号', '500103', 29.558912, 106.574129, 'B0FFGX78Y9', 'restaurant', '["江湖菜", "辣子鸡", "毛血旺", "特色餐饮"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
-
--- 沙坪坝区 / 九龙坡区 (文化与慢生活)
-('磁器口古镇', '重庆', '沙坪坝区', '沙坪坝区磁南街1号', '500106', 29.582914, 106.448219, 'B001783TNN', 'attraction', '["千年古镇", "陈麻花", "嘉陵江畔", "民俗文化"]'::jsonb, 120, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 93),
-('渣滓洞/白公馆', '重庆', '沙坪坝区', '沙坪坝区歌乐山下', '500106', 29.581219, 106.425129, 'B001783TO2', 'museum', '["红色历史", "爱国教育", "歌乐山"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
-('鹅岭二厂文创公园', '重庆', '渝中区', '渝中区鹅岭正街1号', '500103', 29.550124, 106.538129, 'B0FFH9M2Q8', 'park', '["文创园区", "俯瞰江景", "从你的全世界路过", "文艺打卡"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
-('交通茶馆', '重庆', '九龙坡区', '九龙坡区黄桷坪正街20号', '500107', 29.498214, 106.532129, 'B0FFG8M4X3', 'attraction', '["老茶馆", "盖碗茶", "市井风情", "年代感"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 86),
-('黄桷坪涂鸦艺术街', '重庆', '九龙坡区', '九龙坡区黄桷坪正街', '500107', 29.499124, 106.531219, 'B0FFG9N5Y1', 'photo_spot', '["当代艺术", "巨幅涂鸦", "川美老校区"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 82),
-
--- 南岸区 / 江北区 (江景与夜景视角)
-('弹子石老街', '重庆', '南岸区', '南岸区泰昌路69号', '500108', 29.566129, 106.599124, 'B0FFH8Q3M1', 'attraction', '["百年老街", "江海关", "绝美夜景", "两江交汇"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 89),
-('南山一棵树观景台', '重庆', '南岸区', '南岸区龙黄公路', '500108', 29.544129, 106.595124, 'B001783TNP', 'photo_spot', '["全景夜景", "俯瞰渝中半岛", "摄影胜地"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 91),
-('九街/观音桥夜市', '重庆', '江北区', '江北区北城天街', '500105', 29.578129, 106.538124, 'B0FFH7P2L9', 'market', '["年轻潮流", "夜生活", "酒吧街", "地道小吃"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88)
+('洪崖洞民俗风貌区', '重庆', '渝中区', '渝中区嘉陵江滨江路88号', '500103', 29.562914, 106.582236, 'B0FFG8Y2L6', 'attraction', '["夜景", "吊脚楼", "巴渝风貌"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 100),
+('解放碑步行街', '重庆', '渝中区', '渝中区民族路177号', '500103', 29.557218, 106.577132, 'B0FFG0N645', 'attraction', '["地标", "母城", "步行街"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 98),
+('李子坝轻轨穿楼', '重庆', '渝中区', '渝中区李子坝正街39号', '500103', 29.553924, 106.539218, 'B0FFH8M4P2', 'photo_spot', '["轨道交通", "立体地形", "取景地"]'::jsonb, 40, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 95),
+('长江索道', '重庆', '渝中区', '渝中区新华路151号', '500103', 29.558312, 106.584321, 'B001783TNL', 'attraction', '["索道", "江景", "城市交通"]'::jsonb, 45, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 95),
+('磁器口古镇', '重庆', '沙坪坝区', '沙坪坝区磁南街1号', '500106', 29.582914, 106.448219, 'B001783TNN', 'attraction', '["古镇", "嘉陵江", "民俗街区"]'::jsonb, 120, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 93),
+('八一好吃街', '重庆', '渝中区', '渝中区八一路177号', '500103', 29.556214, 106.576129, 'B0FFH9N2K1', 'market', '["小吃街", "地方风味", "美食"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 92),
+('千厮门大桥', '重庆', NULL, NULL, NULL, 29.569264, 106.576790, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 92),
+('山城步道', '重庆', '渝中区', '渝中区中兴路234号', '500103', 29.551829, 106.570129, 'B0FFH7Q1A9', 'attraction', '["步行道", "老重庆", "江景"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 92),
+('重庆动物园', '重庆', NULL, NULL, NULL, 29.504023, 106.505799, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 92),
+('南山一棵树观景台', '重庆', '南岸区', '南岸区龙黄公路', '500108', 29.544129, 106.595124, 'B001783TNP', 'photo_spot', '["全景夜景", "渝中半岛", "观景台"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 91),
+('三毛故居', '重庆', NULL, NULL, NULL, 29.537832, 106.601608, NULL, 'museum', '["博物馆", "历史文化"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('下浩里老街', '重庆', NULL, NULL, NULL, 29.557588, 106.595746, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 15, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('两江小渡', '重庆', NULL, NULL, NULL, 29.562381, 106.576537, NULL, 'attraction', '["城市景点"]'::jsonb, 56, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('北仓文创街', '重庆', NULL, NULL, NULL, 29.578539, 106.538685, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('十八梯传统风貌区', '重庆', '渝中区', '渝中区中兴路1号', '500103', 29.552431, 106.573512, 'B0J1K9L0M1', 'attraction', '["老街", "历史风貌", "石阶"]'::jsonb, 75, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('山城巷', '重庆', NULL, NULL, NULL, 29.551978, 106.565949, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('重庆中国三峡博物馆', '重庆', '渝中区', '渝中区人民路236号', '500103', 29.565412, 106.550219, 'B001783U2L', 'museum', '["博物馆", "巴渝文化", "三峡历史"]'::jsonb, 120, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('重庆之圆', '重庆', NULL, NULL, NULL, 29.573616, 106.589876, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('重庆大剧院', '重庆', NULL, NULL, NULL, 29.569832, 106.581333, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('重庆开埠遗址公园', '重庆', NULL, NULL, NULL, 29.551026, 106.593058, NULL, 'park', '["公园", "户外漫步"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('鹅岭二厂文创公园', '重庆', '渝中区', '渝中区鹅岭正街1号', '500103', 29.550124, 106.538129, 'B0FFH9M2Q8', 'park', '["文创园", "江景视野", "渝中"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('鹅岭公园', '重庆', NULL, NULL, NULL, 29.549688, 106.536235, NULL, 'park', '["公园", "户外漫步"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('黄葛古道', '重庆', NULL, NULL, NULL, 29.540940, 106.596874, NULL, 'attraction', '["城市景点"]'::jsonb, 165, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('龙门浩老街', '重庆', NULL, NULL, NULL, 29.555993, 106.594746, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 90),
+('弹子石老街', '重庆', '南岸区', '南岸区泰昌路69号', '500108', 29.566129, 106.599124, 'B0FFH8Q3M1', 'attraction', '["老街", "两江交汇", "夜景"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 89),
+('九街/观音桥夜市', '重庆', '江北区', '江北区北城天街', '500105', 29.578129, 106.538124, 'B0FFH7P2L9', 'market', '["夜生活", "美食街区", "江北"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
+('彼此的厨房EachotheR', '重庆', NULL, NULL, NULL, 29.574175, 106.553075, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
+('戴家巷崖壁步道', '重庆', '渝中区', '渝中区戴家巷', '500103', 29.563412, 106.580219, 'B0J2K3L4M5', 'photo_spot', '["崖壁步道", "江景", "街区"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
+('杨记隆府(解放碑总店)', '重庆', '渝中区', '渝中区临江支路30号', '500103', 29.558912, 106.574129, 'B0FFGX78Y9', 'restaurant', '["江湖菜", "特色餐饮", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
+('栗栗梯', '重庆', NULL, NULL, NULL, 29.552082, 106.536416, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
+('苔moss', '重庆', NULL, NULL, NULL, 29.557144, 106.595772, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88),
+('白象居', '重庆', '渝中区', '渝中区白象街4号', '500103', 29.556213, 106.586129, 'B0FFJ7K9L2', 'photo_spot', '["山城建筑", "索道同框", "街区"]'::jsonb, 50, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 87),
+('重庆来福士', '重庆', NULL, NULL, NULL, 29.564826, 106.587237, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 87),
+('交通茶馆', '重庆', '九龙坡区', '九龙坡区黄桷坪正街20号', '500107', 29.498214, 106.532129, 'B0FFG8M4X3', 'attraction', '["老茶馆", "市井文化", "历史"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 86),
+('佛图关公园', '重庆', NULL, NULL, NULL, 29.549345, 106.531503, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 86),
+('重庆市人民大礼堂', '重庆', '渝中区', '渝中区人民路173号', '500103', 29.564819, 106.551912, 'B001783TNM', 'attraction', '["传统建筑", "地标", "广场"]'::jsonb, 45, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 86),
+('大井巷社区火锅', '重庆', '渝中区', '渝中区大井巷', '500103', 29.555812, 106.578192, 'B0J3K4L5M6', 'restaurant', '["火锅", "地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 85),
+('湖广会馆', '重庆', '渝中区', '渝中区长滨路芭蕉园1号', '500103', 29.555219, 106.589124, 'B001783T6H', 'museum', '["明清建筑", "移民文化", "历史"]'::jsonb, 75, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 85),
+('N23咖啡', '重庆', NULL, NULL, NULL, 29.508535, 106.657591, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('Rust marks锈迹', '重庆', NULL, NULL, NULL, 29.619149, 106.524439, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('Soloist独奏公司', '重庆', NULL, NULL, NULL, 29.550794, 106.566059, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('Swimin', '重庆', NULL, NULL, NULL, 29.539324, 106.570430, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('Three H', '重庆', NULL, NULL, NULL, 29.590968, 106.548237, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('dede芭菲下午茶店', '重庆', NULL, NULL, NULL, 29.562292, 106.578902, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('丘JUST CHILL', '重庆', NULL, NULL, NULL, 29.550715, 106.566387, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('临江门糯米团', '重庆', NULL, NULL, NULL, 29.559626, 106.572501, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('九九豆花馆', '重庆', NULL, NULL, NULL, 29.559132, 106.584040, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('云崖台咖啡', '重庆', NULL, NULL, NULL, 29.575882, 106.428153, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('储奇门鳝鱼火锅', '重庆', NULL, NULL, NULL, 29.550398, 106.578599, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('华一坡蓉姐火锅', '重庆', NULL, NULL, NULL, 29.558060, 106.565050, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('叁屿瀑布咖啡', '重庆', NULL, NULL, NULL, 29.567168, 106.522526, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('喜饄耙耙牛肉', '重庆', NULL, NULL, NULL, 29.571235, 106.509736, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('壹品卤犟', '重庆', NULL, NULL, NULL, 29.561463, 106.226197, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('好吃狗凉糕总店', '重庆', NULL, NULL, NULL, 29.556749, 106.469446, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('才才手卷', '重庆', NULL, NULL, NULL, 29.413605, 106.308450, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('朱儿面庄', '重庆', NULL, NULL, NULL, 29.856003, 107.717621, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('李子坝梁山鸡', '重庆', NULL, NULL, NULL, 29.599416, 106.488906, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('林中乐辣子鸡', '重庆', NULL, NULL, NULL, 29.576545, 106.427053, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('熨斗糕老烧饼', '重庆', NULL, NULL, NULL, 29.553352, 106.570317, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('福源排档', '重庆', NULL, NULL, NULL, 29.552663, 106.554794, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('老甘家小龙虾江湖菜', '重庆', NULL, NULL, NULL, 29.512492, 106.471307, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('苗师傅大饼', '重庆', NULL, NULL, NULL, 29.589344, 106.225744, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('防空洞老火锅', '重庆', NULL, NULL, NULL, 29.550859, 106.533870, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('雾都二宝火锅', '重庆', NULL, NULL, NULL, 29.572762, 106.551851, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 83),
+('罗汉寺', '重庆', '渝中区', '渝中区罗汉寺街7号', '500103', 29.560124, 106.581291, 'B001783TO1', 'attraction', '["古刹", "历史建筑", "渝中"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 82),
+('黄桷坪涂鸦艺术街', '重庆', '九龙坡区', '九龙坡区黄桷坪正街', '500107', 29.499124, 106.531219, 'B0FFG9N5Y1', 'photo_spot', '["艺术街区", "涂鸦", "街拍"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 82),
+('东水门长江大桥', '重庆', NULL, NULL, NULL, 29.557763, 106.591170, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('临江门旧书店', '重庆', NULL, NULL, NULL, 29.559467, 106.572464, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('北温泉', '重庆', NULL, NULL, NULL, 29.856288, 106.416712, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('南滨路钟楼广场', '重庆', NULL, NULL, NULL, 29.572515, 106.591817, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('存在书店', '重庆', NULL, NULL, NULL, 29.550517, 106.567495, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('朝东路', '重庆', NULL, NULL, NULL, 29.562487, 106.587849, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('渣滓洞/白公馆', '重庆', '沙坪坝区', '沙坪坝区歌乐山下', '500106', 29.581219, 106.425129, 'B001783TO2', 'museum', '["近代历史", "歌乐山", "纪念馆"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('爱乐之城（天空之镜）', '重庆', NULL, NULL, NULL, 29.570688, 106.522312, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('爱情小巷', '重庆', NULL, NULL, NULL, 29.550204, 106.566967, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('礼嘉天街', '重庆', NULL, NULL, NULL, 29.670694, 106.490487, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('礼嘉渡', '重庆', NULL, NULL, NULL, 29.684591, 106.499815, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('重庆之瞳', '重庆', NULL, NULL, NULL, 29.562014, 106.550513, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('重庆欢乐谷', '重庆', NULL, NULL, NULL, 29.668184, 106.517099, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('金刚碑古镇', '重庆', NULL, NULL, NULL, 29.840176, 106.419087, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('铜元之光城市阳台', '重庆', NULL, NULL, NULL, 29.533158, 106.551485, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 80),
+('塔坪', '重庆', NULL, NULL, NULL, 29.578512, 106.539660, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 79),
+('海棠溪筒子楼', '重庆', NULL, NULL, NULL, 29.543436, 106.588060, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 79),
+('南滨路', '重庆', NULL, NULL, NULL, 29.541622, 106.576856, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('古木枫老火锅', '重庆', NULL, NULL, NULL, 29.560770, 106.579150, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('孔二火锅', '重庆', NULL, NULL, NULL, 29.579489, 106.532457, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('新壹牛肉', '重庆', NULL, NULL, NULL, 29.555129, 106.570723, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('李若桃', '重庆', NULL, NULL, NULL, 29.573620, 106.533083, NULL, 'restaurant', '["地方美食", "正餐"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('江滩公园', '重庆', NULL, NULL, NULL, 29.567497, 106.575640, NULL, 'park', '["公园", "户外漫步"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('老君洞道观', '重庆', NULL, NULL, NULL, 29.542263, 106.602082, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('观音桥', '重庆', NULL, NULL, NULL, 29.576104, 106.533919, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('魁星楼', '重庆', NULL, NULL, NULL, 29.560258, 106.573618, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('黄桷垭老街', '重庆', NULL, NULL, NULL, 29.537306, 106.602521, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 78),
+('长嘉汇购物广场', '重庆', NULL, NULL, NULL, 29.579677, 106.586959, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 76),
+('Half Pasture半场', '重庆', NULL, NULL, NULL, 29.561957, 106.546748, NULL, 'market', '["市集", "地方小吃"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('Imagine古着', '重庆', NULL, NULL, NULL, 29.550409, 106.595049, NULL, 'market', '["市集", "地方小吃"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('S95超次元中心商场', '重庆', NULL, NULL, NULL, 29.560530, 106.581265, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('Soul Radio', '重庆', NULL, NULL, NULL, 29.550352, 106.594893, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('TCITY桃源天地', '重庆', NULL, NULL, NULL, 29.738270, 106.629592, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 180, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('ifs国金中心', '重庆', NULL, NULL, NULL, 29.575926, 106.573110, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('“我在重庆”大屏', '重庆', NULL, NULL, NULL, 29.576984, 106.533377, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('下浩里观景台', '重庆', NULL, NULL, NULL, 29.557588, 106.595746, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('两江新区山地运动公园', '重庆', NULL, NULL, NULL, 29.631687, 106.547974, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('乐和乐都动物主题乐园', '重庆', NULL, NULL, NULL, 29.290902, 105.907814, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('刀锋书酒馆', '重庆', NULL, NULL, NULL, 29.517643, 106.518712, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('北仓图书馆', '重庆', NULL, NULL, NULL, 29.578587, 106.538445, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('北城天街', '重庆', NULL, NULL, NULL, 29.579884, 106.538603, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('十八梯城市阳台', '重庆', NULL, NULL, NULL, 29.552505, 106.573637, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('双子塔', '重庆', NULL, NULL, NULL, 29.700675, 107.398275, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('呼归石花阶公园', '重庆', NULL, NULL, NULL, 29.574883, 106.589754, NULL, 'park', '["公园", "户外漫步"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('喜马拉雅行政公馆', '重庆', NULL, NULL, NULL, 29.573577, 106.593625, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('大井巷', '重庆', NULL, NULL, NULL, 29.558614, 106.573075, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('大圆祥博物馆', '重庆', NULL, NULL, NULL, 29.384982, 106.222407, NULL, 'museum', '["博物馆", "历史文化"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('大树下音乐温泉', '重庆', NULL, NULL, NULL, 29.843168, 106.422075, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('天地湖', '重庆', NULL, NULL, NULL, 29.549875, 106.512294, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('学田湾正街', '重庆', NULL, NULL, NULL, 29.559341, 106.550837, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('安居古城', '重庆', NULL, NULL, NULL, 29.986274, 106.027658, NULL, 'attraction', '["城市景点"]'::jsonb, 360, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('小邓书屋', '重庆', NULL, NULL, NULL, 29.571944, 106.510116, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('广阳岛', '重庆', NULL, NULL, NULL, 29.561965, 106.718813, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('张培爵烈士纪念碑', '重庆', NULL, NULL, NULL, 29.561899, 106.579034, NULL, 'photo_spot', '["拍照取景", "风光"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('张飞古道', '重庆', NULL, NULL, NULL, 29.854276, 106.427064, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('弹子石码头', '重庆', NULL, NULL, NULL, 29.579540, 106.583655, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('朝天门7码头', '重庆', NULL, NULL, NULL, 29.566393, 106.588816, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('未命名书店', '重庆', NULL, NULL, NULL, 29.550519, 106.459120, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('枣子岚垭正街', '重庆', NULL, NULL, NULL, 29.559809, 106.554722, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('沙坪坝', '重庆', NULL, NULL, NULL, 29.557204, 106.462681, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('沧白路', '重庆', NULL, NULL, NULL, 29.561876, 106.579542, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('洪崖洞码头', '重庆', NULL, NULL, NULL, 29.562360, 106.576869, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('澄江渡口', '重庆', NULL, NULL, NULL, 29.867919, 106.392921, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('澄江老街', '重庆', NULL, NULL, NULL, 29.871485, 106.388950, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('磁器口后街', '重庆', NULL, NULL, NULL, 29.578694, 106.447571, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('科苑旧书店', '重庆', NULL, NULL, NULL, 29.564660, 106.456262, NULL, 'attraction', '["城市景点"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('虫洞古着（塔坪店）', '重庆', NULL, NULL, NULL, 29.577570, 106.536830, NULL, 'market', '["市集", "地方小吃"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('较场口', '重庆', NULL, NULL, NULL, 29.553575, 106.574352, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('重庆光环购物公园', '重庆', NULL, NULL, NULL, 29.650527, 106.529275, NULL, 'business_area', '["商圈", "街区漫步"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75),
+('重庆小商品市场', '重庆', NULL, NULL, NULL, 29.560859, 106.582835, NULL, 'market', '["市集", "地方小吃"]'::jsonb, 60, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 75)
 ON CONFLICT DO NOTHING;
 
 -- 4. 同步标准化地点表 (travel_place) 与聚合摘要表 (travel_place_summary)
@@ -80,10 +192,9 @@ SELECT
     ROUND(c.latitude::numeric, 7),
     c.category_tags
 FROM travel_canonical_place AS c
-WHERE c.city = '重庆'
+WHERE c.city IN ('重庆')
 ON CONFLICT (city, normalized_name) DO UPDATE
-SET
-    address = EXCLUDED.address,
+SET address = EXCLUDED.address,
     longitude = EXCLUDED.longitude,
     latitude = EXCLUDED.latitude,
     tags = EXCLUDED.tags;
@@ -94,72 +205,179 @@ INSERT INTO travel_place_summary (
     latest_captured_time, rating, top_reasons, warnings, hot_score, quality_score, recommend_score
 )
 SELECT
-    p.id AS place_id,
-    c.place_id AS canonical_place_id,
+    p.id,
+    c.place_id,
     c.city,
-    c.canonical_name AS name,
+    c.canonical_name,
     p.place_type,
     c.address,
     p.longitude,
     p.latitude,
-    c.category_tags AS tags,
-    GREATEST(12, c.base_priority - 40) AS mention_count_30d,
-    GREATEST(10, c.base_priority - 45) AS positive_count_30d,
-    1 AS negative_count_30d,
-    4 AS source_count,
-    NOW() AS latest_captured_time,
-    4.7 AS rating,
-    CASE c.canonical_name
-        WHEN '洪崖洞民俗风貌区' THEN '[{"reason": "依山就势的巴渝吊脚楼建筑群，傍晚亮灯后临江立面与千厮门大桥同框夜景极具辨识度"}, {"reason": "建议从11楼沧白路或1楼嘉陵江滨江路错峰观景"}]'::jsonb
-        WHEN '解放碑步行街' THEN '[{"reason": "重庆母城核心地标与商业街区，去八一好吃街、十八梯和洪崖洞步行皆可串联"}]'::jsonb
-        WHEN '长江索道' THEN '[{"reason": "横跨长江的空中交通体验，轿厢内可俯瞰渝中半岛与南岸江景"}, {"reason": "新华路北站排队较长时，可从上新街南站反向乘坐"}]'::jsonb
-        WHEN '山城步道' THEN '[{"reason": "沿崖壁修筑的老城石阶步道，串联仁爱堂旧址与临江栈道，适合慢走看江景"}]'::jsonb
-        WHEN '十八梯传统风貌区' THEN '[{"reason": "连接上下半城的传统石阶老街，保留了山城吊脚楼与街巷肌理"}]'::jsonb
-        WHEN '李子坝轻轨穿楼' THEN '[{"reason": "单轨2号线列车穿过居民楼的立体交通景观，楼下设专门观景平台"}]'::jsonb
-        WHEN '戴家巷崖壁步道' THEN '[{"reason": "紧邻洪崖洞的临江悬崖栈道，老城墙与江畔咖啡小店氛围松弛"}]'::jsonb
-        WHEN '白象居' THEN '[{"reason": "24层无电梯老式山城居民楼，可拍到长江索道与东水门大桥同框画面"}]'::jsonb
-        WHEN '湖广会馆' THEN '[{"reason": "临江明清古建筑群，黄色封火墙与戏楼雕花保存完好，展现湖广填四川移民历史"}]'::jsonb
-        WHEN '重庆中国三峡博物馆' THEN '[{"reason": "馆藏壮丽三峡、远古巴渝与城市变迁文物，与人民大礼堂隔广场相望"}]'::jsonb
-        WHEN '重庆市人民大礼堂' THEN '[{"reason": "传统宫殿式穹顶建筑代表，广场开阔适合拍摄对称建筑外观"}]'::jsonb
-        WHEN '罗汉寺' THEN '[{"reason": "闹市高楼环抱中的宋代古刹，古摩崖佛像与现代都市反差鲜明"}]'::jsonb
-        WHEN '八一好吃街' THEN '[{"reason": "解放碑旁人气小吃街，汇集酸辣粉、山城小汤圆、烤脑花等街头小吃"}]'::jsonb
-        WHEN '大井巷社区火锅' THEN '[{"reason": "藏在老居民楼下的地道重庆牛油老火锅，锅底醇厚、市井烟火气足"}]'::jsonb
-        WHEN '杨记隆府(解放碑总店)' THEN '[{"reason": "重庆代表性江湖菜馆，招牌辣子鸡、毛血旺分量扎实，适合多人聚餐"}]'::jsonb
-        WHEN '磁器口古镇' THEN '[{"reason": "嘉陵江畔千年水陆码头古镇，青石板路两侧汇集陈麻花与传统茶铺"}]'::jsonb
-        WHEN '渣滓洞/白公馆' THEN '[{"reason": "歌乐山麓近代历史旧址，林木幽深，适合结合红色历史慢步参观"}]'::jsonb
-        WHEN '鹅岭二厂文创公园' THEN '[{"reason": "印钞老厂房改造的工业风文创园，山顶天台可俯瞰两江风光"}]'::jsonb
-        WHEN '交通茶馆' THEN '[{"reason": "保留上世纪老重庆风貌的老茶馆，木桌长凳配盖碗茶极具年代感"}]'::jsonb
-        WHEN '黄桷坪涂鸦艺术街' THEN '[{"reason": "川美老校区周边整条街楼宇绘满彩绘涂鸦，与交通茶馆相邻适合顺路打卡"}]'::jsonb
-        WHEN '弹子石老街' THEN '[{"reason": "南岸临江坡地老街，傍晚在观景台可正面观赏朝天门两江交汇夜景"}]'::jsonb
-        WHEN '南山一棵树观景台' THEN '[{"reason": "南山半山腰经典观景平台，视野开阔，可俯瞰渝中半岛万家灯火"}]'::jsonb
-        WHEN '九街/观音桥夜市' THEN '[{"reason": "江北核心夜生活与美食街区，夜间餐饮与小酒馆热闹非凡"}]'::jsonb
-        ELSE '[{"reason": "重庆本地热门打卡与顺路游览地点"}]'::jsonb
-    END AS top_reasons,
-    CASE c.canonical_name
-        WHEN '洪崖洞民俗风貌区' THEN '[{"warning": "节假日夜间19:30-21:30人流密集，注意错峰出行"}]'::jsonb
-        WHEN '长江索道' THEN '[{"warning": "旺季排队时间较长，建议提前关注现场候乘提示"}]'::jsonb
-        WHEN '山城步道' THEN '[{"warning": "全程台阶较多，建议穿舒适防滑平底鞋"}]'::jsonb
-        ELSE '[]'::jsonb
-    END AS warnings,
-    c.base_priority::numeric AS hot_score,
-    8.8 AS quality_score,
-    9.0 AS recommend_score
+    c.category_tags,
+    GREATEST(12, c.base_priority - 40),
+    GREATEST(10, c.base_priority - 45),
+    1,
+    4,
+    NOW(),
+    4.7,
+    s.top_reasons,
+    s.warnings,
+    c.base_priority::numeric,
+    8.8,
+    9.0
 FROM travel_canonical_place AS c
 JOIN travel_place AS p
   ON p.city = c.city
  AND p.normalized_name = LOWER(REGEXP_REPLACE(c.canonical_name, '\s+', '', 'g'))
-WHERE c.city = '重庆'
-  AND c.contextual_only = FALSE
+JOIN (VALUES
+    ('重庆', '洪崖洞民俗风貌区', '[{"reason": "依山就势的巴渝吊脚楼建筑群，傍晚亮灯后临江立面与千厮门大桥夜景辨识度高"}]'::jsonb, '[{"warning": "节假日客流集中或需提前预约，建议错峰出行并确认开放公告"}]'::jsonb),
+    ('重庆', '解放碑步行街', '[{"reason": "重庆母城核心商业街区与地标广场，串联八一好吃街、十八梯与洪崖洞步行动线"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '李子坝轻轨穿楼', '[{"reason": "单轨2号线列车穿过住宅建筑的立体交通景观，街边设有专门观景平台"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '长江索道', '[{"reason": "横跨长江的空中索道交通线，轿厢视野可纵览渝中半岛与两江两岸风貌"}]'::jsonb, '[{"warning": "节假日客流集中或需提前预约，建议错峰出行并确认开放公告"}]'::jsonb),
+    ('重庆', '磁器口古镇', '[{"reason": "嘉陵江畔千年水陆码头古镇，青石板街巷串联传统手信与巴渝民俗建筑"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '八一好吃街', '[{"reason": "解放碑核心区传统美食小吃聚集地，汇聚川渝风味街头小食"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '千厮门大桥', '[{"reason": "跨嘉陵江标志性斜拉桥，夜间桥面视线正对洪崖洞建筑群"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '山城步道', '[{"reason": "沿崖壁修筑的老城石阶步道，途经传统民居与临江栈道，适合慢步游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆动物园', '[{"reason": "九龙坡区大型综合动物园，以大熊猫展区为核心游览区域"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '南山一棵树观景台', '[{"reason": "南山半山腰高处观景台，可全景俯瞰渝中半岛夜色轮廓"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '三毛故居', '[{"reason": "南山黄桷垭故居遗址陈列室，体量小巧适合沿老街顺路参观"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '下浩里老街', '[{"reason": "紧邻龙门浩的青砖老街建筑群，延续山城街巷错落格局"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '两江小渡', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '北仓文创街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '十八梯传统风貌区', '[{"reason": "连接上下半城的传统石阶老街，集中展现山城建筑肌理与历史街巷风貌"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '山城巷', '[{"reason": "渝中半岛南坡传统历史街区，保留仁爱堂旧址与崖壁栈道风貌"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆中国三峡博物馆', '[{"reason": "国家一级博物馆，常设壮丽三峡、远古巴渝及重庆城市历史专题展览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆之圆', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆大剧院', '[{"reason": "江北嘴标志性现代公共文化建筑，外广场临江开阔适合夜间赏灯"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆开埠遗址公园', '[{"reason": "重庆城市绿地与户外园林漫步区，适合安排约90分钟日常散步休闲"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '鹅岭二厂文创公园', '[{"reason": "工业老厂房改造的半山文创园区，山顶开阔平台可俯瞰嘉陵江岸风光"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '鹅岭公园', '[{"reason": "渝中制高点传统园林公园，揽胜楼可同时远眺长江与嘉陵江"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '黄葛古道', '[{"reason": "南山百年石板古道，沿途古树成荫，适合半日登山徒步"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '龙门浩老街', '[{"reason": "南岸江畔开埠历史建筑群，依坡而建并设有观景电梯"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '弹子石老街', '[{"reason": "南岸临江坡地老街，傍晚在开阔平台可正面观赏两江交汇与渝中夜景"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '九街/观音桥夜市', '[{"reason": "江北夜间餐饮与商业活力街区，晚间宵夜选择集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '彼此的厨房EachotheR', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '戴家巷崖壁步道', '[{"reason": "毗邻洪崖洞的临江悬崖步道，结合老城墙遗址与街巷步行动线"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '杨记隆府(解放碑总店)', '[{"reason": "渝中区代表性川渝江湖菜馆，临近解放碑步行圈，适合多人正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '栗栗梯', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '苔moss', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '白象居', '[{"reason": "24层无电梯特色居民楼，连廊机位可同框拍摄长江索道与东水门大桥"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆来福士', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '交通茶馆', '[{"reason": "九龙坡黄桷坪传统老茶馆，保留上世纪木桌长凳与盖碗茶市井格局"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '佛图关公园', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆市人民大礼堂', '[{"reason": "传统宫殿式穹顶对称建筑代表，与三峡博物馆隔人民广场相望"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '大井巷社区火锅', '[{"reason": "渝中区老街巷内的重庆传统牛油火锅店，适合纳入解放碑周边正餐动线"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '湖广会馆', '[{"reason": "临江明清古建筑群，保留黄色封火墙、戏楼木雕与巴渝移民历史陈列"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'N23咖啡', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Rust marks锈迹', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Soloist独奏公司', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Swimin', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Three H', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'dede芭菲下午茶店', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '丘JUST CHILL', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '临江门糯米团', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '九九豆花馆', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '云崖台咖啡', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '储奇门鳝鱼火锅', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '华一坡蓉姐火锅', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '叁屿瀑布咖啡', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '喜饄耙耙牛肉', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '壹品卤犟', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '好吃狗凉糕总店', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '才才手卷', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '朱儿面庄', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '李子坝梁山鸡', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '林中乐辣子鸡', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '熨斗糕老烧饼', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '福源排档', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '老甘家小龙虾江湖菜', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '苗师傅大饼', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '防空洞老火锅', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '雾都二宝火锅', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '罗汉寺', '[{"reason": "都市楼宇环抱中的宋代古刹，保留摩崖石刻造像与传统佛殿建筑"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '黄桷坪涂鸦艺术街', '[{"reason": "围绕川美老校区延伸的城市墙体涂鸦艺术街区，与交通茶馆相邻"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '东水门长江大桥', '[{"reason": "连接渝中与南岸的公轨两用大桥，桥面人行道视野开阔"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '临江门旧书店', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '北温泉', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '南滨路钟楼广场', '[{"reason": "南滨路临江城市广场，正对两江交汇处与对岸大剧院轮廓"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '存在书店', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '朝东路', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '渣滓洞/白公馆', '[{"reason": "歌乐山麓近现代历史纪念馆区，山林环境清幽，适宜配合历史讲解游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '爱乐之城（天空之镜）', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '爱情小巷', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '礼嘉天街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '礼嘉渡', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆之瞳', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆欢乐谷', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '金刚碑古镇', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '铜元之光城市阳台', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '塔坪', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '海棠溪筒子楼', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '南滨路', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '古木枫老火锅', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '孔二火锅', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '新壹牛肉', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '李若桃', '[{"reason": "重庆地方风味餐饮与特色食肆门店，可结合周边游览顺路安排正餐"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '江滩公园', '[{"reason": "重庆城市绿地与户外园林漫步区，适合安排约90分钟日常散步休闲"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '老君洞道观', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '观音桥', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '魁星楼', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '黄桷垭老街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '长嘉汇购物广场', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Half Pasture半场', '[{"reason": "重庆地方风味小吃与街区市集聚集带，适合结合傍晚或夜间逛吃动线"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Imagine古着', '[{"reason": "重庆地方风味小吃与街区市集聚集带，适合结合傍晚或夜间逛吃动线"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'S95超次元中心商场', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'Soul Radio', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'TCITY桃源天地', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', 'ifs国金中心', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '“我在重庆”大屏', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '下浩里观景台', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '两江新区山地运动公园', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '乐和乐都动物主题乐园', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '刀锋书酒馆', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '北仓图书馆', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '北城天街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '十八梯城市阳台', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '双子塔', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '呼归石花阶公园', '[{"reason": "重庆城市绿地与户外园林漫步区，适合安排约90分钟日常散步休闲，目前公开信息显示无需门票（以现场开放公告为准）"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '喜马拉雅行政公馆', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '大井巷', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '大圆祥博物馆', '[{"reason": "重庆专题陈列与历史人文展馆，建议预留90分钟按展陈动线参观"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '大树下音乐温泉', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '天地湖', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '学田湾正街', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '安居古城', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '小邓书屋', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '广阳岛', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '张培爵烈士纪念碑', '[{"reason": "重庆代表性街区视角与城市建筑取景地，适合配合片区步行线路顺路打卡"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '张飞古道', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '弹子石码头', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '朝天门7码头', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '未命名书店', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '枣子岚垭正街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '沙坪坝', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '沧白路', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '洪崖洞码头', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '澄江渡口', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '澄江老街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '磁器口后街', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '科苑旧书店', '[{"reason": "重庆具有地方风貌与代表性的游览去处，可搭配同片区景点联动游览"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '虫洞古着（塔坪店）', '[{"reason": "重庆地方风味小吃与街区市集聚集带，适合结合傍晚或夜间逛吃动线"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '较场口', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆光环购物公园', '[{"reason": "重庆重要商业街区与城市公共生活片区，交通接驳与餐饮配套集中"}]'::jsonb, '[]'::jsonb),
+    ('重庆', '重庆小商品市场', '[{"reason": "重庆地方风味小吃与街区市集聚集带，适合结合傍晚或夜间逛吃动线"}]'::jsonb, '[]'::jsonb)
+) AS s(city, place_name, top_reasons, warnings)
+  ON s.city = c.city AND s.place_name = c.canonical_name
+WHERE c.contextual_only = FALSE
 ON CONFLICT (place_id) DO UPDATE
-SET
-    canonical_place_id = EXCLUDED.canonical_place_id,
+SET canonical_place_id = EXCLUDED.canonical_place_id,
     top_reasons = EXCLUDED.top_reasons,
     warnings = EXCLUDED.warnings,
     mention_count_30d = EXCLUDED.mention_count_30d,
     source_count = EXCLUDED.source_count,
     recommend_score = EXCLUDED.recommend_score;
 
--- 5. 灵感图鉴与地点详情图集 (travel_canonical_place_image)
+-- 5. 灵感图鉴与地点详情实景图集 (travel_canonical_place_image)
 INSERT INTO travel_canonical_place_image (
     place_id, asset_id, position,
     desktop_url, desktop_width, desktop_height,
@@ -169,40 +387,121 @@ INSERT INTO travel_canonical_place_image (
 )
 SELECT
     c.place_id,
-    SUBSTRING(MD5('seed-cq-img-' || c.canonical_name) FROM 1 FOR 16) AS asset_id,
-    1 AS position,
-    img.url AS desktop_url,
-    1600 AS desktop_width,
-    1067 AS desktop_height,
-    REPLACE(img.url, '.webp', '.mobile.webp') AS mobile_url,
-    800 AS mobile_width,
-    533 AS mobile_height,
-    REPLACE(img.url, '.webp', '.mobile.webp') AS thumb_url,
-    400 AS thumb_width,
-    267 AS thumb_height,
-    c.canonical_name || '实景图' AS alt_text,
-    TRUE AS active,
-    'seed_chongqing_v1' AS import_batch_id
+    img.asset_id,
+    img.pos,
+    img.d_url, img.d_w, img.d_h,
+    img.m_url, img.m_w, img.m_h,
+    img.t_url, img.t_w, img.t_h,
+    img.alt_text,
+    TRUE,
+    img.batch_id
 FROM travel_canonical_place AS c
-JOIN (
-    VALUES
-        ('洪崖洞民俗风貌区', 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.webp'),
-        ('解放碑步行街', 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.webp'),
-        ('长江索道', 'https://assets.kakarot8.com/city-opt/chongqing/commons-12364263.webp'),
-        ('山城步道', 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.webp'),
-        ('十八梯传统风貌区', 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.webp'),
-        ('李子坝轻轨穿楼', 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-RG2YD21o81E-unsplash.webp'),
-        ('戴家巷崖壁步道', 'https://assets.kakarot8.com/city-opt/chongqing/harrison-qi-E9dIbdSd7LU-unsplash.webp'),
-        ('白象居', 'https://assets.kakarot8.com/city-opt/chongqing/zhang-qc-EyScjFlzvtg-unsplash.webp'),
-        ('弹子石老街', 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.webp'),
-        ('南山一棵树观景台', 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.webp'),
-        ('鹅岭二厂文创公园', 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.webp'),
-        ('磁器口古镇', 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.webp')
-) AS img(place_name, url)
-  ON img.place_name = c.canonical_name
-WHERE c.city = '重庆'
+JOIN (VALUES
+    ('重庆', 'Half Pasture半场', '5ec26a57b71d33cc', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1054/5ec26a57b71d33cc.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1054/5ec26a57b71d33cc.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1054/5ec26a57b71d33cc.thumb.webp', 270, 360, 'Half Pasture半场实景图 1', 'seed_5cities_v1'),
+    ('重庆', 'Imagine古着', '27b2b99985cc9f8b', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1055/27b2b99985cc9f8b.webp', 1280, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1055/27b2b99985cc9f8b.mobile.webp', 768, 512, 'https://assets.kakarot8.com/poi-opt/chongqing/1055/27b2b99985cc9f8b.thumb.webp', 360, 240, 'Imagine古着实景图 1', 'seed_5cities_v1'),
+    ('重庆', 'Imagine古着', '508f38d25ffddbd7', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1055/508f38d25ffddbd7.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1055/508f38d25ffddbd7.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1055/508f38d25ffddbd7.thumb.webp', 270, 360, 'Imagine古着实景图 2', 'seed_5cities_v1'),
+    ('重庆', 'N23咖啡', '096393e668abb5d2', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1057/096393e668abb5d2.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1057/096393e668abb5d2.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1057/096393e668abb5d2.thumb.webp', 270, 360, 'N23咖啡实景图 1', 'seed_5cities_v1'),
+    ('重庆', 'N23咖啡', '179ef72bba95ad73', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1057/179ef72bba95ad73.webp', 640, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1057/179ef72bba95ad73.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1057/179ef72bba95ad73.thumb.webp', 240, 360, 'N23咖啡实景图 2', 'seed_5cities_v1'),
+    ('重庆', 'Rust marks锈迹', '34f257c64c92e366', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/34f257c64c92e366.webp', 854, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/34f257c64c92e366.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/34f257c64c92e366.thumb.webp', 240, 360, 'Rust marks锈迹实景图 1', 'seed_5cities_v1'),
+    ('重庆', 'Rust marks锈迹', '521471b9038e7cf3', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/521471b9038e7cf3.webp', 854, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/521471b9038e7cf3.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/521471b9038e7cf3.thumb.webp', 240, 360, 'Rust marks锈迹实景图 2', 'seed_5cities_v1'),
+    ('重庆', 'Rust marks锈迹', '615589097982803a', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/615589097982803a.webp', 854, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/615589097982803a.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1058/615589097982803a.thumb.webp', 240, 360, 'Rust marks锈迹实景图 3', 'seed_5cities_v1'),
+    ('重庆', 'S95超次元中心商场', '5cecbb13be62df09', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1059/5cecbb13be62df09.webp', 633, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1059/5cecbb13be62df09.mobile.webp', 380, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1059/5cecbb13be62df09.thumb.webp', 178, 360, 'S95超次元中心商场实景图 1', 'seed_5cities_v1'),
+    ('重庆', 'Soul Radio', '5aad684f0fd7ee8a', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/5aad684f0fd7ee8a.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/5aad684f0fd7ee8a.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/5aad684f0fd7ee8a.thumb.webp', 270, 360, 'Soul Radio实景图 1', 'seed_5cities_v1'),
+    ('重庆', 'Soul Radio', '7db33da406ff5fb5', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/7db33da406ff5fb5.webp', 944, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/7db33da406ff5fb5.mobile.webp', 567, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/7db33da406ff5fb5.thumb.webp', 266, 360, 'Soul Radio实景图 2', 'seed_5cities_v1'),
+    ('重庆', 'Soul Radio', '998d07d7edd02321', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/998d07d7edd02321.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/998d07d7edd02321.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1061/998d07d7edd02321.thumb.webp', 270, 360, 'Soul Radio实景图 3', 'seed_5cities_v1'),
+    ('重庆', 'Swimin', '0e3b4221751ed1e4', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1062/0e3b4221751ed1e4.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1062/0e3b4221751ed1e4.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1062/0e3b4221751ed1e4.thumb.webp', 270, 360, 'Swimin实景图 1', 'seed_5cities_v1'),
+    ('重庆', '“我在重庆”大屏', '4fa06326d70fa17f', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1068/4fa06326d70fa17f.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1068/4fa06326d70fa17f.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1068/4fa06326d70fa17f.thumb.webp', 270, 360, '“我在重庆”大屏实景图 1', 'seed_5cities_v1'),
+    ('重庆', '“我在重庆”大屏', '5174c60d073f8d40', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1068/5174c60d073f8d40.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1068/5174c60d073f8d40.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1068/5174c60d073f8d40.thumb.webp', 270, 360, '“我在重庆”大屏实景图 2', 'seed_5cities_v1'),
+    ('重庆', '三毛故居', '70304c87e0766464', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1072/70304c87e0766464.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1072/70304c87e0766464.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1072/70304c87e0766464.thumb.webp', 270, 360, '三毛故居实景图 1', 'seed_5cities_v1'),
+    ('重庆', '丘JUST CHILL', '745b1020f929a0e0', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1079/745b1020f929a0e0.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1079/745b1020f929a0e0.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1079/745b1020f929a0e0.thumb.webp', 270, 360, '丘JUST CHILL实景图 1', 'seed_5cities_v1'),
+    ('重庆', '东水门长江大桥', 'f3e5f51fa444d000', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1080/f3e5f51fa444d000.webp', 640, 854, 'https://assets.kakarot8.com/poi-opt/chongqing/1080/f3e5f51fa444d000.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1080/f3e5f51fa444d000.thumb.webp', 270, 360, '东水门长江大桥实景图 1', 'seed_5cities_v1'),
+    ('重庆', '两江小渡', 'a61d2d414a97181d', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1082/a61d2d414a97181d.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1082/a61d2d414a97181d.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1082/a61d2d414a97181d.thumb.webp', 270, 360, '两江小渡实景图 1', 'seed_5cities_v1'),
+    ('重庆', '两江小渡', 'e873aac0a44591a3', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1082/e873aac0a44591a3.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1082/e873aac0a44591a3.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1082/e873aac0a44591a3.thumb.webp', 270, 360, '两江小渡实景图 2', 'seed_5cities_v1'),
+    ('重庆', '临江门旧书店', '333bd7ff35e53595', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1087/333bd7ff35e53595.webp', 640, 1064, 'https://assets.kakarot8.com/poi-opt/chongqing/1087/333bd7ff35e53595.mobile.webp', 462, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1087/333bd7ff35e53595.thumb.webp', 217, 360, '临江门旧书店实景图 1', 'seed_5cities_v1'),
+    ('重庆', '九街/观音桥夜市', '38e993f5dee8b308', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1243/38e993f5dee8b308.webp', 853, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1243/38e993f5dee8b308.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1243/38e993f5dee8b308.thumb.webp', 240, 360, '九街/观音桥夜市实景图 1', 'seed_5cities_v1'),
+    ('重庆', '九街/观音桥夜市', 'f2ec9dd14392850e', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1243/f2ec9dd14392850e.webp', 853, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1243/f2ec9dd14392850e.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1243/f2ec9dd14392850e.thumb.webp', 240, 360, '九街/观音桥夜市实景图 2', 'seed_5cities_v1'),
+    ('重庆', '佛图关公园', 'ad4809c9b6c843cf', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1092/ad4809c9b6c843cf.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1092/ad4809c9b6c843cf.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1092/ad4809c9b6c843cf.thumb.webp', 270, 360, '佛图关公园实景图 1', 'seed_5cities_v1'),
+    ('重庆', '佛图关公园', 'b74b54fab5bb6a5e', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1092/b74b54fab5bb6a5e.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1092/b74b54fab5bb6a5e.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1092/b74b54fab5bb6a5e.thumb.webp', 270, 360, '佛图关公园实景图 2', 'seed_5cities_v1'),
+    ('重庆', '储奇门鳝鱼火锅', 'c91bee221d54aee3', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1094/c91bee221d54aee3.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1094/c91bee221d54aee3.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1094/c91bee221d54aee3.thumb.webp', 270, 360, '储奇门鳝鱼火锅实景图 1', 'seed_5cities_v1'),
+    ('重庆', '刀锋书酒馆', '579b37ec2b2fc657', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1096/579b37ec2b2fc657.webp', 640, 480, 'https://assets.kakarot8.com/poi-opt/chongqing/1096/579b37ec2b2fc657.mobile.webp', 640, 480, 'https://assets.kakarot8.com/poi-opt/chongqing/1096/579b37ec2b2fc657.thumb.webp', 360, 270, '刀锋书酒馆实景图 1', 'seed_5cities_v1'),
+    ('重庆', '刀锋书酒馆', 'ffef188e1b696246', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1096/ffef188e1b696246.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1096/ffef188e1b696246.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1096/ffef188e1b696246.thumb.webp', 270, 360, '刀锋书酒馆实景图 2', 'seed_5cities_v1'),
+    ('重庆', '北仓图书馆', 'fad94c53a7acf597', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1098/fad94c53a7acf597.webp', 640, 852, 'https://assets.kakarot8.com/poi-opt/chongqing/1098/fad94c53a7acf597.mobile.webp', 577, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1098/fad94c53a7acf597.thumb.webp', 270, 360, '北仓图书馆实景图 1', 'seed_5cities_v1'),
+    ('重庆', '北仓文创街', 'cafa15ebfc66738d', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1099/cafa15ebfc66738d.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1099/cafa15ebfc66738d.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1099/cafa15ebfc66738d.thumb.webp', 270, 360, '北仓文创街实景图 1', 'seed_5cities_v1'),
+    ('重庆', '北城天街', 'a419888b7ad93319', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1102/a419888b7ad93319.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1102/a419888b7ad93319.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1102/a419888b7ad93319.thumb.webp', 270, 360, '北城天街实景图 1', 'seed_5cities_v1'),
+    ('重庆', '十八梯传统风貌区', '51c6f544ca6ee783', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/51c6f544ca6ee783.webp', 964, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/51c6f544ca6ee783.mobile.webp', 578, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/51c6f544ca6ee783.thumb.webp', 271, 360, '十八梯传统风貌区实景图 1', 'seed_5cities_v1'),
+    ('重庆', '十八梯传统风貌区', 'a0a7ef69eb72ff73', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/a0a7ef69eb72ff73.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/a0a7ef69eb72ff73.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/a0a7ef69eb72ff73.thumb.webp', 270, 360, '十八梯传统风貌区实景图 2', 'seed_5cities_v1'),
+    ('重庆', '十八梯传统风貌区', 'c545addade2432b6', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/c545addade2432b6.webp', 964, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/c545addade2432b6.mobile.webp', 578, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1105/c545addade2432b6.thumb.webp', 271, 360, '十八梯传统风貌区实景图 3', 'seed_5cities_v1'),
+    ('重庆', '南山一棵树观景台', '3bc4f132e8207f46', 1, 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.mobile.webp', 400, 267, '南山一棵树观景台实景图', 'seed_5cities_v1'),
+    ('重庆', '南滨路钟楼广场', 'd8733090c1661412', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1112/d8733090c1661412.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1112/d8733090c1661412.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1112/d8733090c1661412.thumb.webp', 270, 360, '南滨路钟楼广场实景图 1', 'seed_5cities_v1'),
+    ('重庆', '叁屿瀑布咖啡', '2fe8ea9ab191fa12', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/2fe8ea9ab191fa12.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/2fe8ea9ab191fa12.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/2fe8ea9ab191fa12.thumb.webp', 270, 360, '叁屿瀑布咖啡实景图 1', 'seed_5cities_v1'),
+    ('重庆', '叁屿瀑布咖啡', '6c91eae12397a135', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/6c91eae12397a135.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/6c91eae12397a135.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/6c91eae12397a135.thumb.webp', 270, 360, '叁屿瀑布咖啡实景图 2', 'seed_5cities_v1'),
+    ('重庆', '叁屿瀑布咖啡', 'b77c0a974396d0b7', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/b77c0a974396d0b7.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/b77c0a974396d0b7.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1113/b77c0a974396d0b7.thumb.webp', 270, 360, '叁屿瀑布咖啡实景图 3', 'seed_5cities_v1'),
+    ('重庆', '双子塔', '5da979ddcf0a7608', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1114/5da979ddcf0a7608.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1114/5da979ddcf0a7608.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1114/5da979ddcf0a7608.thumb.webp', 270, 360, '双子塔实景图 1', 'seed_5cities_v1'),
+    ('重庆', '双子塔', '6c6e0cc6c8cbde7f', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1114/6c6e0cc6c8cbde7f.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1114/6c6e0cc6c8cbde7f.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1114/6c6e0cc6c8cbde7f.thumb.webp', 270, 360, '双子塔实景图 2', 'seed_5cities_v1'),
+    ('重庆', '呼归石花阶公园', '600802cd956d8b99', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1117/600802cd956d8b99.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1117/600802cd956d8b99.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1117/600802cd956d8b99.thumb.webp', 270, 360, '呼归石花阶公园实景图 1', 'seed_5cities_v1'),
+    ('重庆', '大井巷', 'b21953c731d64f5a', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1122/b21953c731d64f5a.webp', 640, 958, 'https://assets.kakarot8.com/poi-opt/chongqing/1122/b21953c731d64f5a.mobile.webp', 513, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1122/b21953c731d64f5a.thumb.webp', 241, 360, '大井巷实景图 1', 'seed_5cities_v1'),
+    ('重庆', '存在书店', '9427f7f50035f0a2', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1128/9427f7f50035f0a2.webp', 853, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1128/9427f7f50035f0a2.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1128/9427f7f50035f0a2.thumb.webp', 240, 360, '存在书店实景图 1', 'seed_5cities_v1'),
+    ('重庆', '存在书店', 'a41acc0ed6cf5d87', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1128/a41acc0ed6cf5d87.webp', 853, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1128/a41acc0ed6cf5d87.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1128/a41acc0ed6cf5d87.thumb.webp', 240, 360, '存在书店实景图 2', 'seed_5cities_v1'),
+    ('重庆', '小邓书屋', 'a135f4f631d63aca', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1131/a135f4f631d63aca.webp', 640, 800, 'https://assets.kakarot8.com/poi-opt/chongqing/1131/a135f4f631d63aca.mobile.webp', 614, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1131/a135f4f631d63aca.thumb.webp', 288, 360, '小邓书屋实景图 1', 'seed_5cities_v1'),
+    ('重庆', '山城巷', '7b52ec83a24e78ed', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1132/7b52ec83a24e78ed.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1132/7b52ec83a24e78ed.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1132/7b52ec83a24e78ed.thumb.webp', 270, 360, '山城巷实景图 1', 'seed_5cities_v1'),
+    ('重庆', '山城巷', 'f1f0e34e191098b1', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1132/f1f0e34e191098b1.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1132/f1f0e34e191098b1.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1132/f1f0e34e191098b1.thumb.webp', 270, 360, '山城巷实景图 2', 'seed_5cities_v1'),
+    ('重庆', '山城步道', '75451577708c5f50', 1, 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.mobile.webp', 400, 267, '山城步道实景图', 'seed_5cities_v1'),
+    ('重庆', '张培爵烈士纪念碑', '3cf2193b0f2b120c', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1139/3cf2193b0f2b120c.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1139/3cf2193b0f2b120c.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1139/3cf2193b0f2b120c.thumb.webp', 270, 360, '张培爵烈士纪念碑实景图 1', 'seed_5cities_v1'),
+    ('重庆', '张飞古道', '94547b7af9af9d4f', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1141/94547b7af9af9d4f.webp', 853, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1141/94547b7af9af9d4f.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1141/94547b7af9af9d4f.thumb.webp', 240, 360, '张飞古道实景图 1', 'seed_5cities_v1'),
+    ('重庆', '张飞古道', 'b8a5769ccc56e527', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1141/b8a5769ccc56e527.webp', 853, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1141/b8a5769ccc56e527.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1141/b8a5769ccc56e527.thumb.webp', 240, 360, '张飞古道实景图 2', 'seed_5cities_v1'),
+    ('重庆', '弹子石码头', 'c34a711a9ee57646', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1142/c34a711a9ee57646.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1142/c34a711a9ee57646.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1142/c34a711a9ee57646.thumb.webp', 270, 360, '弹子石码头实景图 1', 'seed_5cities_v1'),
+    ('重庆', '弹子石老街', 'b7561573a2d65a45', 1, 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.mobile.webp', 400, 267, '弹子石老街实景图', 'seed_5cities_v1'),
+    ('重庆', '彼此的厨房EachotheR', '8cdadcac0f827f93', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/8cdadcac0f827f93.webp', 1280, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/8cdadcac0f827f93.mobile.webp', 768, 576, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/8cdadcac0f827f93.thumb.webp', 360, 270, '彼此的厨房EachotheR实景图 1', 'seed_5cities_v1'),
+    ('重庆', '彼此的厨房EachotheR', 'c1fcbca605d54bbb', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/c1fcbca605d54bbb.webp', 1280, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/c1fcbca605d54bbb.mobile.webp', 768, 576, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/c1fcbca605d54bbb.thumb.webp', 360, 270, '彼此的厨房EachotheR实景图 2', 'seed_5cities_v1'),
+    ('重庆', '彼此的厨房EachotheR', 'd3fb5cd1bd9b719a', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/d3fb5cd1bd9b719a.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/d3fb5cd1bd9b719a.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1144/d3fb5cd1bd9b719a.thumb.webp', 270, 360, '彼此的厨房EachotheR实景图 3', 'seed_5cities_v1'),
+    ('重庆', '戴家巷崖壁步道', '167786fd7c89839e', 1, 'https://assets.kakarot8.com/city-opt/chongqing/harrison-qi-E9dIbdSd7LU-unsplash.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/harrison-qi-E9dIbdSd7LU-unsplash.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/harrison-qi-E9dIbdSd7LU-unsplash.mobile.webp', 400, 267, '戴家巷崖壁步道实景图', 'seed_5cities_v1'),
+    ('重庆', '未命名书店', 'ba602b8316cba911', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1158/ba602b8316cba911.webp', 640, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1158/ba602b8316cba911.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1158/ba602b8316cba911.thumb.webp', 240, 360, '未命名书店实景图 1', 'seed_5cities_v1'),
+    ('重庆', '李子坝梁山鸡', '3438372d28661c1b', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1160/3438372d28661c1b.webp', 959, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1160/3438372d28661c1b.mobile.webp', 575, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1160/3438372d28661c1b.thumb.webp', 270, 360, '李子坝梁山鸡实景图 1', 'seed_5cities_v1'),
+    ('重庆', '李子坝梁山鸡', '4f90814b3bab28d0', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1160/4f90814b3bab28d0.webp', 1280, 720, 'https://assets.kakarot8.com/poi-opt/chongqing/1160/4f90814b3bab28d0.mobile.webp', 768, 432, 'https://assets.kakarot8.com/poi-opt/chongqing/1160/4f90814b3bab28d0.thumb.webp', 360, 203, '李子坝梁山鸡实景图 2', 'seed_5cities_v1'),
+    ('重庆', '李子坝轻轨穿楼', 'e3e91f699d17749e', 1, 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-RG2YD21o81E-unsplash.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-RG2YD21o81E-unsplash.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-RG2YD21o81E-unsplash.mobile.webp', 400, 267, '李子坝轻轨穿楼实景图', 'seed_5cities_v1'),
+    ('重庆', '杨记隆府(解放碑总店)', '87c400016b5bf9cf', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/87c400016b5bf9cf.webp', 1280, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/87c400016b5bf9cf.mobile.webp', 768, 576, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/87c400016b5bf9cf.thumb.webp', 360, 270, '杨记隆府(解放碑总店)实景图 1', 'seed_5cities_v1'),
+    ('重庆', '杨记隆府(解放碑总店)', '93460c2f4205ec3f', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/93460c2f4205ec3f.webp', 1280, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/93460c2f4205ec3f.mobile.webp', 768, 576, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/93460c2f4205ec3f.thumb.webp', 360, 270, '杨记隆府(解放碑总店)实景图 2', 'seed_5cities_v1'),
+    ('重庆', '杨记隆府(解放碑总店)', 'e40cbe415c204f72', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/e40cbe415c204f72.webp', 1280, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/e40cbe415c204f72.mobile.webp', 768, 576, 'https://assets.kakarot8.com/poi-opt/chongqing/1162/e40cbe415c204f72.thumb.webp', 360, 270, '杨记隆府(解放碑总店)实景图 3', 'seed_5cities_v1'),
+    ('重庆', '林中乐辣子鸡', 'dc3be8eac4d228f3', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1164/dc3be8eac4d228f3.webp', 640, 959, 'https://assets.kakarot8.com/poi-opt/chongqing/1164/dc3be8eac4d228f3.mobile.webp', 513, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1164/dc3be8eac4d228f3.thumb.webp', 240, 360, '林中乐辣子鸡实景图 1', 'seed_5cities_v1'),
+    ('重庆', '枣子岚垭正街', 'fcda4dde0eda6a5c', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1166/fcda4dde0eda6a5c.webp', 640, 1138, 'https://assets.kakarot8.com/poi-opt/chongqing/1166/fcda4dde0eda6a5c.mobile.webp', 432, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1166/fcda4dde0eda6a5c.thumb.webp', 202, 360, '枣子岚垭正街实景图 1', 'seed_5cities_v1'),
+    ('重庆', '栗栗梯', '161780b18fa55a16', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1168/161780b18fa55a16.webp', 640, 1138, 'https://assets.kakarot8.com/poi-opt/chongqing/1168/161780b18fa55a16.mobile.webp', 432, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1168/161780b18fa55a16.thumb.webp', 202, 360, '栗栗梯实景图 1', 'seed_5cities_v1'),
+    ('重庆', '沙坪坝', '5b29c4d5ba4e6a53', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1172/5b29c4d5ba4e6a53.webp', 971, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1172/5b29c4d5ba4e6a53.mobile.webp', 583, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1172/5b29c4d5ba4e6a53.thumb.webp', 273, 360, '沙坪坝实景图 1', 'seed_5cities_v1'),
+    ('重庆', '沙坪坝', 'd7114ea9f232d6a3', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1172/d7114ea9f232d6a3.webp', 968, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1172/d7114ea9f232d6a3.mobile.webp', 581, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1172/d7114ea9f232d6a3.thumb.webp', 272, 360, '沙坪坝实景图 2', 'seed_5cities_v1'),
+    ('重庆', '洪崖洞民俗风貌区', 'b4fc20b2ce8aec81', 1, 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.mobile.webp', 400, 267, '洪崖洞民俗风貌区实景图', 'seed_5cities_v1'),
+    ('重庆', '洪崖洞码头', '497e6d4ee5ec844a', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/497e6d4ee5ec844a.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/497e6d4ee5ec844a.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/497e6d4ee5ec844a.thumb.webp', 270, 360, '洪崖洞码头实景图 1', 'seed_5cities_v1'),
+    ('重庆', '洪崖洞码头', '542ba0e4e309076c', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/542ba0e4e309076c.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/542ba0e4e309076c.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/542ba0e4e309076c.thumb.webp', 270, 360, '洪崖洞码头实景图 2', 'seed_5cities_v1'),
+    ('重庆', '洪崖洞码头', 'f7ce51b2fa4ddee5', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/f7ce51b2fa4ddee5.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/f7ce51b2fa4ddee5.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1177/f7ce51b2fa4ddee5.thumb.webp', 270, 360, '洪崖洞码头实景图 3', 'seed_5cities_v1'),
+    ('重庆', '白象居', 'b465629edd823fb9', 1, 'https://assets.kakarot8.com/city-opt/chongqing/zhang-qc-EyScjFlzvtg-unsplash.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/zhang-qc-EyScjFlzvtg-unsplash.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/zhang-qc-EyScjFlzvtg-unsplash.mobile.webp', 400, 267, '白象居实景图', 'seed_5cities_v1'),
+    ('重庆', '磁器口古镇', '8f9e27e37de74128', 1, 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.mobile.webp', 400, 267, '磁器口古镇实景图', 'seed_5cities_v1'),
+    ('重庆', '磁器口后街', '1f131c7eaff15291', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1200/1f131c7eaff15291.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1200/1f131c7eaff15291.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1200/1f131c7eaff15291.thumb.webp', 270, 360, '磁器口后街实景图 1', 'seed_5cities_v1'),
+    ('重庆', '科苑旧书店', '5bfdb7d6e3d9242e', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1206/5bfdb7d6e3d9242e.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1206/5bfdb7d6e3d9242e.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1206/5bfdb7d6e3d9242e.thumb.webp', 270, 360, '科苑旧书店实景图 1', 'seed_5cities_v1'),
+    ('重庆', '科苑旧书店', '8bbda2d7b5860f7c', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1206/8bbda2d7b5860f7c.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1206/8bbda2d7b5860f7c.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1206/8bbda2d7b5860f7c.thumb.webp', 270, 360, '科苑旧书店实景图 2', 'seed_5cities_v1'),
+    ('重庆', '老君洞道观', 'ec840b188aaa340c', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1211/ec840b188aaa340c.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1211/ec840b188aaa340c.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1211/ec840b188aaa340c.thumb.webp', 270, 360, '老君洞道观实景图 1', 'seed_5cities_v1'),
+    ('重庆', '老甘家小龙虾江湖菜', '53128d60fcf0f7de', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1212/53128d60fcf0f7de.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1212/53128d60fcf0f7de.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1212/53128d60fcf0f7de.thumb.webp', 270, 360, '老甘家小龙虾江湖菜实景图 1', 'seed_5cities_v1'),
+    ('重庆', '老甘家小龙虾江湖菜', 'ef2ba58abb53d955', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1212/ef2ba58abb53d955.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1212/ef2ba58abb53d955.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1212/ef2ba58abb53d955.thumb.webp', 270, 360, '老甘家小龙虾江湖菜实景图 2', 'seed_5cities_v1'),
+    ('重庆', '苗师傅大饼', 'f4f53c6fdc3365ba', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1215/f4f53c6fdc3365ba.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1215/f4f53c6fdc3365ba.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1215/f4f53c6fdc3365ba.thumb.webp', 270, 360, '苗师傅大饼实景图 1', 'seed_5cities_v1'),
+    ('重庆', '虫洞古着（塔坪店）', '0b67019c534aa1af', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/0b67019c534aa1af.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/0b67019c534aa1af.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/0b67019c534aa1af.thumb.webp', 270, 360, '虫洞古着（塔坪店）实景图 1', 'seed_5cities_v1'),
+    ('重庆', '虫洞古着（塔坪店）', '6d1c8a0320ef085d', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/6d1c8a0320ef085d.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/6d1c8a0320ef085d.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/6d1c8a0320ef085d.thumb.webp', 270, 360, '虫洞古着（塔坪店）实景图 2', 'seed_5cities_v1'),
+    ('重庆', '虫洞古着（塔坪店）', 'bd047c5ab02570b8', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/bd047c5ab02570b8.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/bd047c5ab02570b8.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1220/bd047c5ab02570b8.thumb.webp', 270, 360, '虫洞古着（塔坪店）实景图 3', 'seed_5cities_v1'),
+    ('重庆', '解放碑步行街', 'd4df62ab91f654d9', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1224/d4df62ab91f654d9.webp', 640, 1137, 'https://assets.kakarot8.com/poi-opt/chongqing/1224/d4df62ab91f654d9.mobile.webp', 432, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1224/d4df62ab91f654d9.thumb.webp', 203, 360, '解放碑步行街实景图 1', 'seed_5cities_v1'),
+    ('重庆', '重庆中国三峡博物馆', '5cbc6370d8b8d0be', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1238/5cbc6370d8b8d0be.webp', 640, 480, 'https://assets.kakarot8.com/poi-opt/chongqing/1238/5cbc6370d8b8d0be.mobile.webp', 640, 480, 'https://assets.kakarot8.com/poi-opt/chongqing/1238/5cbc6370d8b8d0be.thumb.webp', 360, 270, '重庆中国三峡博物馆实景图 1', 'seed_5cities_v1'),
+    ('重庆', '重庆中国三峡博物馆', '902cbd4a28b1b6a5', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1238/902cbd4a28b1b6a5.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1238/902cbd4a28b1b6a5.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1238/902cbd4a28b1b6a5.thumb.webp', 270, 360, '重庆中国三峡博物馆实景图 2', 'seed_5cities_v1'),
+    ('重庆', '重庆之瞳', '6cf20e8c366c9a66', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1241/6cf20e8c366c9a66.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1241/6cf20e8c366c9a66.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1241/6cf20e8c366c9a66.thumb.webp', 270, 360, '重庆之瞳实景图 1', 'seed_5cities_v1'),
+    ('重庆', '重庆之瞳', 'e9b9d3536c62ae45', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1241/e9b9d3536c62ae45.webp', 960, 1280, 'https://assets.kakarot8.com/poi-opt/chongqing/1241/e9b9d3536c62ae45.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1241/e9b9d3536c62ae45.thumb.webp', 270, 360, '重庆之瞳实景图 2', 'seed_5cities_v1'),
+    ('重庆', '重庆光环购物公园', '575982145345b9e2', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1244/575982145345b9e2.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1244/575982145345b9e2.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1244/575982145345b9e2.thumb.webp', 270, 360, '重庆光环购物公园实景图 1', 'seed_5cities_v1'),
+    ('重庆', '重庆市人民大礼堂', '96d6380f2623c19b', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/96d6380f2623c19b.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/96d6380f2623c19b.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/96d6380f2623c19b.thumb.webp', 270, 360, '重庆市人民大礼堂实景图 1', 'seed_5cities_v1'),
+    ('重庆', '重庆市人民大礼堂', '994a84fcbeece5f8', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/994a84fcbeece5f8.webp', 640, 960, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/994a84fcbeece5f8.mobile.webp', 512, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/994a84fcbeece5f8.thumb.webp', 240, 360, '重庆市人民大礼堂实景图 2', 'seed_5cities_v1'),
+    ('重庆', '重庆市人民大礼堂', 'e10f93efd219ed82', 3, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/e10f93efd219ed82.webp', 640, 850, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/e10f93efd219ed82.mobile.webp', 578, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1249/e10f93efd219ed82.thumb.webp', 271, 360, '重庆市人民大礼堂实景图 3', 'seed_5cities_v1'),
+    ('重庆', '长嘉汇购物广场', '521eea7faae46ca0', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1275/521eea7faae46ca0.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1275/521eea7faae46ca0.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1275/521eea7faae46ca0.thumb.webp', 270, 360, '长嘉汇购物广场实景图 1', 'seed_5cities_v1'),
+    ('重庆', '长江索道', 'ec10d8b937769a5a', 1, 'https://assets.kakarot8.com/city-opt/chongqing/commons-12364263.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/commons-12364263.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/commons-12364263.mobile.webp', 400, 267, '长江索道实景图', 'seed_5cities_v1'),
+    ('重庆', '防空洞老火锅', '6f5a6f4a96834b2c', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1277/6f5a6f4a96834b2c.webp', 640, 854, 'https://assets.kakarot8.com/poi-opt/chongqing/1277/6f5a6f4a96834b2c.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1277/6f5a6f4a96834b2c.thumb.webp', 270, 360, '防空洞老火锅实景图 1', 'seed_5cities_v1'),
+    ('重庆', '防空洞老火锅', 'e067cf99b95f3631', 2, 'https://assets.kakarot8.com/poi-opt/chongqing/1277/e067cf99b95f3631.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1277/e067cf99b95f3631.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1277/e067cf99b95f3631.thumb.webp', 270, 360, '防空洞老火锅实景图 2', 'seed_5cities_v1'),
+    ('重庆', '雾都二宝火锅', 'a833ec28d6893154', 1, 'https://assets.kakarot8.com/poi-opt/chongqing/1278/a833ec28d6893154.webp', 640, 853, 'https://assets.kakarot8.com/poi-opt/chongqing/1278/a833ec28d6893154.mobile.webp', 576, 768, 'https://assets.kakarot8.com/poi-opt/chongqing/1278/a833ec28d6893154.thumb.webp', 270, 360, '雾都二宝火锅实景图 1', 'seed_5cities_v1'),
+    ('重庆', '鹅岭二厂文创公园', '3a1d413cde61610b', 1, 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.webp', 1600, 1067, 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.mobile.webp', 800, 533, 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.mobile.webp', 400, 267, '鹅岭二厂文创公园实景图', 'seed_5cities_v1')
+) AS img(city, place_name, asset_id, pos, d_url, d_w, d_h, m_url, m_w, m_h, t_url, t_w, t_h, alt_text, batch_id)
+  ON img.city = c.city AND img.place_name = c.canonical_name
 ON CONFLICT (place_id, position) DO UPDATE
-SET
+SET asset_id = EXCLUDED.asset_id,
     desktop_url = EXCLUDED.desktop_url,
     mobile_url = EXCLUDED.mobile_url,
     thumb_url = EXCLUDED.thumb_url,

@@ -336,6 +336,10 @@ export function ChinaMapExplorer({
                 src={coverPhoto}
                 alt={displayCity?.name || "城市"}
                 className="h-full w-full object-cover"
+                onError={(event) => {
+                  event.currentTarget.onerror = null;
+                  event.currentTarget.src = "/city-placeholder.svg";
+                }}
               />
               <span className="absolute bottom-0.5 right-0.5 rounded bg-black/60 px-1 py-0.2 font-mono text-[8px] font-bold text-white">
                 {displayCity?.iata || "N/A"}

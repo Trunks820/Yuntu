@@ -21,7 +21,7 @@ async def main() -> None:
     engine = create_async_engine(settings.database_url, echo=False)
 
     schema_file = SQL_DIR / "schema.sql"
-    seed_file = SQL_DIR / "seed_chongqing.sql"
+    seed_files = [SQL_DIR / "seed_chongqing.sql", SQL_DIR / "seed_cities.sql"]
 
     logger.info("Connecting to database: %s", settings.database_url)
 
@@ -44,13 +44,14 @@ async def main() -> None:
             logger.error("schema.sql not found at %s", schema_file)
             return
 
-        if seed_file.exists():
-            logger.info("Executing seed_chongqing.sql...")
-            seed_sql = seed_file.read_text(encoding="utf-8")
-            await driver.execute(seed_sql)
-            logger.info("Chongqing seed data imported successfully.")
-        else:
-            logger.warning("seed_chongqing.sql not found at %s", seed_file)
+        for seed_file in seed_files:
+            if seed_file.exists():
+                logger.info("Executing %s...", seed_file.name)
+                seed_sql = seed_file.read_text(encoding="utf-8")
+                await driver.execute(seed_sql)
+                logger.info("%s imported successfully.", seed_file.name)
+            else:
+                logger.warning("%s not found at %s", seed_file.name, seed_file)
 
     await engine.dispose()
     logger.info("Database initialization complete! You can now run: python -m scripts.trip")

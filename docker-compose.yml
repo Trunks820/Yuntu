@@ -13,6 +13,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./sql/seed_chongqing.sql:/docker-entrypoint-initdb.d/02_seed_chongqing.sql:ro
+      - ./sql/seed_cities.sql:/docker-entrypoint-initdb.d/03_seed_cities.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U yuntu -d yuntu_travel"]
       interval: 5s
