@@ -25,15 +25,21 @@ async def main() -> None:
 
     logger.info("Connecting to database: %s", settings.database_url)
 
-    async with engine.begin() as conn:
+    async with engine.connect() as conn:
         raw = await conn.get_raw_connection()
         driver = raw.driver_connection
         if schema_file.exists():
             logger.info("Executing schema.sql...")
             schema_sql = schema_file.read_text(encoding="utf-8")
-            # asyncpg prepare() cannot take multiple commands; execute() can.
-            await driver.execute(schema_sql)
-            logger.info("Schema created successfully.")
+            try:
+                # asyncpg prepare() cannot take multiple commands; execute() can.
+                await driver.execute(schema_sql)
+                logger.info("Schema created successfully.")
+            except Exception as exc:
+                if "DuplicateTable" in type(exc).__name__ or "already exists" in str(exc) or "已经存在" in str(exc):
+                    logger.info("Schema tables already exist; continuing to seed import.")
+                else:
+                    raise
         else:
             logger.error("schema.sql not found at %s", schema_file)
             return

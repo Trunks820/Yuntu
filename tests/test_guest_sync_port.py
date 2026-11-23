@@ -76,7 +76,7 @@ def test_lodging_without_sourced_price_has_no_invented_price():
 
 
 def test_public_open_source_routes_registered():
-    paths = {route.path for route in app.routes}
+    paths = {getattr(route, "path", None) for route in app.routes}
     assert "/destinations" in paths
     assert "/trip" in paths
     assert "/trip/async" in paths
@@ -96,7 +96,8 @@ def test_preferences_normalize_known_labels():
 def test_schema_sql_includes_plan_record_accommodation_columns():
     from pathlib import Path
 
-    schema_sql = (Path(__file__).resolve().parent.parent / "sql" / "schema.sql").read_text(encoding="utf-8")
+    sql_dir = Path(__file__).resolve().parent.parent / "sql"
+    schema_sql = (sql_dir / "schema.sql").read_text(encoding="utf-8")
     for col in (
         "accommodation_name",
         "accommodation_lat",
@@ -105,6 +106,10 @@ def test_schema_sql_includes_plan_record_accommodation_columns():
         "travel_canonical_place_opening_schedule",
     ):
         assert col in schema_sql
+
+    seed_sql = (sql_dir / "seed_chongqing.sql").read_text(encoding="utf-8")
+    assert "INSERT INTO travel_place_summary" in seed_sql
+    assert "INSERT INTO travel_canonical_place_image" in seed_sql
 
 
 def test_legacy_model_names_and_workflow_policy_default(monkeypatch):

@@ -61,4 +61,152 @@ INSERT INTO travel_canonical_place (
 ('九街/观音桥夜市', '重庆', '江北区', '江北区北城天街', '500105', 29.578129, 106.538124, 'B0FFH7P2L9', 'market', '["年轻潮流", "夜生活", "酒吧街", "地道小吃"]'::jsonb, 90, 'manual', 'official', 'trusted', 'auto_accepted', TRUE, FALSE, 'resolved', 88)
 ON CONFLICT DO NOTHING;
 
+-- 4. 同步标准化地点表 (travel_place) 与聚合摘要表 (travel_place_summary)
+INSERT INTO travel_place (
+    city, name, normalized_name, place_type, address, longitude, latitude, tags
+)
+SELECT
+    c.city,
+    c.canonical_name,
+    LOWER(REGEXP_REPLACE(c.canonical_name, '\s+', '', 'g')),
+    CASE
+        WHEN c.place_type IN ('attraction', 'restaurant', 'business_area', 'market', 'park', 'museum', 'photo_spot', 'hotel', 'other')
+        THEN c.place_type
+        WHEN c.place_type = 'accommodation_area' THEN 'business_area'
+        ELSE 'other'
+    END,
+    c.address,
+    ROUND(c.longitude::numeric, 7),
+    ROUND(c.latitude::numeric, 7),
+    c.category_tags
+FROM travel_canonical_place AS c
+WHERE c.city = '重庆'
+ON CONFLICT (city, normalized_name) DO UPDATE
+SET
+    address = EXCLUDED.address,
+    longitude = EXCLUDED.longitude,
+    latitude = EXCLUDED.latitude,
+    tags = EXCLUDED.tags;
+
+INSERT INTO travel_place_summary (
+    place_id, canonical_place_id, city, name, place_type, address, longitude, latitude,
+    tags, mention_count_30d, positive_count_30d, negative_count_30d, source_count,
+    latest_captured_time, rating, top_reasons, warnings, hot_score, quality_score, recommend_score
+)
+SELECT
+    p.id AS place_id,
+    c.place_id AS canonical_place_id,
+    c.city,
+    c.canonical_name AS name,
+    p.place_type,
+    c.address,
+    p.longitude,
+    p.latitude,
+    c.category_tags AS tags,
+    GREATEST(12, c.base_priority - 40) AS mention_count_30d,
+    GREATEST(10, c.base_priority - 45) AS positive_count_30d,
+    1 AS negative_count_30d,
+    4 AS source_count,
+    NOW() AS latest_captured_time,
+    4.7 AS rating,
+    CASE c.canonical_name
+        WHEN '洪崖洞民俗风貌区' THEN '[{"reason": "依山就势的巴渝吊脚楼建筑群，傍晚亮灯后临江立面与千厮门大桥同框夜景极具辨识度"}, {"reason": "建议从11楼沧白路或1楼嘉陵江滨江路错峰观景"}]'::jsonb
+        WHEN '解放碑步行街' THEN '[{"reason": "重庆母城核心地标与商业街区，去八一好吃街、十八梯和洪崖洞步行皆可串联"}]'::jsonb
+        WHEN '长江索道' THEN '[{"reason": "横跨长江的空中交通体验，轿厢内可俯瞰渝中半岛与南岸江景"}, {"reason": "新华路北站排队较长时，可从上新街南站反向乘坐"}]'::jsonb
+        WHEN '山城步道' THEN '[{"reason": "沿崖壁修筑的老城石阶步道，串联仁爱堂旧址与临江栈道，适合慢走看江景"}]'::jsonb
+        WHEN '十八梯传统风貌区' THEN '[{"reason": "连接上下半城的传统石阶老街，保留了山城吊脚楼与街巷肌理"}]'::jsonb
+        WHEN '李子坝轻轨穿楼' THEN '[{"reason": "单轨2号线列车穿过居民楼的立体交通景观，楼下设专门观景平台"}]'::jsonb
+        WHEN '戴家巷崖壁步道' THEN '[{"reason": "紧邻洪崖洞的临江悬崖栈道，老城墙与江畔咖啡小店氛围松弛"}]'::jsonb
+        WHEN '白象居' THEN '[{"reason": "24层无电梯老式山城居民楼，可拍到长江索道与东水门大桥同框画面"}]'::jsonb
+        WHEN '湖广会馆' THEN '[{"reason": "临江明清古建筑群，黄色封火墙与戏楼雕花保存完好，展现湖广填四川移民历史"}]'::jsonb
+        WHEN '重庆中国三峡博物馆' THEN '[{"reason": "馆藏壮丽三峡、远古巴渝与城市变迁文物，与人民大礼堂隔广场相望"}]'::jsonb
+        WHEN '重庆市人民大礼堂' THEN '[{"reason": "传统宫殿式穹顶建筑代表，广场开阔适合拍摄对称建筑外观"}]'::jsonb
+        WHEN '罗汉寺' THEN '[{"reason": "闹市高楼环抱中的宋代古刹，古摩崖佛像与现代都市反差鲜明"}]'::jsonb
+        WHEN '八一好吃街' THEN '[{"reason": "解放碑旁人气小吃街，汇集酸辣粉、山城小汤圆、烤脑花等街头小吃"}]'::jsonb
+        WHEN '大井巷社区火锅' THEN '[{"reason": "藏在老居民楼下的地道重庆牛油老火锅，锅底醇厚、市井烟火气足"}]'::jsonb
+        WHEN '杨记隆府(解放碑总店)' THEN '[{"reason": "重庆代表性江湖菜馆，招牌辣子鸡、毛血旺分量扎实，适合多人聚餐"}]'::jsonb
+        WHEN '磁器口古镇' THEN '[{"reason": "嘉陵江畔千年水陆码头古镇，青石板路两侧汇集陈麻花与传统茶铺"}]'::jsonb
+        WHEN '渣滓洞/白公馆' THEN '[{"reason": "歌乐山麓近代历史旧址，林木幽深，适合结合红色历史慢步参观"}]'::jsonb
+        WHEN '鹅岭二厂文创公园' THEN '[{"reason": "印钞老厂房改造的工业风文创园，山顶天台可俯瞰两江风光"}]'::jsonb
+        WHEN '交通茶馆' THEN '[{"reason": "保留上世纪老重庆风貌的老茶馆，木桌长凳配盖碗茶极具年代感"}]'::jsonb
+        WHEN '黄桷坪涂鸦艺术街' THEN '[{"reason": "川美老校区周边整条街楼宇绘满彩绘涂鸦，与交通茶馆相邻适合顺路打卡"}]'::jsonb
+        WHEN '弹子石老街' THEN '[{"reason": "南岸临江坡地老街，傍晚在观景台可正面观赏朝天门两江交汇夜景"}]'::jsonb
+        WHEN '南山一棵树观景台' THEN '[{"reason": "南山半山腰经典观景平台，视野开阔，可俯瞰渝中半岛万家灯火"}]'::jsonb
+        WHEN '九街/观音桥夜市' THEN '[{"reason": "江北核心夜生活与美食街区，夜间餐饮与小酒馆热闹非凡"}]'::jsonb
+        ELSE '[{"reason": "重庆本地热门打卡与顺路游览地点"}]'::jsonb
+    END AS top_reasons,
+    CASE c.canonical_name
+        WHEN '洪崖洞民俗风貌区' THEN '[{"warning": "节假日夜间19:30-21:30人流密集，注意错峰出行"}]'::jsonb
+        WHEN '长江索道' THEN '[{"warning": "旺季排队时间较长，建议提前关注现场候乘提示"}]'::jsonb
+        WHEN '山城步道' THEN '[{"warning": "全程台阶较多，建议穿舒适防滑平底鞋"}]'::jsonb
+        ELSE '[]'::jsonb
+    END AS warnings,
+    c.base_priority::numeric AS hot_score,
+    8.8 AS quality_score,
+    9.0 AS recommend_score
+FROM travel_canonical_place AS c
+JOIN travel_place AS p
+  ON p.city = c.city
+ AND p.normalized_name = LOWER(REGEXP_REPLACE(c.canonical_name, '\s+', '', 'g'))
+WHERE c.city = '重庆'
+  AND c.contextual_only = FALSE
+ON CONFLICT (place_id) DO UPDATE
+SET
+    canonical_place_id = EXCLUDED.canonical_place_id,
+    top_reasons = EXCLUDED.top_reasons,
+    warnings = EXCLUDED.warnings,
+    mention_count_30d = EXCLUDED.mention_count_30d,
+    source_count = EXCLUDED.source_count,
+    recommend_score = EXCLUDED.recommend_score;
+
+-- 5. 灵感图鉴与地点详情图集 (travel_canonical_place_image)
+INSERT INTO travel_canonical_place_image (
+    place_id, asset_id, position,
+    desktop_url, desktop_width, desktop_height,
+    mobile_url, mobile_width, mobile_height,
+    thumb_url, thumb_width, thumb_height,
+    alt_text, active, import_batch_id
+)
+SELECT
+    c.place_id,
+    SUBSTRING(MD5('seed-cq-img-' || c.canonical_name) FROM 1 FOR 16) AS asset_id,
+    1 AS position,
+    img.url AS desktop_url,
+    1600 AS desktop_width,
+    1067 AS desktop_height,
+    REPLACE(img.url, '.webp', '.mobile.webp') AS mobile_url,
+    800 AS mobile_width,
+    533 AS mobile_height,
+    REPLACE(img.url, '.webp', '.mobile.webp') AS thumb_url,
+    400 AS thumb_width,
+    267 AS thumb_height,
+    c.canonical_name || '实景图' AS alt_text,
+    TRUE AS active,
+    'seed_chongqing_v1' AS import_batch_id
+FROM travel_canonical_place AS c
+JOIN (
+    VALUES
+        ('洪崖洞民俗风貌区', 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.webp'),
+        ('解放碑步行街', 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.webp'),
+        ('长江索道', 'https://assets.kakarot8.com/city-opt/chongqing/commons-12364263.webp'),
+        ('山城步道', 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.webp'),
+        ('十八梯传统风貌区', 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.webp'),
+        ('李子坝轻轨穿楼', 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-RG2YD21o81E-unsplash.webp'),
+        ('戴家巷崖壁步道', 'https://assets.kakarot8.com/city-opt/chongqing/harrison-qi-E9dIbdSd7LU-unsplash.webp'),
+        ('白象居', 'https://assets.kakarot8.com/city-opt/chongqing/zhang-qc-EyScjFlzvtg-unsplash.webp'),
+        ('弹子石老街', 'https://assets.kakarot8.com/city-opt/chongqing/commons-77016559.webp'),
+        ('南山一棵树观景台', 'https://assets.kakarot8.com/city-opt/chongqing/commons-58923778.webp'),
+        ('鹅岭二厂文创公园', 'https://assets.kakarot8.com/city-opt/chongqing/andrea-sun-pMnpZayQJFE-unsplash.webp'),
+        ('磁器口古镇', 'https://assets.kakarot8.com/city-opt/chongqing/albert-canite-vMM4_VA8ogw-unsplash.webp')
+) AS img(place_name, url)
+  ON img.place_name = c.canonical_name
+WHERE c.city = '重庆'
+ON CONFLICT (place_id, position) DO UPDATE
+SET
+    desktop_url = EXCLUDED.desktop_url,
+    mobile_url = EXCLUDED.mobile_url,
+    thumb_url = EXCLUDED.thumb_url,
+    alt_text = EXCLUDED.alt_text,
+    active = TRUE;
+
 COMMIT;

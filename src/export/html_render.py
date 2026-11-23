@@ -38,15 +38,32 @@ def html_document(title: str, css: str, body: str) -> str:
 </html>"""
 
 
+def _launch_export_browser(playwright):
+    common_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--enable-logging=stderr",
+        "--log-level=3",
+    ]
+    try:
+        return playwright.chromium.launch(
+            channel="chromium",
+            args=common_args,
+            timeout=_BROWSER_TIMEOUT_MS,
+        )
+    except Exception:
+        return playwright.chromium.launch(
+            args=common_args,
+            timeout=_BROWSER_TIMEOUT_MS,
+        )
+
+
 @contextmanager
 def _export_page(html: str, *, width: int, media: str):
     # Playwright's synchronous objects belong to the calling worker thread.
     with sync_playwright() as playwright:
-        with playwright.chromium.launch(
-            channel="chromium",
-            args=["--no-sandbox", "--enable-logging=stderr", "--log-level=3"],
-            timeout=_BROWSER_TIMEOUT_MS,
-        ) as browser:
+        with _launch_export_browser(playwright) as browser:
             page = browser.new_page(
                 viewport={"width": width, "height": 960},
                 device_scale_factor=1,

@@ -2,9 +2,9 @@
 
 # 🧭 Yuntu (云图旅行)
 
-**AI 旅行规划引擎源码 · 确定性路线排程 + 时间轴可行性校验 + 事实约束路书生成**
+**AI 旅行规划开源系统 · 真实地点选点 + 顺路时间表 + 事实受控的路书生成**
 
-在线完整体验：**[kakarot8.com](https://kakarot8.com)**（账号体系、16+ 热门城市、完整规划与云端同步能力）
+在线完整体验：**[kakarot8.com](https://kakarot8.com)**（支持账号云同步、27 座热门旅行城市、完整规划与导出能力）
 
 [![Live Demo](https://img.shields.io/badge/Live-kakarot8.com-0f766e.svg?style=flat-square)](https://kakarot8.com)
 [![Author: Trunks820](https://img.shields.io/badge/Author-Trunks820-orange.svg?style=flat-square&logo=github)](https://github.com/Trunks820)
@@ -17,102 +17,95 @@
 
 <br/>
 
-<img src="docs/screenshots/home.jpg" alt="云图首页：重庆行程规划入口" width="100%" />
+<img src="docs/screenshots/home.jpg" alt="云图首页：四步启程与画面灵感" width="100%" />
 
 <p>
-  <img src="docs/screenshots/plan.jpg" alt="云图行程详情：重庆三日街区漫步" width="100%" />
+  <img src="docs/screenshots/plan.jpg" alt="云图旅行册：地图路线连线与每日行程长卷" width="100%" />
 </p>
 
 </div>
 
 ---
 
-## 🌟 为什么选择 Yuntu？
+## 🌟 为什么做 Yuntu？
 
-市面上的大多数“AI 旅行规划”应用往往存在三大硬伤：
-- **地点幻觉**：编造已经倒闭或根本不存在的餐厅、打卡点。
-- **路线荒谬**：同一天内让游客在城市东西两头来回折返，或忽略场馆闭馆日与夜间营业窗口。
-- **价格与时间瞎编**：随口捏造门票价格、酒店房价和通勤耗时。
+很多人用大模型做旅行攻略，经常踩这三个坑：
+- **瞎编地点**：推荐早就关门的餐厅，甚至根本不存在的景点。
+- **路线折腾**：一天之内让你在城市东西两头来回跑四趟，或者去了才发现当天闭馆。
+- **价格乱报**：随口编造门票、酒店房价和路上的通勤时间。
 
-**Yuntu 采用“确定性核心 + 创造性外围”的生产级架构（已同步至 v0.15.4 内核）**：
-- **纯 SQL 真实地点池**：地点、经纬度、营业时间表（`opening_schedule`）与商圈归属全部来自本地 PostgreSQL 权威库，**绝不交由 LLM 凭空捏造 POI**。
-- **两段式选点与空间时间轴排程（Selector + Route Planner）**：
-  - 先基于出行偏好（美食、夜景、自然、历史人文、亲子等）与必去点（`must_include`）做候选池配额选点；
-  - 再结合高德真实路网耗时、营业时间窗口、午休/晚归节奏预算与同区聚类，排出精确到分钟的每日时间轴（`planned_time_ranges`），并在异常时自动回退到确定性排程兜底（`scheduled_fallback`）。
-- **住宿商圈自动推导（Accommodation Resolver）**：根据每日核心 POI 空间重心推导通勤最省时的落脚片区（如解放碑一带），严禁无凭据编造具体酒店品牌或房价。
-- **版式蓝图与双轨路书（Composition Blueprint + Article Writer）**：LLM 仅在“结构化事实载荷（Structured Evidence Payload）”与片段注册表（`poi_fragments`）约束下撰写连贯游记或精炼基础版路书；开头偏好兑现说明与最终排期表严格对账。
-- **行前准备与费用估算（Pre-trip Advice + Cost Estimate）**：结合出行季节、目的地地形特性、跨城交通参考与本地门票/餐饮消费基准，自动生成打包清单与预算区间。
-- **发布门禁（Publish Gate）**：确定性代码复核路线顺序、必去点兑现率、营业冲突与价格声明，违规片段自动触发局部修复（Targeted Repair）或安全渲染器（`SafePlanRenderer`）兜底。
+**Yuntu 的做法很实在：把“查地点、算路线、卡时间”交给确定的程序，只让大模型根据查好的事实写路书**：
+- **地点只从真实数据库里挑**：所有景点、餐厅、经纬度和营业时间都存在本地 PostgreSQL 里，**绝不让大模型凭空编地点**。
+- **路线顺路、时间表精确到分钟**：结合高德真实路网耗时、场馆开放时间、午休窗口与夜间时段，先把每天去哪、几点到几点、路上花多少分钟算清楚；万一模型排线超时，也有本地算法兜底排出一份顺路行程。
+- **自动推荐住哪一片最省时**：根据每天要去的核心景点位置，算出通勤最方便的住宿商圈（比如“建议住在解放碑附近”），不乱编具体酒店名字和价格。
+- **行前准备与花费参考**：结合出行季节、天气、跨城交通与当地消费水平，自动整理好必带物品清单、避坑提醒和费用估算。
+- **出稿前先对账**：生成完路书后，程序会逐条核对景点顺序、必去点有没有漏、正餐和夜景有没有兑现，发现对不上的地方自动修正。
 
 ---
 
-## ✨ 前端与交互亮点 (`web/`)
+## ✨ 界面与体验亮点
 
-- **桌面端旅行册（Spread Book 全面接管）**：
-  - **四步启程页**：目的地选择、天数与作息节奏、偏好标签与灵感选点、必去项确认一气呵成，砍掉冗余旧版入口。
-  - **城市灵感图鉴抽屉（POI Inspiration Drawer）**：出发前即可按分类浏览目的地真实高赞地点、入选理由与避坑提示，一键加入“必去清单”。
-  - **装订等待与双页路书**：实时 SSE 进度透出；生成后以左右双页路书呈现每日时间轴、高德动态连线地图、住宿片区建议、行前准备与费用明细。
-- **移动端渐进式探索流**：针对触屏打磨的卡片式引导与单手抽屉交互。
-- **免登录开箱即用 + 浏览器本地行程库**：开源版前端全面去登录化，生成的行程自动持久化在浏览器 `localStorage`（“我的行程”），克隆仓库跑起来即可完整体验创建、查看、重命名、删除与 PDF/长图导出。
+- **桌面端“摊开的旅行册”**：
+  - **四步出发**：挑心动画面 → 定旅行节奏 → 选目的地 → 定天数与同行人，一步只问一件事。
+  - **灵感图鉴与必去清单**：出发前可以浏览目的地的真实景点照片、推荐理由和避坑提醒，遇到想去的一键加进“必去清单”。
+  - **地图画布配每日长卷**：生成好的攻略直接铺在地图上，左上角看整趟概要，底部长卷按天展示每一站的时段、亮点和站间交通；点右上角还能展开完整游记攻略、出发前准备、交通住宿和费用明细。
+- **手机端卡片探索流**：针对手机单手操作专门设计的滑动选点与路书阅读界面。
+- **免登录、本地直接存行程**：开源版去掉了登录门槛，生成的行程自动保存在浏览器本地（“我的行程”），拉下代码跑起来就能完整体验生成、查看、导出 A5 旅行册 PDF 和分享长图。
 
 ---
 
-## 🏗️ 核心架构流程
+## 🏗️ 一份攻略是怎么生成的？
 
 ```text
-用户请求 (自然语言 / 旅行册四步表单 / 灵感必去点)
+用户提交出行想法 (四步表单 / 自然语言 / 必去地点)
   │
   ▼
-[ 1. 意图解析 (Intent Parser) ]
-  解析目的地、天数、偏好维度、必去 POI、每日起止时间与午休窗口
+1. 读懂需求
+   拆解目的地、玩几天、同行人数、偏好（美食/夜景/人文等）与作息时间
   │
   ▼
-[ 2. 权威地点召回与候选选点 (SQL Retrieval + Candidate Selector) ]
-  从 PostgreSQL 检索真实 POI + 营业时间表，按偏好配额与空间覆盖筛选候选池
+2. 从数据库挑候选地点
+   从本地 PostgreSQL 取出真实景点与地道餐厅，附上网友推荐理由与营业时间
   │
   ▼
-[ 3. 住宿商圈锚定 (Accommodation Resolver · 空间重心算法) ]
-  推导到各日核心景点通勤最省时的住宿商圈 (支持用户指定或自动推荐)
+3. 算好住哪一片最方便
+   根据候选景点的位置重心，算出往返最省时间的住宿商圈
   │
   ▼
-[ 4. 路线排程与时间轴校验 (Route Planner + Timeline Scheduler) ]
-  结合高德通勤矩阵、场馆开放窗口与夜间时段，生成每日顺序与精确到分钟的时间轴
+4. 排定每日顺路路线与时间表
+   结合高德通勤耗时与场馆开放窗口，排好每天的游览顺序与到站时段
   │
   ▼
-[ 5. 偏好对账与版式蓝图 (Preference Notices + Composition Blueprint) ]
-  对账必去点、夜景、美食正餐兑现情况，构建每日叙事蓝图与行前准备/费用载荷
+5. 核对偏好并整理行前清单
+   检查必去点、夜景、正餐有没有排上，同步生成天气提醒、打包清单与费用参考
   │
   ▼
-[ 6. 路书生成与局部修复 (Article Writer + Targeted Repair) ]
-  在严格事实载荷约束下生成游记式路书，自动注入住宿建议与偏好说明
-  │
-  ▼
-[ 7. 发布门禁复核 (Publish Gate + SafePlanRenderer 兜底) ]
-  校验地点顺序、事实一致性与价格禁令，输出最终结构化路书与 POI 片段
+6. 撰写路书并做最终检查
+   基于排好的路线和真实资料写出每日游记攻略，检查无误后交付页面与 PDF/长图导出
 ```
 
 ---
 
-## 📦 开源范围与说明
+## 📦 开源说明
 
-想直接用完整线上能力，打开 **[https://kakarot8.com](https://kakarot8.com)**（含账号云同步、16+ 热门城市完整数据库与线上集群配置）。
+如果你想直接体验完整功能，可以访问线上站 **[https://kakarot8.com](https://kakarot8.com)**（线上版目前已开放 **27 座热门旅行城市**，支持账号登录与云端同步）。
 
-本仓库提供**规划引擎后端与配套前端的完整源码**，方便本地自建、架构研究与二次开发。本地运行前需准备：
+这个仓库包含**规划引擎后端和前端界面的完整源码**，方便你在本地运行、研究架构或二次开发。本地跑起来需要准备：
 
 - Python 3.11+、Node.js 20+、PostgreSQL 16+
-- 大模型 API Key（推荐单配一个 **DeepSeek** 或 **Google Gemini** Key 即可跑通全链路，也支持按角色混配）
-- 高德开放平台 Key（后端算路需 **Web 服务 Key**；前端展示地图另需 **Web 端 JS API Key**）
+- 大模型 API Key（配一个 **DeepSeek** 或 **Google Gemini** 的 Key 就能跑通全部环节；不配 Key 也能走本地基础路线生成一份可用行程）
+- 高德开放平台 Key（可选：后端算真实通勤需要 **Web 服务 Key**；前端显示互动地图需要 **Web 端 JS API Key**）
 
 > [!NOTE]
-> **为什么开源种子库默认只内置了【重庆】？**
-> 本仓库聚焦展示**生产级 AI 旅行规划引擎的架构与全链路代码实现**。为降低本地自建门槛，`sql/seed_chongqing.sql` 仅内置了**重庆**核心经过验证的真实 POI、经纬度与摘要数据，前端也默认聚焦重庆以免因缺少其他城市数据而报错。
-> 如需扩展其他城市（如成都、西安、北京、上海等），只需往 `travel_canonical_place` / `travel_place_summary` 导入对应城市数据，并在 [`src/api/destinations.py`](src/api/destinations.py) 中放开对应城市即可。
+> **为什么开源仓库默认只带了【重庆】的数据？**
+> 线上站已有 **27 座城市**，但为了让大家克隆仓库后不用下载庞大的全国数据库就能跑通全流程，`sql/seed_chongqing.sql` 里默认内置了**重庆**的 27 个精选景点/餐厅坐标、推荐理由摘要和实景配图，前端也默认聚焦重庆。
+> 如果你想自己加别的城市（比如成都、西安、北京等），只要把对应城市的地点导入 `travel_canonical_place` 和 `travel_place_summary` 表，再在 [`src/api/destinations.py`](src/api/destinations.py) 里加上这座城市就行。
 
 ---
 
-## 🛠️ 本地快速启动
+## 🛠️ 本地运行步骤
 
-先克隆仓库并准备环境变量：
+先克隆代码并复制配置文件：
 
 ```bash
 git clone https://github.com/Trunks820/Yuntu.git
@@ -124,7 +117,16 @@ cp .env.example .env
 
 ```bash
 pip install -r requirements.txt
+
+# 安装用于导出 A5 旅行册 PDF 和分享长图的无头浏览器（带系统依赖与中文字体）
+playwright install --with-deps chromium
+# 如果在云服务器上碰到默认下载源 403 或偏慢，可换国内镜像再装：
+# PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright playwright install --with-deps chromium
+
+# 初始化数据库表并导入重庆种子数据（含地点、推荐摘要与图鉴配图）
 python -m scripts.init_db
+
+# 启动后端服务
 python -m uvicorn src.api.app:app --host 127.0.0.1 --port 6666 --reload
 ```
 
@@ -132,32 +134,32 @@ python -m uvicorn src.api.app:app --host 127.0.0.1 --port 6666 --reload
 
 ```bash
 cd web
-cp .env.example .env.development   # 按需填入 VITE_AMAP_KEY 与 VITE_AMAP_SECURITY_JS_CODE
+cp .env.example .env.development   # 如需前端显示高德底图，在里面填入 VITE_AMAP_KEY 和 VITE_AMAP_SECURITY
 npm install
 npm run dev
 ```
 
-> **安全提醒**：`docker-compose.yml` 与 `.env.example` 中的 `yuntu` / `yuntupassword` 仅供本地开发演示，且后端默认仅放行本机 IP；若需容器化或暴露至公网，请务必修改数据库口令并收紧网关鉴权。
+> **安全提醒**：`docker-compose.yml` 和 `.env.example` 里的 `yuntu` / `yuntupassword` 只是本地演示密码，而且后端默认只允许本机 IP 访问；如果要部署到公网，请记得改掉数据库密码并收紧访问权限。
 
 ---
 
 ## ⚙️ 模型与环境配置 (`.env`)
 
-Yuntu 内置了**单 Key 自动路由降级机制**：你只需要配置**任意一家**全局 API Key（如 `DEEPSEEK_API_KEY` 或 `GEMINI_API_KEY`），系统会自动将意图解析（`intent`）、选点（`selector`）、排线（`route_planner`）、撰写（`writer`）与修复（`repair`）全部路由到该 Key 对应的可用模型上，无需逐个填写。
+不用同时配好几家模型！你只需要在 `.env` 里填**任意一个**大模型 Key（推荐 `DEEPSEEK_API_KEY` 或 `GEMINI_API_KEY`），系统就会自动用这把 Key 跑完解析、选点、排线和写路书所有环节。
 
-完整配置项见 [`.env.example`](.env.example)，最简配置如下：
+完整配置项可看 [`.env.example`](.env.example)，平时最常用的就这几项：
 
 ```env
-# 数据库连接（本地演示账号，生产环境请修改）
+# 数据库连接（本地演示账号，上生产请修改）
 DATABASE_URL=postgresql+asyncpg://yuntu:yuntupassword@localhost:5432/yuntu_travel
 
-# 方式 A：单 Key 快速启动 — DeepSeek（推荐，性价比高且稳定）
+# 方式 A：只配 DeepSeek（推荐，便宜稳定）
 DEEPSEEK_API_KEY=your_deepseek_api_key
 
-# 方式 B：单 Key 快速启动 — Google Gemini（默认路由至 gemini-3.8-flash）
+# 方式 B：只配 Google Gemini（默认使用 gemini-3.8-flash）
 # GEMINI_API_KEY=your_gemini_api_key
 
-# 方式 C：按角色混用不同模型 / OpenAI 兼容网关（可选，不填则自动复用全局 Key）
+# 方式 C：不同环节混用不同模型（可选，不填就自动复用上面的全局 Key）
 # ROUTE_PLANNER_PROVIDER=gemini
 # ROUTE_PLANNER_MODEL=gemini-3.8-flash
 # ROUTE_PLANNER_API_KEY=your_gemini_key
@@ -165,78 +167,78 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 # WRITER_MODEL=deepseek-chat
 # WRITER_API_KEY=your_deepseek_key
 
-# 地理与路线服务（高德 Web 服务 Key）
+# 高德 Web 服务 Key（用于计算景点之间的真实交通时间）
 AMAP_API_KEY=your_amap_api_key
 AMAP_ROUTE_ENABLED=true
 ```
 
 ---
 
-## 📡 核心 API 端点
+## 📡 常用 API 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/destinations` | 获取当前启用的目的地城市列表与元数据 |
-| `GET` | `/trip/poi-inspiration` | 获取城市灵感图鉴 POI 列表（支持分类筛选与精选推荐） |
-| `GET` | `/trip/poi-inspiration/cities` | 获取支持灵感图鉴的城市概览 |
-| `GET` | `/trip/poi-catalog` | 获取规划选点目录与必去点检索 |
-| `POST` | `/trip/poi-catalog/selection` | 校验并解析用户勾选的必去地点集合 |
-| `POST` | `/trip/async` | **主生产入口**：提交异步旅行规划任务，返回 `job_id` |
-| `GET` | `/trip/jobs/{job_id}` | 轮询异步任务状态与阶段进度 |
-| `GET` | `/trip/jobs/{job_id}/stream` | SSE 流式实时推送规划阶段进度与最终结果 |
-| `GET` | `/trip/results/{result_id}` | 获取完整结构化路书（含每日时间轴、POI 片段、住宿建议、行前准备与费用估算） |
-| `POST` | `/trip` | 同步调试入口（直接调用规划工作流） |
+| `GET` | `/destinations` | 获取当前开放的目的地城市列表 |
+| `GET` | `/trip/poi-inspiration` | 获取城市的灵感图鉴地点与实景图集 |
+| `GET` | `/trip/poi-inspiration/cities` | 获取支持灵感图鉴的城市及地点数量 |
+| `GET` | `/trip/poi-catalog` | 搜索和浏览城市的可选必去地点目录 |
+| `GET` | `/trip/poi-catalog/selection` | 校验用户勾选的必去地点 |
+| `POST` | `/trip/async` | **主入口**：提交异步规划任务，返回 `job_id`（没配模型 Key 时也能降级生成基础行程） |
+| `GET` | `/trip/jobs/{job_id}` | 查询规划任务的当前状态与进度 |
+| `GET` | `/trip/jobs/{job_id}/stream` | 实时推送规划进度的 SSE 流接口 |
+| `GET` | `/trip/results/{result_id}` | 获取生成好的完整路书（含每日路线、时段、住宿建议、行前清单和费用估算） |
+| `POST` | `/trip` | 命令行/调试用的同步生成接口（需要配置好大模型 Key） |
 
 ---
 
-## 📂 项目结构
+## 📂 目录结构
 
 ```text
 Yuntu/
-├── web/                     # 🎨 前端工程 (React 18 + TypeScript + TailwindCSS + Vite)
+├── web/                     # 🎨 前端界面 (React 18 + TypeScript + TailwindCSS + Vite)
 │   ├── src/
-│   │   ├── components/      # 旅行册双页路书、灵感图鉴抽屉、高德地图联动、行前与费用卡片
-│   │   ├── pages/           # 桌面 SpreadStartPage 四步启程、装订等待、路书详情、移动端视图
-│   │   └── utils/           # 浏览器本地行程存储 (guestTripHistory)、必去点与偏好工具
-│   └── Dockerfile           # 前端 Nginx 容器构建文件
-├── src/                     # ⚙️ 核心规划引擎与 FastAPI 服务
-│   ├── agents/              # 意图解析、选点、空间排程、住宿推导、偏好对账、文案撰写与门禁复核
-│   ├── api/                 # FastAPI 路由（异步任务、灵感图鉴、选点目录、结果查询与导出）
-│   ├── cost_estimate/       # 行程费用区间估算引擎
-│   ├── cost_reference/      # 城市门票、餐饮与交通参考基准
-│   ├── db/                  # SQLAlchemy 异步模型与查询层
-│   ├── export/              # PDF 与长图渲染导出引擎
+│   │   ├── components/      # 顶部栏、分享弹窗、行前建议与费用卡片等公共组件
+│   │   ├── pages/           # 四步出发页 (start)、装订等待页 (planning)、旅行册画布 (book)、本地我的行程 (history) 及手机端页面
+│   │   └── utils/           # 浏览器本地行程存储 (guestTripHistory) 与排期格式化工具
+│   └── Dockerfile           # 前端容器构建文件
+├── src/                     # ⚙️ 后端规划引擎与 API 服务
+│   ├── agents/              # 需求解析、选点、路线时间表排程、住宿推荐、路书撰写与质量检查
+│   ├── api/                 # FastAPI 路由接口（异步任务、灵感图鉴、地点目录、结果与导出）
+│   ├── cost_estimate/       # 旅行花费估算模块
+│   ├── cost_reference/      # 城市门票、餐饮与交通参考价数据
+│   ├── db/                  # 数据库表模型与查询封装
+│   ├── export/              # A5 旅行册 PDF 与分享长图渲染引擎
 │   ├── jobs/                # 异步任务队列与后台 Worker
-│   ├── config.py            # 全局配置与特性开关
-│   └── model_routes.py      # 多模型路由表与单 Key 自动回退逻辑
+│   ├── config.py            # 全局配置项
+│   └── model_routes.py      # 模型路由与单 Key 自动复用逻辑
 ├── sql/
-│   ├── schema.sql           # PostgreSQL 全量建表脚本（含营业时间表与住宿字段）
-│   └── seed_chongqing.sql   # 重庆精选真实 POI、商圈与摘要种子数据
+│   ├── schema.sql           # PostgreSQL 建表脚本
+│   └── seed_chongqing.sql   # 重庆种子数据（含 27 个精选地点、推荐摘要与实景配图）
 ├── scripts/
-│   ├── init_db.py           # 一键初始化数据库表结构与重庆种子数据
-│   ├── trip.py              # 命令行端到端规划调试脚本
-│   └── stress_test.py       # 规划引擎回归与压力测试
-├── tests/                   # 前后端核心逻辑与开源单 Key 适配单元测试
-├── docs/                    # 架构文档与界面截图
-├── docker-compose.yml       # 本地容器编排参考
-├── Dockerfile               # 后端 Python 3.11 镜像构建文件
+│   ├── init_db.py           # 一键建表并导入重庆种子数据
+│   ├── trip.py              # 命令行单次规划体验脚本
+│   └── stress_test.py       # 批量回归与压力测试脚本
+├── tests/                   # 自动化测试套件
+├── docs/                    # 架构说明与界面截图
+├── docker-compose.yml       # 本地 Docker 编排参考
+├── Dockerfile               # 后端容器镜像构建文件
 └── README.md
 ```
 
 ---
 
-## 👨‍💻 作者与交流 (Author & Connect)
+## 👨‍💻 作者与交流
 
-由 **[Trunks820](https://github.com/Trunks820)** 设计与研发。
+由 **[Trunks820](https://github.com/Trunks820)** 设计与开发。
 
-如果你对 **LLM 落地实战、确定性 Agent 架构设计、旅行/本地生活垂类 AI** 感兴趣，欢迎：
+如果你对 **AI 落地实战、靠谱的 Agent 架构设计、旅行与本地生活应用** 感兴趣，欢迎：
 - 🌟 给项目点个 **Star** 支持一下！
-- 💡 提交 [Issue](https://github.com/Trunks820/Yuntu/issues) 或 Pull Request 共同完善
-- 🤝 GitHub 关注 **[@Trunks820](https://github.com/Trunks820)** 交流探讨
+- 💡 提 [Issue](https://github.com/Trunks820/Yuntu/issues) 或 Pull Request 一起打磨
+- 🤝 在 GitHub 关注 **[@Trunks820](https://github.com/Trunks820)** 交流想法
 
-## 💖 鸣谢 (Acknowledgments)
+## 💖 鸣谢
 
-- 特别鸣谢 **[LINUX DO](https://linux.do)** 社区及其充满探索与极客精神的佬友们！
+- 特别感谢 **[LINUX DO](https://linux.do)** 社区和各位热心折腾、帮忙实测的佬友们！
 
 ---
 
