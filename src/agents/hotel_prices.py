@@ -1,8 +1,7 @@
 """RollingGo hotel prices for one lodging pin.
 
 Looks up economy, mid, and high hotels, drops prices that do not belong in
-the tier, and caches each tier for a day. Lodging copy and the budget do not
-read this yet.
+the tier, and caches each tier for a day.
 """
 
 from __future__ import annotations
@@ -81,6 +80,7 @@ class HotelTier:
     widened: bool
     failure: str = ""
     queried_at: str = ""
+    priced_offers: tuple[HotelOffer, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -310,8 +310,11 @@ def _cache_key(
     checkin: date,
     nights: int,
     tier: str,
+    cache_at_origin: bool = False,
 ) -> str:
     label = _cache_part(_area_key_label(area_name, latitude, longitude))
+    if area_name and cache_at_origin:
+        label = f"{label}@{_area_key_label('', latitude, longitude)}"
     return (
         f"{CACHE_PREFIX}:{_cache_part(city)}:{label}:"
         f"{checkin.isoformat()}:{int(nights)}:{tier}"
@@ -546,6 +549,7 @@ def _tier_from_hotels(
         widened=widened,
         failure=failure,
         queried_at=queried_at,
+        priced_offers=tuple(hotels),
     )
 
 
@@ -828,6 +832,7 @@ async def _collect(
     origin: tuple[float, float],
     checkin: date,
     nights: int,
+    cache_at_origin: bool,
 ) -> HotelTierResult:
     latitude, longitude = origin
     keys = {
@@ -839,6 +844,7 @@ async def _collect(
             checkin=checkin,
             nights=nights,
             tier=tier,
+            cache_at_origin=cache_at_origin,
         )
         for tier in TIERS
     }
@@ -1008,6 +1014,7 @@ async def fetch_tier_hotels(
     settings,
     client=None,
     cache=None,
+    cache_at_origin: bool = False,
 ) -> HotelTierResult:
     """Query three RollingGo tiers for one lodging pin and cache each for a day.
 
@@ -1046,6 +1053,7 @@ async def fetch_tier_hotels(
             origin=origin,
             checkin=checkin,
             nights=parsed_nights,
+            cache_at_origin=cache_at_origin,
         )
     finally:
         if owns_cache:

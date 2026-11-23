@@ -1,5 +1,5 @@
-import { Fragment, useCallback, useEffect, useRef } from "react";
-import { X } from "lucide-react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import type { TripPlace, TripPlan, TripResult } from "@/types/trip";
 import { commuteModeIcon, commuteModeName } from "@/utils/format";
 import {
@@ -11,6 +11,7 @@ import {
   getDayWeather,
   isReducedMotionPreferred,
   pickClosestReadingStopId,
+  pickGuideReadingStopId,
   resolveCommutePopup,
   resolveStopDetailBody,
   resolveStopScheduleMeta,
@@ -35,7 +36,7 @@ export interface BookGuideProps {
   placeDetails: Record<number, PlaceDetailEntry | undefined>;
   brokenImageUrls: ReadonlySet<string>;
   onImageError: (url: string) => void;
-  onReadingStopChange: (placeId: number, dayNum: number) => void;
+  onReadingStopChange: (placeId: number | null, dayNum: number) => void;
   onClose: () => void;
   disableEsc?: boolean;
 }
@@ -83,8 +84,30 @@ export function BookGuide({
 }: BookGuideProps) {
   const asideRef = useRef<HTMLElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
-  const sectionRefs = useRef<Map<number, HTMLElement>>(new Map());
   const stopRefs = useRef<Map<number, HTMLLIElement>>(new Map());
+
+  const activeDay =
+    plan.days.find((d) => d.day === readingDayNum) ?? plan.days[0];
+  const activeDayIndex = activeDay
+    ? plan.days.findIndex((d) => d.day === activeDay.day)
+    : -1;
+  const prevDay = activeDayIndex > 0 ? plan.days[activeDayIndex - 1] : null;
+  const nextDay =
+    activeDayIndex >= 0 && activeDayIndex < plan.days.length - 1
+      ? plan.days[activeDayIndex + 1]
+      : null;
+
+  const [turnState, setTurnState] = useState<{
+    day: number;
+    dir: "next" | "prev" | null;
+  }>(() => ({ day: activeDay?.day ?? initialDayNum, dir: null }));
+
+  if (activeDay && turnState.day !== activeDay.day) {
+    setTurnState({
+      day: activeDay.day,
+      dir: activeDay.day > turnState.day ? "next" : "prev",
+    });
+  }
 
   const readingPlaceIdRef = useRef(readingPlaceId);
   readingPlaceIdRef.current = readingPlaceId;
@@ -171,124 +194,166 @@ export function BookGuide({
     [clearIoLock, lockIoDuringSmoothScroll],
   );
 
-  const scrollToDaySection = useCallback(
-    (dayNum: number, smooth: boolean) => {
-      const aside = asideRef.current;
-      const secEl = sectionRefs.current.get(dayNum);
-      if (!aside || !secEl) return;
-
-      const headerH = headerRef.current?.getBoundingClientRect().height || 62;
-      const top = getOffsetTopWithin(secEl, aside) - headerH - 6;
-      if (smooth) {
-        lockIoDuringSmoothScroll(aside);
-      } else {
-        clearIoLock();
-      }
-      scrollAsideTo(aside, top, smooth);
-    },
-    [clearIoLock, lockIoDuringSmoothScroll],
-  );
-
-  // 初次翻开：若原先正在看某一站，直达那一站；否则从当前这一天的开头读起
+  // 初次翻开：若原先正在看某一站，直达那一站；否则从当天开头读起
   const didInitialScrollRef = useRef(false);
   useEffect(() => {
     if (didInitialScrollRef.current) return;
     didInitialScrollRef.current = true;
 
-    const firstDayNum = plan.days[0]?.day;
     if (initialStopId !== null && stopRefs.current.has(initialStopId)) {
       scrollToStopElement(initialStopId, false);
-      return;
-    }
-
-    if (
-      initialDayNum !== firstDayNum &&
-      sectionRefs.current.has(initialDayNum)
-    ) {
-      scrollToDaySection(initialDayNum, false);
       return;
     }
 
     if (asideRef.current) {
       asideRef.current.scrollTop = 0;
     }
-  }, [
-    initialDayNum,
-    initialStopId,
-    plan.days,
-    scrollToDaySection,
-    scrollToStopElement,
-  ]);
+  }, [initialStopId, scrollToStopElement]);
 
-  // 地图点击某一站：攻略滚过去并切换为正在读
+  // 地图点击某一站：攻略切到那天并滚到那一站
   const lastSeqRef = useRef<number | null>(null);
   useEffect(() => {
     if (!scrollRequest || scrollRequest.seq === lastSeqRef.current) return;
+    if (!stopRefs.current.has(scrollRequest.placeId)) return;
     lastSeqRef.current = scrollRequest.seq;
     scrollToStopElement(scrollRequest.placeId, true);
-  }, [scrollRequest, scrollToStopElement]);
+  }, [activeDay?.day, scrollRequest, scrollToStopElement]);
 
-  // 监听每一站经过“上面约 28%”阅读线：通知地图跟着走
-  const planObserverSig = plan.days
-    .map((d) => `${d.day}:${d.places.map((p) => p.place_id).join(",")}`)
-    .join("|");
+  // 切到另一天（非地图指定站点）时回到新页面顶部
+  const prevRenderedDayRef = useRef<number | undefined>(activeDay?.day);
+  useEffect(() => {
+    const currentDayNum = activeDay?.day;
+    if (
+      currentDayNum === undefined ||
+      prevRenderedDayRef.current === currentDayNum
+    ) {
+      return;
+    }
+    prevRenderedDayRef.current = currentDayNum;
+    const hasPendingStopRequest =
+      scrollRequest !== null &&
+      scrollRequest.seq !== lastSeqRef.current &&
+      stopRefs.current.has(scrollRequest.placeId);
+    if (!hasPendingStopRequest && asideRef.current) {
+      clearIoLock();
+      asideRef.current.scrollTop = 0;
+    }
+  }, [activeDay?.day, scrollRequest, clearIoLock]);
 
+  const activeDayObserverSig = activeDay
+    ? `${activeDay.day}:${activeDay.places.map((p) => p.place_id).join(",")}`
+    : "";
+
+  // 页内“读到哪站地图亮哪站”：保留 28% 阅读线 IO，并叠加底部平滑滚读判定确保最后一站也能亮起
   useEffect(() => {
     const aside = asideRef.current;
-    if (!aside || typeof IntersectionObserver === "undefined") {
+    if (!aside || !activeDay) {
       return;
     }
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const now =
-          typeof performance !== "undefined" ? performance.now() : Date.now();
-        if (now < suppressIoUntilRef.current) {
-          return;
-        }
+    const handleScroll = () => {
+      const now =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (now < suppressIoUntilRef.current) {
+        return;
+      }
+      const asideRect = aside.getBoundingClientRect();
+      const asideHeight = aside.clientHeight || asideRect.height;
+      if (asideHeight <= 0 || aside.scrollHeight <= asideHeight + 1) {
+        return;
+      }
+      const samples = activeDay.places
+        .map((place) => {
+          const el = stopRefs.current.get(place.place_id);
+          if (!el) return null;
+          const rect = el.getBoundingClientRect();
+          return {
+            placeId: place.place_id,
+            top: rect.top,
+            height: rect.height,
+          };
+        })
+        .filter(
+          (s): s is { placeId: number; top: number; height: number } =>
+            s !== null,
+        );
 
-        const hitting = entries.filter((e) => e.isIntersecting);
-        if (hitting.length === 0) return;
+      const pickedId = pickGuideReadingStopId(samples, {
+        asideTop: asideRect.top,
+        asideHeight,
+        scrollTop: aside.scrollTop,
+        scrollHeight: aside.scrollHeight,
+      });
+      if (pickedId !== null && pickedId !== readingPlaceIdRef.current) {
+        onReadingStopChangeRef.current(pickedId, activeDay.day);
+      }
+    };
 
-        const samples = hitting
-          .map((e) => {
-            const target = e.target as HTMLElement;
-            const id = Number(target.dataset.placeId);
-            if (!Number.isFinite(id)) return null;
-            return {
-              placeId: id,
-              top: e.boundingClientRect.top,
-              height: e.boundingClientRect.height,
-            };
-          })
-          .filter(
-            (s): s is { placeId: number; top: number; height: number } =>
-              s !== null,
-          );
+    aside.addEventListener("scroll", handleScroll, { passive: true });
 
-        const asideRect = aside.getBoundingClientRect();
-        const targetLineTop =
-          asideRect.top +
-          (aside.clientHeight || asideRect.height || 680) * 0.28;
-        const pickedId = pickClosestReadingStopId(samples, targetLineTop);
-        if (pickedId === null || pickedId === readingPlaceIdRef.current) {
-          return;
-        }
+    let observer: IntersectionObserver | null = null;
+    if (typeof IntersectionObserver !== "undefined") {
+      observer = new IntersectionObserver(
+        (entries) => {
+          const now =
+            typeof performance !== "undefined" ? performance.now() : Date.now();
+          if (now < suppressIoUntilRef.current) {
+            return;
+          }
+          // 真实滚动已触底时让最后一站保持高亮，避免被上方旧站点回调覆盖
+          if (
+            aside.clientHeight > 0 &&
+            aside.scrollHeight > aside.clientHeight + 4 &&
+            aside.scrollTop >= aside.scrollHeight - aside.clientHeight - 4
+          ) {
+            const lastPlace = activeDay.places[activeDay.places.length - 1];
+            if (lastPlace && lastPlace.place_id !== readingPlaceIdRef.current) {
+              onReadingStopChangeRef.current(lastPlace.place_id, activeDay.day);
+            }
+            return;
+          }
 
-        const matchedEl = stopRefs.current.get(pickedId);
-        const dayNum = Number(matchedEl?.dataset.day);
-        if (Number.isFinite(dayNum)) {
-          onReadingStopChangeRef.current(pickedId, dayNum);
-        }
-      },
-      {
-        root: aside,
-        rootMargin: "-28% 0px -62% 0px",
-      },
-    );
+          const hitting = entries.filter((e) => e.isIntersecting);
+          if (hitting.length === 0) return;
 
-    for (const day of plan.days) {
-      for (const place of day.places) {
+          const samples = hitting
+            .map((e) => {
+              const target = e.target as HTMLElement;
+              const id = Number(target.dataset.placeId);
+              if (!Number.isFinite(id)) return null;
+              return {
+                placeId: id,
+                top: e.boundingClientRect.top,
+                height: e.boundingClientRect.height,
+              };
+            })
+            .filter(
+              (s): s is { placeId: number; top: number; height: number } =>
+                s !== null,
+            );
+
+          const asideRect = aside.getBoundingClientRect();
+          const targetLineTop =
+            asideRect.top +
+            (aside.clientHeight || asideRect.height || 680) * 0.28;
+          const pickedId = pickClosestReadingStopId(samples, targetLineTop);
+          if (pickedId === null || pickedId === readingPlaceIdRef.current) {
+            return;
+          }
+
+          const matchedEl = stopRefs.current.get(pickedId);
+          const dayNum = Number(matchedEl?.dataset.day);
+          if (Number.isFinite(dayNum)) {
+            onReadingStopChangeRef.current(pickedId, dayNum);
+          }
+        },
+        {
+          root: aside,
+          rootMargin: "-28% 0px -62% 0px",
+        },
+      );
+
+      for (const place of activeDay.places) {
         const el = stopRefs.current.get(place.place_id);
         if (el) {
           observer.observe(el);
@@ -297,17 +362,26 @@ export function BookGuide({
     }
 
     return () => {
-      observer.disconnect();
+      aside.removeEventListener("scroll", handleScroll);
+      observer?.disconnect();
     };
-  }, [plan.days, planObserverSig]);
+  }, [activeDay, activeDayObserverSig]);
 
-  const handleClickDayTab = (dayNum: number) => {
-    scrollToDaySection(dayNum, true);
+  const handleTurnToDay = (dayNum: number) => {
     const targetDay = plan.days.find((d) => d.day === dayNum);
-    const firstPlace: TripPlace | undefined = targetDay?.places[0];
-    if (firstPlace) {
-      onReadingStopChange(firstPlace.place_id, dayNum);
+    if (!targetDay) return;
+    if (activeDay && targetDay.day === activeDay.day) {
+      if (asideRef.current) {
+        scrollAsideTo(asideRef.current, 0, true);
+      }
+      return;
     }
+    const firstPlace: TripPlace | undefined = targetDay.places[0];
+    if (asideRef.current) {
+      clearIoLock();
+      asideRef.current.scrollTop = 0;
+    }
+    onReadingStopChange(firstPlace ? firstPlace.place_id : null, dayNum);
   };
 
   const handleClickStop = (placeId: number, dayNum: number) => {
@@ -372,7 +446,7 @@ export function BookGuide({
                 className="bk-dtab bk-rtab"
                 data-rday={d.day}
                 aria-pressed={active}
-                onClick={() => handleClickDayTab(d.day)}
+                onClick={() => handleTurnToDay(d.day)}
               >
                 <b>{formatBookDayLabel(d.day)}</b>
                 {badge && (
@@ -406,206 +480,251 @@ export function BookGuide({
         </button>
       </div>
 
-      <div className="bk-rd">
-        {plan.days.map((day) => {
-          const weatherDay = getDayWeather(result.weather, day.day);
-          const badge = formatDayWeatherBadge(weatherDay);
-          const narrativeText = day.narrative?.trim() ?? "";
+      <div
+        key={activeDay?.day ?? "empty"}
+        className={[
+          "bk-rd",
+          turnState.dir === "next"
+            ? "is-next"
+            : turnState.dir === "prev"
+              ? "is-prev"
+              : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        {activeDay &&
+          (() => {
+            const day = activeDay;
+            const weatherDay = getDayWeather(result.weather, day.day);
+            const badge = formatDayWeatherBadge(weatherDay);
+            const narrativeText = day.narrative?.trim() ?? "";
 
-          return (
-            <section
-              key={day.day}
-              id={`rd-d${day.day}`}
-              data-day={day.day}
-              className="bk-rd-day"
-              ref={(el) => {
-                if (el) {
-                  sectionRefs.current.set(day.day, el);
-                } else {
-                  sectionRefs.current.delete(day.day);
-                }
-              }}
-            >
-              <header className="bk-ga-dh">
-                <h2>
-                  <small>{formatBookDayLabel(day.day)}</small>
-                  {day.title}
-                </h2>
-                {badge && (
-                  <span className="bk-wx">
-                    <badge.Icon
-                      size={15}
-                      className="bk-wx-icon"
-                      aria-hidden="true"
-                    />
-                    <span>
-                      {badge.weatherText} {badge.tempRange}
+            return (
+              <section
+                id={`rd-d${day.day}`}
+                data-day={day.day}
+                className="bk-rd-day"
+              >
+                <header className="bk-ga-dh">
+                  <h2>
+                    <small>{formatBookDayLabel(day.day)}</small>
+                    {day.title}
+                  </h2>
+                  {badge && (
+                    <span className="bk-wx">
+                      <badge.Icon
+                        size={15}
+                        className="bk-wx-icon"
+                        aria-hidden="true"
+                      />
+                      <span>
+                        {badge.weatherText} {badge.tempRange}
+                      </span>
                     </span>
-                  </span>
-                )}
-              </header>
+                  )}
+                </header>
 
-              {narrativeText && <p className="bk-ga-nar">{narrativeText}</p>}
+                {narrativeText && <p className="bk-ga-nar">{narrativeText}</p>}
 
-              <ol className="bk-gss">
-                {day.places.map((place, idx) => {
-                  const prevPlace = idx > 0 ? day.places[idx - 1] : null;
-                  const leg = prevPlace
-                    ? findCommuteLeg(day, prevPlace.place_id, place.place_id)
-                    : undefined;
-                  const legPopup = leg ? resolveCommutePopup(leg) : null;
-                  const ModeIcon = leg ? commuteModeIcon(leg.mode) : null;
-                  const modeLabel = leg ? commuteModeName(leg.mode) : "";
+                <ol className="bk-gss">
+                  {day.places.map((place, idx) => {
+                    const prevPlace = idx > 0 ? day.places[idx - 1] : null;
+                    const leg = prevPlace
+                      ? findCommuteLeg(day, prevPlace.place_id, place.place_id)
+                      : undefined;
+                    const legPopup = leg ? resolveCommutePopup(leg) : null;
+                    const ModeIcon = leg ? commuteModeIcon(leg.mode) : null;
+                    const modeLabel = leg ? commuteModeName(leg.mode) : "";
 
-                  const scheduleMeta = resolveStopScheduleMeta(place);
-                  const stayText = formatStayMinutes(place.stay_minutes);
-                  const metaParts = [
-                    scheduleMeta.combinedText,
-                    stayText,
-                    place.optional ? "可选" : null,
-                  ].filter((part): part is string => Boolean(part));
+                    const scheduleMeta = resolveStopScheduleMeta(place);
+                    const stayText = formatStayMinutes(place.stay_minutes);
+                    const metaParts = [
+                      scheduleMeta.combinedText,
+                      stayText,
+                      place.optional ? "可选" : null,
+                    ].filter((part): part is string => Boolean(part));
 
-                  const { itineraryText } = resolveStopDetailBody(place, null);
+                    const { itineraryText } = resolveStopDetailBody(
+                      place,
+                      null,
+                    );
 
-                  const detailEntry = placeDetails[place.place_id];
-                  const detail =
-                    detailEntry?.status === "ready" ? detailEntry.data : null;
-                  const sortedGallery = sortPlaceGallery(detail?.gallery);
-                  const firstImage = sortedGallery[0] ?? null;
-                  const thumbUrl = firstImage?.thumb?.url || null;
-                  const hasPhoto = Boolean(
-                    thumbUrl && !brokenImageUrls.has(thumbUrl),
-                  );
+                    const detailEntry = placeDetails[place.place_id];
+                    const detail =
+                      detailEntry?.status === "ready" ? detailEntry.data : null;
+                    const sortedGallery = sortPlaceGallery(detail?.gallery);
+                    const firstImage = sortedGallery[0] ?? null;
+                    const thumbUrl = firstImage?.thumb?.url || null;
+                    const hasPhoto = Boolean(
+                      thumbUrl && !brokenImageUrls.has(thumbUrl),
+                    );
 
-                  // 详情已有结果、既没照片也没说明的站（多为餐馆）收成一行，不留灰块
-                  const isBare =
-                    !hasPhoto &&
-                    !itineraryText &&
-                    (detailEntry?.status === "ready" ||
-                      detailEntry?.status === "unsupported" ||
-                      detailEntry?.status === "error");
+                    // 详情已有结果、既没照片也没说明的站（多为餐馆）收成一行，不留灰块
+                    const isBare =
+                      !hasPhoto &&
+                      !itineraryText &&
+                      (detailEntry?.status === "ready" ||
+                        detailEntry?.status === "unsupported" ||
+                        detailEntry?.status === "error");
 
-                  const isReading =
-                    readingPlaceId !== null &&
-                    place.place_id === readingPlaceId;
+                    const isReading =
+                      readingPlaceId !== null &&
+                      place.place_id === readingPlaceId;
 
-                  return (
-                    <Fragment key={`${day.day}-${place.place_id}-${idx}`}>
-                      {leg && (
-                        <li className="bk-gl">
-                          <span className="bk-gl-head">
-                            {ModeIcon && (
-                              <ModeIcon
-                                size={13}
-                                className="bk-gl-icon"
-                                aria-hidden="true"
-                              />
-                            )}
-                            <span>
-                              {modeLabel} {leg.duration_minutes} 分钟
-                              {leg.duration_source === "estimate"
-                                ? " · 估算"
-                                : ""}
+                    return (
+                      <Fragment key={`${day.day}-${place.place_id}-${idx}`}>
+                        {leg && (
+                          <li className="bk-gl">
+                            <span className="bk-gl-head">
+                              {ModeIcon && (
+                                <ModeIcon
+                                  size={13}
+                                  className="bk-gl-icon"
+                                  aria-hidden="true"
+                                />
+                              )}
+                              <span>
+                                {modeLabel} {leg.duration_minutes} 分钟
+                                {leg.duration_source === "estimate"
+                                  ? " · 估算"
+                                  : ""}
+                              </span>
                             </span>
-                          </span>
-                          {legPopup?.kind === "steps" ? (
-                            <div className="bk-gl-detail">
-                              <ul className="bk-gl-steps">
-                                {legPopup.steps.map((step, stepIdx) => (
-                                  <li
-                                    key={`${day.day}-${place.place_id}-step-${stepIdx}`}
-                                  >
-                                    {formatTransitStepLine(step)}
-                                  </li>
-                                ))}
-                              </ul>
-                            </div>
-                          ) : legPopup?.kind === "summary" ? (
-                            <div className="bk-gl-detail">
-                              <span>{legPopup.summary}</span>
-                            </div>
-                          ) : null}
-                        </li>
-                      )}
+                            {legPopup?.kind === "steps" ? (
+                              <div className="bk-gl-detail">
+                                <ul className="bk-gl-steps">
+                                  {legPopup.steps.map((step, stepIdx) => (
+                                    <li
+                                      key={`${day.day}-${place.place_id}-step-${stepIdx}`}
+                                    >
+                                      {formatTransitStepLine(step)}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            ) : legPopup?.kind === "summary" ? (
+                              <div className="bk-gl-detail">
+                                <span>{legPopup.summary}</span>
+                              </div>
+                            ) : null}
+                          </li>
+                        )}
 
-                      <li
-                        ref={(el) => {
-                          if (el) {
-                            stopRefs.current.set(place.place_id, el);
-                          } else {
-                            stopRefs.current.delete(place.place_id);
-                          }
-                        }}
-                        className={[
-                          "bk-gs",
-                          isReading ? "is-reading" : "",
-                          isBare ? "is-bare" : "",
-                        ]
-                          .filter(Boolean)
-                          .join(" ")}
-                        data-day={day.day}
-                        data-place-id={place.place_id}
-                        aria-current={isReading ? "location" : undefined}
-                        onClick={(e) => {
-                          if ((e.target as Element).closest("button")) return;
-                          handleClickStop(place.place_id, day.day);
-                        }}
-                      >
-                        {(scheduleMeta.period || metaParts.length > 0) && (
-                          <div className="bk-gs-k">
-                            {scheduleMeta.period && (
-                              <i
-                                className={`sky ${scheduleMeta.period}`}
-                                aria-hidden="true"
-                              />
-                            )}
-                            {metaParts.length > 0 && (
-                              <span>{metaParts.join(" · ")}</span>
+                        <li
+                          ref={(el) => {
+                            if (el) {
+                              stopRefs.current.set(place.place_id, el);
+                            } else {
+                              stopRefs.current.delete(place.place_id);
+                            }
+                          }}
+                          className={[
+                            "bk-gs",
+                            isReading ? "is-reading" : "",
+                            isBare ? "is-bare" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          data-day={day.day}
+                          data-place-id={place.place_id}
+                          aria-current={isReading ? "location" : undefined}
+                          onClick={(e) => {
+                            if ((e.target as Element).closest("button")) return;
+                            handleClickStop(place.place_id, day.day);
+                          }}
+                        >
+                          {(scheduleMeta.period || metaParts.length > 0) && (
+                            <div className="bk-gs-k">
+                              {scheduleMeta.period && (
+                                <i
+                                  className={`sky ${scheduleMeta.period}`}
+                                  aria-hidden="true"
+                                />
+                              )}
+                              {metaParts.length > 0 && (
+                                <span>{metaParts.join(" · ")}</span>
+                              )}
+                            </div>
+                          )}
+
+                          <div className="bk-gs-b">
+                            <h4>
+                              <button
+                                type="button"
+                                className="bk-gs-btn"
+                                onClick={() =>
+                                  handleClickStop(place.place_id, day.day)
+                                }
+                              >
+                                <span className="bk-gs-num">{idx + 1}</span>
+                                <span>{place.name}</span>
+                              </button>
+                            </h4>
+                            {itineraryText && (
+                              <p className="bk-gs-n">{itineraryText}</p>
                             )}
                           </div>
-                        )}
 
-                        <div className="bk-gs-b">
-                          <h4>
-                            <button
-                              type="button"
-                              className="bk-gs-btn"
-                              onClick={() =>
-                                handleClickStop(place.place_id, day.day)
-                              }
-                            >
-                              <span className="bk-gs-num">{idx + 1}</span>
-                              <span>{place.name}</span>
-                            </button>
-                          </h4>
-                          {itineraryText && (
-                            <p className="bk-gs-n">{itineraryText}</p>
+                          {hasPhoto && thumbUrl ? (
+                            <img
+                              className="photo bk-gs-ph"
+                              src={thumbUrl}
+                              alt=""
+                              loading="lazy"
+                              onError={() => onImageError(thumbUrl)}
+                            />
+                          ) : isBare ? null : (
+                            <span className="bk-gs-ph none">暂无实拍</span>
                           )}
-                        </div>
+                        </li>
+                      </Fragment>
+                    );
+                  })}
+                </ol>
+              </section>
+            );
+          })()}
 
-                        {hasPhoto && thumbUrl ? (
-                          <img
-                            className="photo bk-gs-ph"
-                            src={thumbUrl}
-                            alt=""
-                            loading="lazy"
-                            onError={() => onImageError(thumbUrl)}
-                          />
-                        ) : isBare ? null : (
-                          <span className="bk-gs-ph none">暂无实拍</span>
-                        )}
-                      </li>
-                    </Fragment>
-                  );
-                })}
-              </ol>
-            </section>
-          );
-        })}
+        {(prevDay || nextDay) && (
+          <nav className="bk-rd-pager" aria-label="翻页">
+            {prevDay ? (
+              <button
+                type="button"
+                className="prev"
+                onClick={() => handleTurnToDay(prevDay.day)}
+              >
+                <ChevronLeft size={16} aria-hidden="true" />
+                <span>
+                  <small>上一天</small>
+                  {formatBookDayLabel(prevDay.day)}
+                </span>
+              </button>
+            ) : (
+              <span aria-hidden="true" />
+            )}
+            {nextDay && (
+              <button
+                type="button"
+                className="next"
+                onClick={() => handleTurnToDay(nextDay.day)}
+              >
+                <span>
+                  <small>下一天</small>
+                  {formatBookDayLabel(nextDay.day)}
+                  {nextDay.title ? ` · ${nextDay.title}` : ""}
+                </span>
+                <ChevronRight size={16} aria-hidden="true" />
+              </button>
+            )}
+          </nav>
+        )}
 
-        <p className="bk-rd-end">
-          出发前、怎么去 · 住哪、花多少在右上另外几页。
-        </p>
+        {!nextDay && (
+          <p className="bk-rd-end">
+            出发前、怎么去 · 住哪、花多少在右上另外几页。
+          </p>
+        )}
       </div>
     </aside>
   );

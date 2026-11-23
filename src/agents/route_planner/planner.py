@@ -23,9 +23,11 @@ from src.agents.pace import generation_base_mode
 
 from src.agents.route_planner.prompt import (
     candidate_block,
+    opening_hours_block,
     request_text,
     system_for,
 )
+from src.agents.route_planner.opening_hours import RouteOpeningHours, load_route_opening_hours
 
 from src.agents.route_planning import (
     AmapRouteProvider,
@@ -74,11 +76,10 @@ from src.agents.route_planner.legs import (
 from src.agents.route_planner.schedule import _idle_fill_counts
 
 from src.agents.route_planner.checks import (
+    attach_schedule_notice_facts,
+    classify_issues,
     urban_commute_notes,
     missing_preference_notes,
-    pot_meal_notes,
-    relaxed_pace_notes,
-    _issues_after_one_repair,
     _estimated_leg_count,
 )
 
@@ -222,6 +223,7 @@ async def prepare_route(
     lodging_anchor: AccommodationAnchor | None = None,
     hotel_query=None,
     hotel_cache=None,
+    opening_hours: RouteOpeningHours | None = None,
 ) -> PreparedRoute:
     settings = settings or _route_planner_pkg.get_settings()
     fetch_restaurants = fetch_restaurants or _default_restaurants
@@ -342,6 +344,8 @@ async def prepare_route(
     for rows in restaurants.values():
         for place in rows:
             by_id[place.place_id] = place
+    if opening_hours is None:
+        opening_hours = await load_route_opening_hours(session, request, by_id.values())
     # Night, family and tea already include the kid and tea fetches. Food is
     # different: a 【高德餐厅】 row with visitor text is a proper meal the
     # check accepts, and a blank row is in amap_ids and is not. Recompute only
@@ -353,6 +357,7 @@ async def prepare_route(
     rules = replace(
         rules,
         food_candidate=preference_candidate_flags(meal_places, amap_ids)["food_candidate"],
+        opening_hours=opening_hours,
     )
     usable_lodging = _usable_user_lodging(lodging_anchor)
     lodging_name = _user_lodging_name(usable_lodging) if usable_lodging is not None else None
@@ -385,6 +390,9 @@ async def prepare_route(
     user = request_text(request, rules) + "\n\n" + candidate_block(
         clusters, restaurants, rules, lodging=lodging_point
     )
+    opening_block = opening_hours_block(rules, by_id.values())
+    if opening_block:
+        user += "\n\n" + opening_block
     return PreparedRoute(
         rules=rules,
         pool=pool,
@@ -398,6 +406,11 @@ async def prepare_route(
         lodging_first=lodging_first,
         preselected_lodging=preselected,
     )
+
+
+_STANDALONE_ROUTE_SECONDS = 70.0
+# Leave room to package the schedule and close the provider before the workflow cutoff.
+_ROUTE_HANDOFF_RESERVE_SECONDS = 1.0
 
 
 def _planner_amap_budget_ms(settings: Settings) -> int:
@@ -641,11 +654,13 @@ async def plan_route(
     fetch_kid_places=None,
     fetch_tea_houses=None,
     settings: Settings | None = None,
+    deadline_monotonic: float | None = None,
     today: date | None = None,
     citycode: str | None = None,
     lodging_anchor: AccommodationAnchor | None = None,
     hotel_query=None,
     hotel_cache=None,
+    opening_hours: RouteOpeningHours | None = None,
 ) -> RoutePlannerResult:
     """Plan one trip. A qualified result carries a ``RoutePlan``; a failed one does not.
 
@@ -670,6 +685,8 @@ async def plan_route(
     """
     started = time.perf_counter()
     settings = settings or _route_planner_pkg.get_settings()
+    if deadline_monotonic is None:
+        deadline_monotonic = time.monotonic() + _STANDALONE_ROUTE_SECONDS
     hotel_on = hotel_lodging_enabled(settings)
     usable_lodging = _usable_user_lodging(lodging_anchor)
     lodging_precision = usable_lodging.location_precision if usable_lodging is not None else None
@@ -687,6 +704,7 @@ async def plan_route(
         lodging_anchor=lodging_anchor,
         hotel_query=hotel_query,
         hotel_cache=hotel_cache,
+        opening_hours=opening_hours,
     )
     marker = (
         LODGING_FIRST_KEPT
@@ -747,15 +765,43 @@ async def plan_route(
                 _planner_amap_budget_ms(settings),
             )
 
-    async def caller(system: str, user: str):
+    async def caller(system: str, user: str, *, timeout: float):
         if model_caller is None:
-            return await _default_caller(system, user, settings, step_started=started)
+            return await _default_caller(system, user, settings, timeout=timeout)
         return await model_caller(system, user)
+
+    async def schedule_draft(plan: dict, places_by_id: dict[int, CandidatePlace]):
+        preset, lodging_marker = _choice(plan, places_by_id)
+        schedule = await arrange(
+            plan,
+            rules=prepared.rules,
+            pool=prepared.pool,
+            by_id=places_by_id,
+            request=request,
+            estimator=estimator,
+            fetch_restaurants=fetch_restaurants or _default_restaurants,
+            session=session,
+            settings=settings,
+            lodging_anchor=lodging_anchor,
+            hotel_query=hotel_query,
+            hotel_cache=hotel_cache,
+            preset_lodging=preset,
+            amap_ids=prepared.amap_ids,
+        )
+        return schedule, lodging_marker
+
+    def include_scheduled_places(plan: dict, places_by_id: dict[int, CandidatePlace]) -> None:
+        for day in plan.get("days") or []:
+            for stop in day.get("stops") or []:
+                place = stop.get("_place")
+                if isinstance(place, CandidatePlace):
+                    places_by_id[place.place_id] = place
 
     try:
         try:
             draft, error = await _read_plan(
-                caller, prepared.system, prepared.user, settings=settings, calls=calls, repaired=False
+                caller, prepared.system, prepared.user, settings=settings, calls=calls,
+                repaired=False, deadline_monotonic=deadline_monotonic,
             )
         except Exception as exc:
             kind, status = classify_planner_call_failure(exc)
@@ -774,170 +820,138 @@ async def plan_route(
         bind(restart=False)
         if hotel_on:
             draft.pop("lodging", None)
-        preset, marker = _choice(draft, prepared.by_id)
-        arranged, adjustments, lodge, source, lodging_name = await arrange(
-            draft,
-            rules=prepared.rules,
-            pool=prepared.pool,
-            by_id=dict(prepared.by_id),
-            request=request,
-            estimator=estimator,
-            fetch_restaurants=fetch_restaurants or _default_restaurants,
-            session=session,
-            settings=settings,
-            lodging_anchor=lodging_anchor,
-            hotel_query=hotel_query,
-            hotel_cache=hotel_cache,
-            preset_lodging=preset,
-            amap_ids=prepared.amap_ids,
+        (arranged, adjustments, lodge, source, lodging_name), marker = await schedule_draft(
+            draft, dict(prepared.by_id)
         )
         by_id = dict(prepared.by_id)
         for rows in prepared.restaurants.values():
             for place in rows:
                 by_id[place.place_id] = place
-        for day in arranged.get("days") or []:
-            for stop in day.get("stops") or []:
-                place = stop.get("_place")
-                if isinstance(place, CandidatePlace):
-                    by_id[place.place_id] = place
+        include_scheduled_places(arranged, by_id)
         check_kw = {"lodge": lodge, "request": request, "settings": settings}
-        issues = _route_planner_pkg.collect_issues(arranged, prepared.rules, by_id, prepared.amap_ids, **check_kw)
+        first_issues = _route_planner_pkg.collect_issues(
+            arranged, prepared.rules, by_id, prepared.amap_ids, **check_kw
+        )
+        checked = classify_issues(first_issues)
         estimated_leg_count = _estimated_leg_count(arranged)
         lodging_rest_count, sight_extend_count = _idle_fill_counts(arranged)
-        public = _public_plan(arranged, include_lodging=not hotel_on)
         kept_first_draft = False
-        if issues:
-            first_draft = {
-                "arranged": arranged,
-                "adjustments": list(adjustments),
-                "lodge": lodge,
-                "source": source,
-                "lodging_name": lodging_name,
-                "issues": list(issues),
-                "check_kw": check_kw,
-                "estimated_leg_count": estimated_leg_count,
-                "lodging_rest_count": lodging_rest_count,
-                "sight_extend_count": sight_extend_count,
-                "lodging_first": marker,
-            }
-            try:
-                revised, repair_error = await _read_plan(
-                    caller,
-                    prepared.system,
-                    _repair_user(prepared, public, adjustments, issues),
-                    settings=settings,
-                    calls=calls,
-                    repaired=True,
-                )
-            except Exception as exc:
-                schedule_ms = int((time.perf_counter() - schedule_started) * 1000)
-                kind, status = classify_planner_call_failure(exc)
-                return _abandon_model_call(
-                    calls, issues, _noted(adjustments, marker), started, schedule_ms,
-                    repaired=True, kind=kind, status=status, exc=exc,
-                    source=source, name=lodging_name,
-                    amap_call_count=_provider_amap_calls(owned_provider),
-                    estimated_leg_count=estimated_leg_count,
-                    lodging_rest_count=lodging_rest_count,
-                    sight_extend_count=sight_extend_count,
-                    lodging_first=marker,
-                )
-            if repair_error is not None or revised is None:
-                schedule_ms = int((time.perf_counter() - schedule_started) * 1000)
-                return _abandon_model_call(
-                    calls, issues, _noted(adjustments, marker), started, schedule_ms,
-                    repaired=True, kind="bad_output", status=None,
-                    issue="改稿不是合法 JSON",
-                    source=source, name=lodging_name,
-                    amap_call_count=_provider_amap_calls(owned_provider),
-                    estimated_leg_count=estimated_leg_count,
-                    lodging_rest_count=lodging_rest_count,
-                    sight_extend_count=sight_extend_count,
-                    lodging_first=marker,
-                )
-            if hotel_on:
-                revised.pop("lodging", None)
-            merged, note = merge_days(
-                prepared.rules,
-                public,
-                _public_plan(revised, include_lodging=not hotel_on),
+        failure_kind = ""
+        if first_issues:
+            can_keep_first_draft = not checked.hard
+            schedule_deadline = deadline_monotonic - _ROUTE_HANDOFF_RESERVE_SECONDS
+            reschedule_seconds = max(
+                _planner_amap_budget_ms(settings) / 1000.0,
+                time.perf_counter() - schedule_started,
             )
-            if note:
-                adjustments.append(note)
-            bind(restart=True)
-            preset, marker = _choice(merged, by_id)
-            arranged, more, lodge, source, lodging_name = await arrange(
-                merged,
-                rules=prepared.rules,
-                pool=prepared.pool,
-                by_id=by_id,
-                request=request,
-                estimator=estimator,
-                fetch_restaurants=fetch_restaurants or _default_restaurants,
-                session=session,
-                settings=settings,
-                lodging_anchor=lodging_anchor,
-                hotel_query=hotel_query,
-                hotel_cache=hotel_cache,
-                preset_lodging=preset,
-                amap_ids=prepared.amap_ids,
-            )
-            adjustments.extend(more)
-            for day in arranged.get("days") or []:
-                for stop in day.get("stops") or []:
-                    place = stop.get("_place")
-                    if isinstance(place, CandidatePlace):
-                        by_id[place.place_id] = place
-            check_kw = {"lodge": lodge, "request": request, "settings": settings}
-            revised_issues = _issues_after_one_repair(
-                _route_planner_pkg.collect_issues(arranged, prepared.rules, by_id, prepared.amap_ids, **check_kw)
-            )
-            # The first draft's only problems become notes after one repair
-            # (a city day over the cap, or a same-day pair of pot meals), and
-            # the repair introduced a real failure. Deliver the first draft.
-            if revised_issues and not _issues_after_one_repair(first_draft["issues"]):
-                arranged = first_draft["arranged"]
-                adjustments = list(first_draft["adjustments"])
-                adjustments.append("改稿后出现新问题，沿用第一稿")
-                lodge = first_draft["lodge"]
-                source = first_draft["source"]
-                lodging_name = first_draft["lodging_name"]
-                check_kw = first_draft["check_kw"]
-                estimated_leg_count = first_draft["estimated_leg_count"]
-                lodging_rest_count = first_draft["lodging_rest_count"]
-                sight_extend_count = first_draft["sight_extend_count"]
-                marker = first_draft["lodging_first"]
-                issues = []
-                kept_first_draft = True
+            repair_deadline = schedule_deadline - reschedule_seconds
+            repair_note = ""
+            revised = None
+            if repair_deadline <= time.monotonic():
+                repair_note = "排线剩余时间不足，跳过改稿"
+                failure_kind = "timeout"
             else:
-                issues = revised_issues
-                estimated_leg_count = _estimated_leg_count(arranged)
-                lodging_rest_count, sight_extend_count = _idle_fill_counts(arranged)
+                public = _public_plan(arranged, include_lodging=not hotel_on)
+                status = None
+                call_issue = ""
+                try:
+                    revised, repair_error = await _read_plan(
+                        caller,
+                        prepared.system,
+                        _repair_user(prepared, public, adjustments, first_issues),
+                        settings=settings,
+                        calls=calls,
+                        repaired=True,
+                        deadline_monotonic=repair_deadline,
+                    )
+                except Exception as exc:
+                    failure_kind, status = classify_planner_call_failure(exc)
+                    call_issue = _model_failure_issue(exc, failure_kind, status)
+                else:
+                    if repair_error is not None or revised is None:
+                        revised = None
+                        failure_kind = "bad_output"
+                        call_issue = "改稿不是合法 JSON"
+                if call_issue:
+                    if not can_keep_first_draft:
+                        return _abandon_model_call(
+                            calls, checked.hard,
+                            _noted(adjustments + checked.repair + checked.record, marker), started,
+                            int((time.perf_counter() - schedule_started) * 1000),
+                            repaired=True, kind=failure_kind, status=status, issue=call_issue,
+                            source=source, name=lodging_name,
+                            amap_call_count=_provider_amap_calls(owned_provider),
+                            estimated_leg_count=estimated_leg_count,
+                            lodging_rest_count=lodging_rest_count,
+                            sight_extend_count=sight_extend_count,
+                            lodging_first=marker,
+                        )
+                    _log_model_call_failure(
+                        kind=failure_kind, status=status, repaired=True, calls=calls
+                    )
+                    repair_note = f"改稿失败（{_FAILURE_LABELS[failure_kind]}）"
+
+            if revised is not None:
+                revised_by_id = dict(by_id)
+                merged, note = merge_days(
+                    prepared.rules, public, _public_plan(revised, include_lodging=not hotel_on),
+                )
+                bind(restart=True)
+                try:
+                    schedule, revised_marker = await asyncio.wait_for(
+                        schedule_draft(merged, revised_by_id),
+                        timeout=schedule_deadline - time.monotonic(),
+                    )
+                except asyncio.TimeoutError:
+                    repair_note = "改稿后重新排程超时"
+                    failure_kind = "timeout"
+                else:
+                    revised_plan, more, revised_lodge, revised_source, revised_name = schedule
+                    include_scheduled_places(revised_plan, revised_by_id)
+                    revised_check_kw = {"lodge": revised_lodge, "request": request, "settings": settings}
+                    revised_checked = classify_issues(
+                        _route_planner_pkg.collect_issues(
+                            revised_plan, prepared.rules, revised_by_id, prepared.amap_ids, **revised_check_kw
+                        )
+                    )
+                    if revised_checked.hard and can_keep_first_draft:
+                        repair_note = "改稿后出现新问题"
+                    else:
+                        if note:
+                            adjustments.append(note)
+                        adjustments.extend(more)
+                        arranged, by_id = revised_plan, revised_by_id
+                        lodge, source, lodging_name = revised_lodge, revised_source, revised_name
+                        marker, check_kw, checked = revised_marker, revised_check_kw, revised_checked
+                        estimated_leg_count = _estimated_leg_count(arranged)
+                        lodging_rest_count, sight_extend_count = _idle_fill_counts(arranged)
+            if repair_note and can_keep_first_draft:
+                adjustments.insert(0, f"{repair_note}，沿用第一稿")
+                kept_first_draft = True
+            elif repair_note:
+                adjustments.append(repair_note)
         schedule_ms = int((time.perf_counter() - schedule_started) * 1000)
-        for note in urban_commute_notes(arranged, prepared.rules, **check_kw):
-            if note not in adjustments:
-                adjustments.append(note)
-        for note in missing_preference_notes(prepared.rules):
-            if note not in adjustments:
-                adjustments.append(note)
-        for note in pot_meal_notes(arranged, by_id):
-            if note not in adjustments:
-                adjustments.append(note)
-        for note in relaxed_pace_notes(
-            arranged, prepared.rules, by_id, prepared.amap_ids, **check_kw
+        for note in (
+            checked.record + checked.repair
+            + urban_commute_notes(arranged, prepared.rules, **check_kw)
+            + missing_preference_notes(prepared.rules)
         ):
             if note not in adjustments:
                 adjustments.append(note)
         adjustments = _noted(adjustments, marker)
-        if issues:
+        if checked.hard:
             return _fail(
-                calls, issues, adjustments, started, schedule_ms, source, lodging_name,
+                calls, checked.hard, adjustments, started, schedule_ms, source, lodging_name,
                 amap_call_count=_provider_amap_calls(owned_provider),
                 estimated_leg_count=estimated_leg_count,
                 lodging_rest_count=lodging_rest_count,
                 sight_extend_count=sight_extend_count,
+                failure_kind=failure_kind,
                 lodging_first=marker,
             )
+        if prepared.rules.opening_hours.by_day:
+            # Emission numbers groups by list position. Keep the dates that passed the check.
+            arranged["days"].sort(key=lambda day: int(day["day"]))
         generation_mode, _generation_reason = generation_base_mode(request, _route_planner_pkg.get_settings())
         try:
             route = await _route_planner_pkg.emit_route_plan(
@@ -968,6 +982,7 @@ async def plan_route(
                 sight_extend_count=sight_extend_count,
                 lodging_first=marker,
             )
+        attach_schedule_notice_facts(route, arranged, prepared.rules, by_id, **check_kw)
         return RoutePlannerResult(
             plan=route,
             qualified=True,

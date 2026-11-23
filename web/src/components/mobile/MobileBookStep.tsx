@@ -41,6 +41,7 @@ export const MobileBookStep: React.FC<MobileBookStepProps> = ({
   const city = draft.cityName || "心动目的地";
   const shortDate =
     draft.dateMode === "exact" && draft.startDate ? formatMonthDay(draft.startDate) : "日期未定";
+  const fromCity = (draft.fromCity || "").trim();
   const partyLabel = `${draft.adults} 位成人${draft.children ? ` · ${draft.children} 位儿童` : ""}`;
   const tags = sceneTags(draft.sceneIds);
   const avoidTags = draft.avoidIds
@@ -112,6 +113,9 @@ export const MobileBookStep: React.FC<MobileBookStepProps> = ({
           <div className="book-edit-tags">
             {editTag("修改目的地", "pin", city, () => onEditStep("profile"))}
             {editTag("修改天数与日期", "calendar", `${days} 天 · ${shortDate}`, () =>
+              onEditStep("departure"),
+            )}
+            {editTag("修改出发城市", "compass", fromCity ? `从${fromCity}出发` : "出发城市未填", () =>
               onEditStep("departure"),
             )}
             {editTag("修改同行情况", "people", partyLabel, () => onEditStep("companions"))}

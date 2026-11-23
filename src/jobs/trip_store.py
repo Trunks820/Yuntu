@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from src.config import is_long_trip
 from src.jobs.projection_outbox import (
     close_all_running_steps,
     emit_trip_projection_commit,
@@ -642,25 +643,36 @@ async def count_running_trip_jobs() -> int:
         return int(result.scalar_one())
 
 
-async def expire_stale_trip_jobs(*, timeout_seconds: int) -> int:
+async def expire_stale_trip_jobs(
+    *, timeout_seconds: int, long_timeout_seconds: int | None = None
+) -> int:
     """Mark worker jobs that exceeded the configured SLA as timed out."""
+    if long_timeout_seconds is None:
+        long_timeout_seconds = timeout_seconds
+    expired = 0
     factory = get_session_factory()
     async with factory() as session:
         stale_rows = await session.execute(
             text("""
-                SELECT job_id, generation_policy_version, delivery_json
+                SELECT job_id, generation_policy_version, delivery_json,
+                       trip_request_json ->> 'days' AS days,
+                       EXTRACT(EPOCH FROM (NOW() - COALESCE(started_time, created_time)))
+                           AS elapsed_seconds
                 FROM travel_trip_job
                 WHERE status IN ('PENDING', 'RUNNING')
                   AND COALESCE(started_time, created_time)
-                      < NOW() - make_interval(secs => :timeout_seconds)
+                      < NOW() - make_interval(secs => :earliest_timeout_seconds)
                 ORDER BY id ASC
                 FOR UPDATE
             """),
-            {"timeout_seconds": timeout_seconds},
+            {"earliest_timeout_seconds": min(timeout_seconds, long_timeout_seconds)},
         )
-        stale_jobs = list(stale_rows)
-        job_ids = [str(row.job_id) for row in stale_jobs]
-        for stale_job in stale_jobs:
+        for stale_job in stale_rows:
+            job_timeout_seconds = (
+                long_timeout_seconds if is_long_trip(stale_job.days) else timeout_seconds
+            )
+            if stale_job.elapsed_seconds <= job_timeout_seconds:
+                continue
             job_id = str(stale_job.job_id)
             delivery_json = None
             if str(stale_job.generation_policy_version or "legacy") == "v0.12":
@@ -699,8 +711,9 @@ async def expire_stale_trip_jobs(*, timeout_seconds: int) -> int:
                 job_id=job_id,
                 changed_step_ids=step_ids,
             )
+            expired += 1
         await session.commit()
-    return len(job_ids)
+    return expired
 
 
 async def purge_expired_route_replays() -> int:

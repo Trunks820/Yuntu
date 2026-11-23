@@ -221,6 +221,8 @@ def _zero_line(
 def _category(
     category: CostCategory,
     line_items: list[CostLineItemV1],
+    *,
+    basis_label: str | None = None,
 ) -> InternalCategoryCostV1:
     ordered = tuple(line_items)
     missing = tuple(
@@ -231,7 +233,7 @@ def _category(
             category=category,
             coverage="missing",
             line_items=ordered,
-            basis_label="费用事实缺失",
+            basis_label=basis_label or "费用事实缺失",
             missing_item_identities=missing,
         )
     ranges = [
@@ -253,7 +255,7 @@ def _category(
         unrounded_party_range_fen=unrounded,
         rounded_party_range_fen=rounded,
         price_basis=basis,
-        basis_label=_BASIS_LABELS[basis],
+        basis_label=basis_label or _BASIS_LABELS[basis],
     )
 
 
@@ -357,7 +359,7 @@ def _accommodation_category(
                 source=inputs.accommodation,
                 registry=registry,
             )
-        ]),
+        ], basis_label=inputs.accommodation.basis_label),
         rooms,
         nights,
     )
@@ -427,7 +429,20 @@ def _admission_category(
             charging_unit="policy_scope",
             quantity=0,
         ))
-    return _category("admission", lines)
+    category = _category("admission", lines)
+    unpriced_count = len(category.missing_item_identities)
+    known_range = category.rounded_party_range_fen
+    if unpriced_count:
+        known_ranges = [
+            item.party_range_fen for item in lines if item.party_range_fen is not None
+        ]
+        if known_ranges:
+            known_range = round_outward_to_cny10(add_ranges(*known_ranges))
+    return category.model_copy(update={
+        "known_range_fen": known_range,
+        "priced_item_count": len(unique) - unpriced_count,
+        "unpriced_item_count": unpriced_count,
+    })
 
 
 def _meals_category(
@@ -500,6 +515,15 @@ def _scenario(
             for item in priced
             if item.rounded_party_range_fen is not None
         ])
+    admission = next(item for item in categories if item.category == "admission")
+    total_with_known_admission = None
+    if admission.unpriced_item_count is not None:
+        total_with_known_admission = public_total
+        if admission.coverage == "missing" and admission.known_range_fen is not None:
+            total_with_known_admission = (
+                add_ranges(public_total, admission.known_range_fen)
+                if public_total is not None else admission.known_range_fen
+            )
     return InternalCostScenarioV1(
         scenario_id=scenario_id,
         intercity_mode=mode,
@@ -510,6 +534,8 @@ def _scenario(
         public_reconciled_total_fen=public_total,
         categories=categories,
         missing_categories=missing,
+        total_range_with_known_admission_fen=total_with_known_admission,
+        unpriced_admission_count=admission.unpriced_item_count,
     )
 
 
@@ -558,7 +584,7 @@ def resolve_cost_snapshot(
         scenarios.append(_scenario(
             scenario_id="without_intercity",
             mode=None,
-            label="不含大交通",
+            label="未填出发城市，所以不含往返交通",
             categories=categories,
         ))
     else:
@@ -568,19 +594,26 @@ def resolve_cost_snapshot(
                 raise ValueError("duplicate intercity mode")
             round_trips[item.mode] = item
         for mode in sorted(round_trips, key=lambda value: _MODE_ORDER[value]):
+            round_trip = round_trips[mode]
             categories = (
                 _intercity_category(
-                    round_trips[mode],
+                    round_trip,
                     mode=mode,
                     people_count=inputs.people_count,
                     registry=registry,
                 ),
                 *(shared[category] for category in CATEGORY_ORDER[1:]),
             )
+            if mode == "flight":
+                label = "飞机往返"
+            elif round_trip.outbound.train_class == "ordinary":
+                label = "普通火车往返"
+            else:
+                label = "高铁往返"
             scenarios.append(_scenario(
                 scenario_id=f"{mode}_round_trip",
                 mode=mode,
-                label="高铁往返" if mode == "train" else "飞机往返",
+                label=label,
                 categories=categories,
             ))
         if not scenarios:
@@ -596,7 +629,12 @@ def resolve_cost_snapshot(
             scenarios.append(_scenario(
                 scenario_id="without_intercity",
                 mode=None,
-                label="大交通费用待确认",
+                label=(
+                    "没查到直达高铁或直飞航班，所以不含往返交通"
+                    if inputs.intercity.status == "no_direct_service"
+                    and not inputs.intercity_failure_code
+                    else "大交通费用待确认"
+                ),
                 categories=categories,
             ))
 
@@ -604,6 +642,12 @@ def resolve_cost_snapshot(
         scenarios,
         key=lambda item: _COMPLETENESS_RANK[item.completeness],
     ).completeness
+    taxi_assumption_label = "打车默认每辆最多四人，车辆数向上取整"
+    if inputs.requested_commute_mode == "driving" and any(
+        line.charging_unit == "vehicle_trip" and line.price_basis in {"sourced", "reference"}
+        for line in local_transport.line_items
+    ):
+        taxi_assumption_label = "市内交通按打车估算，每辆最多四人，车辆数向上取整"
     assumptions = (
         SnapshotAssumptionV1(
             code="two_travellers_per_room",
@@ -617,7 +661,7 @@ def resolve_cost_snapshot(
         ),
         SnapshotAssumptionV1(
             code="four_travellers_per_taxi",
-            label="打车默认每辆最多四人，车辆数向上取整",
+            label=taxi_assumption_label,
             value=f"vehicles={vehicles}",
         ),
         SnapshotAssumptionV1(
@@ -627,7 +671,7 @@ def resolve_cost_snapshot(
         ),
         SnapshotAssumptionV1(
             code="two_main_meals_per_day",
-            label="每个行程日计入午餐和晚餐各一次",
+            label="每个行程日计入午餐和晚餐各一次，不含早餐和小吃",
             value=f"meal_slots={inputs.days * 2}",
         ),
     )

@@ -11,7 +11,7 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from src.cost_reference.models import FrozenModel, MoneyRangeFen, ReviewStatus
 
@@ -131,6 +131,17 @@ class InternalCategoryCostV1(FrozenModel):
     price_basis: AggregatePriceBasis | None = None
     basis_label: str = Field(min_length=1)
     missing_item_identities: tuple[str, ...] = ()
+    known_range_fen: MoneyRangeFen | None = None
+    priced_item_count: int | None = Field(default=None, strict=True, ge=0)
+    unpriced_item_count: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_admission_fields(self, handler):
+        payload = handler(self)
+        for field in ("known_range_fen", "priced_item_count", "unpriced_item_count"):
+            if payload.get(field) is None:
+                payload.pop(field, None)
+        return payload
 
     @model_validator(mode="after")
     def validate_category_coverage(self) -> "InternalCategoryCostV1":
@@ -158,6 +169,16 @@ class InternalCostScenarioV1(FrozenModel):
     public_reconciled_total_fen: MoneyRangeFen | None = None
     categories: tuple[InternalCategoryCostV1, ...]
     missing_categories: tuple[CostCategory, ...] = ()
+    total_range_with_known_admission_fen: MoneyRangeFen | None = None
+    unpriced_admission_count: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_admission_fields(self, handler):
+        payload = handler(self)
+        for field in ("total_range_with_known_admission_fen", "unpriced_admission_count"):
+            if payload.get(field) is None:
+                payload.pop(field, None)
+        return payload
 
     @model_validator(mode="after")
     def validate_scenario(self) -> "InternalCostScenarioV1":

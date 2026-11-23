@@ -92,6 +92,7 @@ class CostSourceResult(FrozenModel):
     selected: SourceObservation | None = None
     reason: str = ""
     itinerary_publishable: Literal[True] = True
+    basis_label: str | None = Field(default=None, min_length=1, exclude=True)
 
     @model_validator(mode="after")
     def validate_selection(self) -> "CostSourceResult":

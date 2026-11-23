@@ -7,9 +7,10 @@ independent from the Writer/Review LLM path and from runtime source adapters.
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
 
 MAX_MONEY_FEN = 2**63 - 1
@@ -124,6 +125,83 @@ class MealReference(ReferenceEntry):
         )
         if self.range_fen != expected:
             raise ValueError("meal range must be the per-person source range")
+        return self
+
+
+class VerifiedMealReference(MealReference):
+    observed_date: date
+
+
+class VerifiedFactModel(FrozenModel):
+    # The file also records booking, extra fees and sampling details.
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+
+class FactPriceCny(FrozenModel):
+    min: Decimal = Field(ge=0, le=Decimal(MAX_MONEY_FEN) / 100, decimal_places=2)
+    max: Decimal = Field(ge=0, le=Decimal(MAX_MONEY_FEN) / 100, decimal_places=2)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "FactPriceCny":
+        if self.min > self.max:
+            raise ValueError("min must be <= max")
+        return self
+
+    def as_fen(self) -> MoneyRangeFen:
+        return MoneyRangeFen(min_fen=int(self.min * 100), max_fen=int(self.max * 100))
+
+
+class VerifiedTicketSource(VerifiedFactModel):
+    url: AnyHttpUrl
+    quote: str = Field(min_length=1)
+
+
+class VerifiedAdmissionFact(VerifiedFactModel):
+    city: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    aliases: tuple[str, ...]
+    price_kind: Literal["free", "paid"]
+    adult_price_cny: FactPriceCny
+    ticket_key: str | None = Field(min_length=1)
+    sources: tuple[VerifiedTicketSource, ...] = Field(min_length=1)
+    confidence: str = Field(min_length=1)
+    checked: date
+    expires: date
+
+    @model_validator(mode="after")
+    def validate_price_and_dates(self) -> "VerifiedAdmissionFact":
+        if (self.price_kind == "free") != (self.adult_price_cny.max == 0):
+            raise ValueError("only free tickets must have zero prices")
+        if self.expires <= self.checked:
+            raise ValueError("expires must be after checked")
+        return self
+
+
+class VerifiedMealCity(VerifiedFactModel):
+    city: str = Field(min_length=1)
+    per_person_cny: FactPriceCny
+
+
+class VerifiedMealTable(VerifiedFactModel):
+    method: str = Field(min_length=1)
+    amap_captured: date
+    queried: date
+    cities: tuple[VerifiedMealCity, ...]
+
+
+class VerifiedFacts(VerifiedFactModel):
+    version: str = Field(min_length=1)
+    admission: tuple[VerifiedAdmissionFact, ...]
+    meal_city_reference: VerifiedMealTable
+
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> "VerifiedFacts":
+        admission_keys = [
+            (row.city, label) for row in self.admission for label in {row.name, *row.aliases}
+        ]
+        meal_keys = [row.city for row in self.meal_city_reference.cities]
+        if len(set(admission_keys)) != len(admission_keys) or len(set(meal_keys)) != len(meal_keys):
+            raise ValueError("duplicate verified fact lookup key")
         return self
 
 

@@ -11,11 +11,12 @@ import {
   savePendingSubmission,
 } from "@/utils/pendingSubmission";
 
-const NOTICE_TEXT = "已生成基础行程，部分详细介绍暂未展开。";
-
 function shouldShowSafeDeliveryNotice(
-  result: Pick<TripResult, "published_variant" | "delivery_status">,
+  result: Pick<TripResult, "published_variant" | "delivery_status" | "delivery">,
 ): boolean {
+  if (result.delivery) {
+    return result.delivery.outcome === "BASIC";
+  }
   return (
     result.published_variant === "safe" && result.delivery_status === "DEGRADED"
   );
@@ -30,7 +31,7 @@ function findRetryInput(): TripSubmitRequest | null {
 }
 
 interface SafeDeliveryNoticeProps {
-  result: Pick<TripResult, "published_variant" | "delivery_status">;
+  result: Pick<TripResult, "published_variant" | "delivery_status" | "delivery">;
   jobId?: string | null;
 }
 
@@ -102,7 +103,7 @@ export function SafeDeliveryNotice({ result, jobId }: SafeDeliveryNoticeProps) {
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm font-medium leading-6 text-amber-950">
-          {NOTICE_TEXT}
+          {result.delivery ? "基础行程已生成" : "已生成基础行程，部分详细介绍暂未展开。"}
         </p>
         <button
           type="button"

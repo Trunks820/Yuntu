@@ -900,7 +900,7 @@ export const MobileInspirationPage: React.FC = () => {
                   <article key={save.placeId} className="saved-poi">
                     <button
                       type="button"
-                      className={`poi-pick${on ? "selected" : ""}`}
+                      className={on ? "poi-pick selected" : "poi-pick"}
                       aria-pressed={on}
                       onClick={() => togglePick(save.placeId)}
                     >

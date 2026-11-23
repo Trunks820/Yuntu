@@ -68,7 +68,8 @@ function sortHistoryItems(items: HistoryTripItem[]): HistoryTripItem[] {
   return [...items].sort((a, b) => {
     const ta = toTimestamp(a.finished_at ?? a.created_at);
     const tb = toTimestamp(b.finished_at ?? b.created_at);
-    return tb - ta;
+    if (tb !== ta) return tb - ta;
+    return toTimestamp(b.created_at) - toTimestamp(a.created_at);
   });
 }
 

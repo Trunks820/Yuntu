@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+from functools import partial
 
 from src.agents import llm
 
@@ -63,6 +64,7 @@ def parse_model_plan(text: str) -> tuple[dict | None, str | None]:
         for stop in day["stops"]:
             if not isinstance(stop, dict) or stop.get("kind") not in KINDS:
                 return None, "format"
+            stop.pop("_scenic_stops", None)
             if stop.get("kind") == "rest":
                 stop["place_id"] = None
             else:
@@ -99,14 +101,15 @@ def _public_plan(plan: dict, *, include_lodging: bool = True) -> dict:
     for day in plan.get("days") or []:
         stops = []
         for stop in day.get("stops") or []:
-            row = {
-                "kind": stop.get("kind"),
-                "place_id": stop.get("place_id"),
-                "stay_minutes": stop.get("stay_minutes"),
-            }
-            if stop.get("optional") is True:
-                row["optional"] = True
-            stops.append(row)
+            for member in stop.get("_scenic_stops", (stop,)):
+                row = {
+                    "kind": member.get("kind"),
+                    "place_id": member.get("place_id"),
+                    "stay_minutes": member.get("stay_minutes"),
+                }
+                if member.get("optional") is True:
+                    row["optional"] = True
+                stops.append(row)
         days.append({"day": day.get("day"), "stops": stops})
     if not include_lodging:
         # Hotel lodging is chosen in code. The repair prompt must not ask for it.
@@ -125,10 +128,22 @@ def _split_model_result(result) -> tuple[str, dict]:
     return str(text or ""), dict(usage or {})
 
 
-async def _invoke(caller, system: str, user: str, *, settings: Settings, calls: list[RoutePlannerCall], repaired: bool, json_retry: bool) -> str:
+async def _invoke(
+    caller,
+    system: str,
+    user: str,
+    *,
+    settings: Settings,
+    calls: list[RoutePlannerCall],
+    repaired: bool,
+    json_retry: bool,
+    timeout: float | None = None,
+) -> str:
+    if timeout is None:
+        timeout = float(settings.route_planner_timeout_seconds)
     started = time.perf_counter()
     try:
-        result = await asyncio.wait_for(caller(system, user), timeout=float(settings.route_planner_timeout_seconds))
+        result = await asyncio.wait_for(caller(system, user), timeout=timeout)
     except Exception as exc:
         calls.append(
             _route_planner_pkg.RoutePlannerCall(
@@ -215,12 +230,11 @@ async def _call_leg(system: str, user: str, settings: Settings, *, timeout: floa
         )
 
 
-async def _default_caller(system: str, user: str, settings: Settings, *,
-                          step_started: float | None = None):
+async def _default_caller(system: str, user: str, settings: Settings, *, timeout: float | None = None):
     """Primary leg, then the backup leg on a clear failure with time left."""
     from src.model_routes import route_leg
 
-    call_limit = float(settings.route_planner_timeout_seconds)
+    call_limit = float(settings.route_planner_timeout_seconds) if timeout is None else timeout
     call_started = time.perf_counter()
     try:
         return await _call_leg(system, user, settings, timeout=call_limit)
@@ -228,10 +242,7 @@ async def _default_caller(system: str, user: str, settings: Settings, *,
         reason = backup_switch_reason(exc)
         if reason is None:
             raise
-        now = time.perf_counter()
-        remaining = call_limit - (now - call_started)
-        if step_started is not None:
-            remaining = min(remaining, float(settings.route_planner_deadline_seconds) - (now - step_started))
+        remaining = call_limit - (time.perf_counter() - call_started)
         if remaining < BACKUP_MIN_SECONDS:
             raise
         try:
@@ -260,11 +271,26 @@ def _repair_user(prepared: PreparedRoute, previous: dict, adjustments: list[str]
     )
 
 
-async def _read_plan(caller, system, user, *, settings, calls, repaired: bool) -> tuple[dict | None, str | None]:
-    text = await _invoke(caller, system, user, settings=settings, calls=calls, repaired=repaired, json_retry=False)
+async def _read_plan(
+    caller, system, user, *, settings, calls, repaired: bool, deadline_monotonic: float | None = None
+) -> tuple[dict | None, str | None]:
+    async def invoke(user: str, *, json_retry: bool) -> str:
+        timeout = float(settings.route_planner_timeout_seconds)
+        if deadline_monotonic is not None:
+            timeout = min(timeout, deadline_monotonic - time.monotonic())
+            if timeout <= 0:
+                raise asyncio.TimeoutError("route planner model deadline exhausted")
+        return await _invoke(
+            partial(caller, timeout=timeout), system, user, settings=settings,
+            calls=calls, repaired=repaired, json_retry=json_retry, timeout=timeout,
+        )
+
+    text = await invoke(user, json_retry=False)
     plan, error = parse_model_plan(text)
     if error is None:
         return plan, None
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        return plan, error
     retry_user = user if JSON_RETRY_HINT in user else f"{user}\n{JSON_RETRY_HINT}"
-    text = await _invoke(caller, system, retry_user, settings=settings, calls=calls, repaired=repaired, json_retry=True)
+    text = await invoke(retry_user, json_retry=True)
     return parse_model_plan(text)

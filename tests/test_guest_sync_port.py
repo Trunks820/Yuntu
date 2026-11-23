@@ -102,6 +102,7 @@ def test_schema_sql_includes_plan_record_accommodation_columns():
         "accommodation_lat",
         "accommodation_lng",
         "accommodation_source",
+        "travel_canonical_place_opening_schedule",
     ):
         assert col in schema_sql
 

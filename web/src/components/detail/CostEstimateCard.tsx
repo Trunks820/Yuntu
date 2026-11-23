@@ -1,6 +1,9 @@
 import { useEffect, useMemo } from "react";
 import {
+  formatMoneyPeak,
+  formatPartialAdmissionText,
   getScenarioCostStatus,
+  resolveScenarioTotalRange,
   type CostEstimateSummary,
   type CostScenarioSummary,
   type CostCategoryKey,
@@ -129,7 +132,12 @@ export function CostEstimateCard({
   const statusInfo = getScenarioCostStatus(selectedScenario, isUnselected);
   const estimatedAtText = formatEstimatedAt(costEstimate.estimated_at);
 
-  const peakAmount = selectedScenario?.total_range?.max_cny;
+  const effectiveTotalRange = resolveScenarioTotalRange(selectedScenario);
+  const peakFormatted = formatMoneyPeak(effectiveTotalRange);
+  const peakDigits = peakFormatted ? peakFormatted.replace(/^¥\s*/, "") : "0";
+  const unpricedAdmissionNote = statusInfo.showAmount
+    ? (statusInfo.unpricedAdmissionNote ?? null)
+    : null;
 
   /**
    * C7：进度条只有在同组有多个金额时才说明得了事。
@@ -284,8 +292,18 @@ export function CostEstimateCard({
                   "font-[family-name:var(--font-serif)] font-normal text-[color:var(--yt-ink)]",
                 )}`}
               >
-                {peakAmount != null ? peakAmount.toLocaleString() : "0"}
+                {peakDigits}
               </span>
+              {unpricedAdmissionNote && (
+                <span
+                  className={`text-xs font-normal ml-2 ${tone(
+                    "text-gray-400",
+                    "text-[color:var(--yt-muted)]",
+                  )}`}
+                >
+                  {unpricedAdmissionNote}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -322,7 +340,8 @@ export function CostEstimateCard({
 
             const isPolicyZero = cat?.price_basis === "policy_zero";
             const isPriced = cat?.coverage === "priced" && cat.range && !isPolicyZero;
-            const amountVal = isPriced && cat.range ? cat.range.max_cny : null;
+            const amountText = isPriced && cat.range ? formatMoneyPeak(cat.range) : null;
+            const partialAdmissionText = formatPartialAdmissionText(cat);
 
             // 4px 细进度条相对比例计算
             const barPercent = isPriced && cat.range
@@ -396,14 +415,14 @@ export function CostEstimateCard({
 
                 {/* 右侧：金额 (复刻参考图单行右对齐) */}
                 <div className="text-right shrink-0 min-w-[80px]">
-                  {isPriced && amountVal != null ? (
+                  {isPriced && amountText ? (
                     <div
                       className={`text-sm font-medium tabular-nums ${tone(
                         "text-gray-800",
                         "text-[color:var(--yt-ink)]",
                       )}`}
                     >
-                      ¥ {amountVal.toLocaleString()}
+                      {amountText}
                     </div>
                   ) : isPolicyZero ? (
                     <div
@@ -421,7 +440,7 @@ export function CostEstimateCard({
                         "bg-[color:var(--yt-paper-soft)] text-[color:var(--yt-muted)]",
                       )}`}
                     >
-                      待确认
+                      {partialAdmissionText ?? "待确认"}
                     </span>
                   )}
                   {priceBasisText && (

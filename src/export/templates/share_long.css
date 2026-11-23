@@ -1,0 +1,98 @@
+/* Direction A from the travel-book mockup, adapted for the full-page share image. */
+:root {
+  color-scheme: light;
+  --paper: #f7f5ef;
+  --surface: #fffef9;
+  --ink: #173b35;
+  --accent: #166c5b;
+  --line: #dcded2;
+  --muted: #55625e;
+  --sans: "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --serif: "Noto Serif CJK SC", "Noto Serif SC", "Microsoft YaHei", serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); background: var(--paper); font-family: var(--sans); }
+h1, h2, h3, p, ul, figure { margin: 0; }
+h1, h2 { font-family: var(--serif); line-height: 1.2; overflow-wrap: anywhere; }
+ul { list-style: none; padding: 0; }
+img { display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: cover; }
+.art { overflow: hidden; border-radius: 13px; }
+.paper-art {
+  aspect-ratio: 3 / 2;
+  background:
+    repeating-linear-gradient(105deg, #fff9ed34 0 1px, transparent 1px 5px),
+    repeating-linear-gradient(23deg, #ae997514 0 1px, transparent 1px 7px),
+    radial-gradient(ellipse at 26% 17%, #fff8e8, #e9dfca 83%);
+}
+.art figcaption {
+  padding: 7px 4px 0;
+  color: var(--muted);
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.cover-label, .day-label { color: var(--accent); font-weight: 700; letter-spacing: .12em; }
+.cover-meta { display: flex; flex-wrap: wrap; align-items: center; }
+.cover-meta span + span::before { content: "·"; margin-inline: .65em; }
+.cover-preferences { color: var(--muted); }
+
+/* A · 网页旅行册 */
+#long { width: 1024px; padding: 36px 48px 52px; }
+.share .cover, .share .day {
+  padding: 17px;
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: var(--surface);
+}
+.cover > .art img, .cover > .paper-art { aspect-ratio: 2 / 1; }
+.share .cover-copy { padding: 34px 34px 30px; }
+.share .cover-label { font-size: 26px; }
+.share h1 { margin-top: 9px; font-size: 88px; letter-spacing: .03em; }
+.share .cover-meta { margin-top: 25px; font-size: 29px; }
+.share .cover-preferences { margin-top: 6px; font-size: 27px; overflow-wrap: anywhere; }
+.share .cover-intro {
+  margin-top: 21px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 28px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.share .days { display: grid; gap: 27px; margin-top: 32px; }
+.share .day-copy { padding: 20px 26px 17px; }
+.share .day-label { font-size: 27px; }
+.share h2 {
+  margin-top: 7px;
+  font-size: 44px;
+  text-wrap: balance;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+.share .periods { display: grid; gap: 10px; margin: 0 13px 14px; }
+.share .period {
+  --sky: #e3e8e1;
+  --dot: #768e7d;
+  display: grid;
+  grid-template-columns: 135px minmax(0, 1fr);
+  align-items: baseline;
+  border-radius: 9px;
+  padding: 12px 16px;
+  background: color-mix(in srgb, var(--sky), var(--surface) 40%);
+}
+.share .period.afternoon { --sky: #ece2ca; --dot: #a48650; }
+.share .period.evening { --sky: #e4cbbd; --dot: #ac7662; }
+.share .period.unscheduled { grid-template-columns: minmax(0, 1fr); }
+.share .period h3 { font-size: 27px; }
+.share .period h3::before {
+  content: "";
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin: 0 10px 4px 0;
+  border-radius: 50%;
+  background: var(--dot);
+}
+.share .period ul { display: flex; flex-flow: row wrap; align-items: center; gap: 1px 22px; }
+.share .period li { min-width: 0; max-width: 100%; font-size: 30px; line-height: 1.48; overflow-wrap: anywhere; }

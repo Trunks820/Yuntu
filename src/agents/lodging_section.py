@@ -21,9 +21,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
+from src.agents.accommodation_resolver import COORDINATE_ONLY_ACCOMMODATION_NAME
 from src.agents.chain_brands import match_chain_brand
 from src.agents.holiday_calendar import PublicHoliday, overlapping_holiday_name
 from src.agents.hotel_prices import HotelTierResult, fetch_tier_hotels
+from src.agents.route_feasibility import valid_coordinate
 from src.agents.schema import (
     AccommodationSuggestion,
     LodgingDisplay,
@@ -170,24 +172,66 @@ def start_lodging_price_task(
     )
 
 
+def _first_day_lodging_points(route_plan: RoutePlan | None) -> list[tuple[str, float, float]]:
+    if route_plan is None:
+        return []
+    first_day = next((day for day in route_plan.day_groups if day.day == 1), None)
+    if first_day is None:
+        return []
+    return [
+        (place.name, place.latitude, place.longitude)
+        for place in first_day.places
+        if valid_coordinate(place.latitude, place.longitude)
+    ]
+
+
+def _closest_place_name(points: list[tuple[str, float, float]], latitude: float, longitude: float) -> str:
+    closest = min(
+        points,
+        key=lambda point: math.dist(point[1:], (latitude, longitude)),
+        default=None,
+    )
+    return closest[0] if closest else ""
+
+
+def first_day_lodging_query_pin(route_plan: RoutePlan | None) -> tuple[str, float, float] | None:
+    points = _first_day_lodging_points(route_plan)
+    if not points:
+        return None
+    latitude = sum(point[1] for point in points) / len(points)
+    longitude = sum(point[2] for point in points) / len(points)
+    # RollingGo searches by place text. Use a nearby stop for that search and
+    # the route center for the distance filter and cache.
+    return _closest_place_name(points, latitude, longitude), latitude, longitude
+
+
 def start_lodging_price_for_trip(
     *,
     trip_request: TripRequest,
     accommodation: AccommodationSuggestion | None,
     settings: Any,
+    route_plan: RoutePlan | None = None,
     fetch: Callable[..., Any] | None = None,
     monotonic: Callable[[], float] | None = None,
     today: date | None = None,
 ) -> LodgingPriceTaskHandle | None:
-    """Start the lookup after the lodging anchor is final.
-
-    A user-stated lodging and a disabled switch do not start a task.
-    """
+    """Start the lookup for the final lodging anchor or the first day's route."""
 
     if not bool(getattr(settings, "lodging_section_v2_enabled", False)):
         return None
-    if accommodation is None or accommodation.source == "user_specified":
-        return None
+    cost_only = accommodation is None or accommodation.source == "user_specified"
+    if accommodation is None:
+        pin = first_day_lodging_query_pin(route_plan)
+        if pin is None:
+            return None
+        area_name, latitude, longitude = pin
+    else:
+        area_name = accommodation.name
+        latitude, longitude = accommodation.latitude, accommodation.longitude
+        if cost_only and not valid_coordinate(latitude, longitude):
+            return None
+        if cost_only and area_name == COORDINATE_ONLY_ACCOMMODATION_NAME:
+            area_name = _closest_place_name(_first_day_lodging_points(route_plan), latitude, longitude)
     query = fetch or fetch_tier_hotels
     checkin = resolve_checkin_date(trip_request, settings, today=today)
     nights = lodging_query_nights(getattr(trip_request, "days", None))
@@ -196,15 +240,18 @@ def start_lodging_price_for_trip(
     except (TypeError, ValueError):
         timeout_seconds = 5.0
 
+    query_options = {"cache_at_origin": True} if cost_only and fetch is None else {}
+
     async def _run() -> HotelTierResult:
         return await query(
             city=getattr(trip_request, "to_city", "") or "",
-            area_name=accommodation.name,
-            latitude=accommodation.latitude,
-            longitude=accommodation.longitude,
+            area_name=area_name,
+            latitude=latitude,
+            longitude=longitude,
             checkin_date=checkin,
             nights=nights,
             settings=settings,
+            **query_options,
         )
 
     return start_lodging_price_task(
@@ -212,7 +259,7 @@ def start_lodging_price_for_trip(
         timeout_seconds=timeout_seconds,
         monotonic=monotonic,
         city=getattr(trip_request, "to_city", "") or "",
-        area_name=accommodation.name,
+        area_name=area_name,
     )
 
 

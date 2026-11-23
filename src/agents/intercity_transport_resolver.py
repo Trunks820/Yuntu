@@ -1,10 +1,4 @@
-"""Deterministic v0.9.3 intercity transport resolver.
-
-Train schedules, inventory and fares come from 12306.  Flight schedules come
-from Aviation Edge, while every flight price comes from the versioned static
-reference table.  Provider failures are isolated from the trip workflow and
-degrade per mode.
-"""
+"""Resolve direct trains from 12306 and flight fares from Variflight."""
 
 from __future__ import annotations
 
@@ -14,7 +8,9 @@ import logging
 import math
 import re
 import time
-from datetime import date, datetime, timezone
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -25,12 +21,13 @@ from src.agents.intercity_transport_static import (
     get_static_fallback,
 )
 from src.agents.schema import (
-    FlightOption,
+    FLIGHT_FARE_PENDING,
     TrainOption,
     TransportModeSummary,
     TransportSuggestion,
     TripRequest,
 )
+from src.agents.variflight import CITY_CODES, FlightLookup, query_flight_prices
 from src.config import get_settings
 from src.jobs.city_store import resolve_city
 
@@ -94,9 +91,9 @@ def _harden_provider_http_logging() -> None:
 _harden_provider_http_logging()
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-TRANSPORT_CACHE_VERSION = "v1"
+TRANSPORT_CACHE_VERSION = "v2"
 TRANSPORT_CACHE_PREFIX = f"transport:{TRANSPORT_CACHE_VERSION}"
-STATION_MAP_CACHE_KEY = f"transport:station-map:{TRANSPORT_CACHE_VERSION}"
+STATION_MAP_CACHE_KEY = "transport:station-map:v1"
 REDIS_OPERATION_TIMEOUT_SECONDS = 0.5
 
 STATION_JS_URL = (
@@ -105,7 +102,6 @@ STATION_JS_URL = (
 LEFT_TICKET_INIT_URL = "https://kyfw.12306.cn/otn/leftTicket/init"
 LEFT_TICKET_URL = "https://kyfw.12306.cn/otn/leftTicket/queryZ"
 TICKET_PRICE_URL = "https://kyfw.12306.cn/otn/leftTicket/queryTicketPrice"
-AVIATION_EDGE_BASE_URL = "https://aviation-edge.com/v2/public"
 
 PROVIDER_HEADERS = {
     "User-Agent": (
@@ -128,28 +124,15 @@ SEAT_INDEX = {
     "动卧": 33,
 }
 
-CITY_IATA_MAP_VERSION = "2026-08-01"
-CITY_IATA_MAP: dict[str, tuple[str, ...]] = {
-    "北京": ("PEK", "PKX"),
-    "上海": ("PVG", "SHA"),
-    "重庆": ("CKG",),
-    "成都": ("CTU", "TFU"),
-    "广州": ("CAN",),
-    "深圳": ("SZX",),
-    "杭州": ("HGH",),
-    "西安": ("XIY",),
-    "南京": ("NKG",),
-    "长沙": ("CSX",),
-    "青岛": ("TAO",),
-    "桂林": ("KWL",),
-    "苏州": (),
-}
-
-DateWindow = Literal["static_only", "train_only", "both", "flight_only"]
+DateWindow = Literal["static_only", "dated", "reference"]
+HIGH_SPEED_PREFIXES = ("G", "D", "C")
+HIGH_SPEED_ONLY_MAX_MINUTES = 180
+ORDINARY_TRAIN_MAX_MINUTES = 720
+TRAIN_REFERENCE_DAYS_AHEAD = 14
 
 _redis_client: Any = None
 _station_map_memory: tuple[float, dict[str, str]] | None = None
-_TIME_RE = re.compile(r"(?P<hour>\d{1,2}):(?P<minute>\d{2})")
+_TRAIN_NUMBER_RE = re.compile(r"[A-Z]?[0-9]+")
 
 
 class ProviderUnavailable(RuntimeError):
@@ -160,8 +143,12 @@ class ProviderResponseError(RuntimeError):
     """A non-retryable provider HTTP response failure."""
 
 
+@dataclass
 class _NoHighSpeedTrains:
-    """12306 returned rows, but parse_train_list kept no G/D trains."""
+    """12306 had no valid G/D/C schedules, with any eligible ordinary trains."""
+
+    ordinary_trains: list[dict[str, Any]] = field(default_factory=list)
+    station_map: dict[str, str] = field(default_factory=dict)
 
 
 def _utc_now_iso() -> str:
@@ -225,11 +212,9 @@ def _date_window(
     days_ahead = (requested - local_today).days
     if days_ahead < 0:
         return "static_only"
-    if days_ahead <= 6:
-        return "train_only"
     if days_ahead <= 15:
-        return "both"
-    return "flight_only"
+        return "dated"
+    return "reference"
 
 
 async def _canonical_city(value: str | None) -> str:
@@ -307,8 +292,13 @@ async def _write_cache(
         client = await _get_redis_client()
         if client is None:
             return
+        payload = suggestion.model_dump(mode="json")
+        if suggestion.direct_service_absent:
+            payload["direct_service_absent"] = True
+        if suggestion.flight_fare_pending:
+            payload["flight_fare_pending"] = True
         await asyncio.wait_for(
-            client.setex(key, int(ttl_seconds), suggestion.model_dump_json()),
+            client.setex(key, int(ttl_seconds), json.dumps(payload, ensure_ascii=False)),
             timeout=REDIS_OPERATION_TIMEOUT_SECONDS,
         )
     except Exception as exc:
@@ -445,8 +435,12 @@ def _duration_minutes(raw: str) -> int:
         return 0
 
 
-def parse_train_list(raw_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Parse 12306 pipe rows and keep valid G/D schedules."""
+def parse_train_list(
+    raw_data: dict[str, Any],
+    *,
+    include_ordinary: bool = False,
+) -> list[dict[str, Any]]:
+    """Parse direct 12306 schedules, keeping G/D/C trains by default."""
 
     data = raw_data.get("data") if isinstance(raw_data, dict) else None
     rows = data.get("result") if isinstance(data, dict) else None
@@ -461,7 +455,10 @@ def parse_train_list(raw_data: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         display_no = parts[3].strip()
         duration = _duration_minutes(parts[10])
-        if not display_no.startswith(("G", "D")) or duration <= 0:
+        valid_train_number = display_no.startswith(HIGH_SPEED_PREFIXES) or (
+            include_ordinary and _TRAIN_NUMBER_RE.fullmatch(display_no)
+        )
+        if not valid_train_number or duration <= 0:
             continue
         seats = {
             label: (parts[index].strip() if index < len(parts) else "")
@@ -593,15 +590,16 @@ async def _query_ticket_price(
     price_data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(price_data, dict):
         return {}
-    second = _parse_price_value(price_data.get("O"))
-    # Seat code M is first class; A9 is business class and must not be
-    # projected into the first_class_price field.
-    first = _parse_price_value(price_data.get("M"))
+    # A9 is business class and A4 is soft sleeper.
+    seat_codes = {
+        "O": "second_class", "M": "first_class",
+        "A1": "hard_seat", "A3": "hard_sleeper",
+    }
     result: dict[str, float] = {}
-    if second is not None:
-        result["second_class"] = second
-    if first is not None:
-        result["first_class"] = first
+    for code, seat in seat_codes.items():
+        price = _parse_price_value(price_data.get(code))
+        if price is not None and math.isfinite(price) and price > 0:
+            result[seat] = price
     return result
 
 
@@ -622,6 +620,74 @@ def _aggregate_price_range(
     )
 
 
+def _train_option(
+    train: dict[str, Any],
+    fare: dict[str, float],
+    station_names: dict[str, str],
+    from_city: str,
+    to_city: str,
+) -> TrainOption:
+    return TrainOption(
+        train_no=train["train_no"],
+        departure_time=train["depart_time"],
+        arrival_time=train["arrive_time"],
+        duration_minutes=train["duration_min"],
+        departure_station=station_names.get(train["from_station_code"], from_city),
+        arrival_station=station_names.get(train["to_station_code"], to_city),
+        second_class_price=fare.get("second_class"),
+        first_class_price=fare.get("first_class"),
+    )
+
+
+async def _query_ordinary_train_prices(
+    trains: list[dict[str, Any]],
+    query_date: str,
+    *,
+    deadline: float,
+) -> list[dict[str, float]]:
+    timeout = float(get_settings().transport_12306_timeout_seconds)
+    parallel_requests = asyncio.Semaphore(5)
+    async with httpx.AsyncClient(verify=True, follow_redirects=True) as client:
+        await _warm_12306_session(client, deadline=deadline, timeout=timeout)
+
+        async def fetch(train: dict[str, Any]) -> dict[str, float]:
+            async with parallel_requests:
+                return await _query_ticket_price(
+                    client, train, query_date, deadline=deadline, timeout=timeout,
+                )
+
+        return await asyncio.gather(*(fetch(train) for train in trains))
+
+
+def _ordinary_train_result(
+    result: _NoHighSpeedTrains,
+    fares: list[dict[str, float]],
+    from_city: str,
+    to_city: str,
+) -> dict[str, Any]:
+    trains = result.ordinary_trains
+    station_names = {code: name for name, code in result.station_map.items()}
+    hard_seats = [fare["hard_seat"] for fare in fares if "hard_seat" in fare]
+    hard_sleepers = [fare["hard_sleeper"] for fare in fares if "hard_sleeper" in fare]
+    price_bounds = []
+    if hard_seats:
+        lower = min(hard_seats)
+        price_bounds = [lower, max(lower, max(hard_sleepers or hard_seats))]
+    price_range, price_source = _aggregate_price_range(price_bounds, fallback="以购票平台为准")
+    return {
+        "train_class": "ordinary",
+        "min_duration_minutes": trains[0]["duration_min"],
+        "price_range": price_range,
+        "price_source": price_source,
+        "daily_count": len(trains),
+        "availability_checked_at": _utc_now_iso(),
+        "top_options": [
+            _train_option(train, {}, station_names, from_city, to_city)
+            for train in trains[:5]
+        ],
+    }
+
+
 async def _query_12306_once(
     from_city: str,
     to_city: str,
@@ -629,6 +695,7 @@ async def _query_12306_once(
     *,
     deadline: float,
     timeout: float,
+    on_train_duration: Callable[[int], None] | None = None,
 ) -> dict[str, Any] | _NoHighSpeedTrains | None:
     async with httpx.AsyncClient(verify=True, follow_redirects=True) as client:
         await _warm_12306_session(client, deadline=deadline, timeout=timeout)
@@ -654,24 +721,37 @@ async def _query_12306_once(
             payload = response.json()
         except ValueError:
             return None
-        if isinstance(payload, dict) and payload.get("httpstatus") not in {None, 200}:
+        if not isinstance(payload, dict):
             return None
-        payload_dict = payload if isinstance(payload, dict) else {}
-        trains = parse_train_list(payload_dict)
+        if payload.get("httpstatus") not in {None, 200} or payload.get("status") is False:
+            return None
+        data = payload.get("data")
+        rows = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        schedules = parse_train_list(payload, include_ordinary=True)
+        if rows and not schedules:
+            return None
+        trains = [train for train in schedules if train["train_no"].startswith(HIGH_SPEED_PREFIXES)]
         if not trains:
-            data = payload_dict.get("data")
-            rows = data.get("result") if isinstance(data, dict) else None
-            if isinstance(rows, list) and rows:
-                logger.info(
-                    "12306 transport lookup has no G/D trains route=%s->%s",
-                    from_city,
-                    to_city,
-                )
-                return _NoHighSpeedTrains()
-            return None
+            logger.info(
+                "12306 transport lookup has no G/D/C trains route=%s->%s",
+                from_city,
+                to_city,
+            )
+            return _NoHighSpeedTrains(
+                ordinary_trains=[
+                    train for train in schedules
+                    if train["duration_min"] <= ORDINARY_TRAIN_MAX_MINUTES
+                ],
+                station_map=station_map,
+            )
         top, availability = recommend_trains(trains)
         if not top:
             return None
+        min_duration = min(train["duration_min"] for train in top)
+        if on_train_duration is not None:
+            on_train_duration(min_duration)
         prices = await asyncio.gather(*[
             _query_ticket_price(
                 client,
@@ -683,37 +763,20 @@ async def _query_12306_once(
             for train in top
         ])
 
-    reverse_station_map = {code: name for name, code in station_map.items()}
-    options: list[TrainOption] = []
-    second_prices: list[float] = []
-    for train, fare in zip(top, prices):
-        second = fare.get("second_class")
-        first = fare.get("first_class")
-        if second is not None:
-            second_prices.append(second)
-        options.append(TrainOption(
-            train_no=str(train["train_no"]),
-            departure_time=str(train["depart_time"]),
-            arrival_time=str(train["arrive_time"]),
-            duration_minutes=int(train["duration_min"]),
-            departure_station=reverse_station_map.get(
-                str(train["from_station_code"]),
-                from_city,
-            ),
-            arrival_station=reverse_station_map.get(
-                str(train["to_station_code"]),
-                to_city,
-            ),
-            second_class_price=second,
-            first_class_price=first,
-        ))
+    station_names = {code: name for name, code in station_map.items()}
+    options = [
+        _train_option(train, fare, station_names, from_city, to_city)
+        for train, fare in zip(top, prices)
+    ]
+    second_prices = [fare["second_class"] for fare in prices if "second_class" in fare]
     static_entry = get_static_fallback(from_city, to_city) or {}
     price_range, price_source = _aggregate_price_range(
         second_prices,
         fallback=str(static_entry.get("train_price") or "以购票平台为准"),
     )
     return {
-        "min_duration_minutes": min(option.duration_minutes for option in options),
+        "train_class": "high_speed",
+        "min_duration_minutes": min_duration,
         "price_range": price_range,
         "price_source": price_source,
         "daily_count": len(trains),
@@ -729,6 +792,7 @@ async def _query_12306_with_deadline(
     query_date: str,
     *,
     deadline: float,
+    on_train_duration: Callable[[int], None] | None = None,
 ) -> dict[str, Any] | _NoHighSpeedTrains | None:
     settings = get_settings()
     attempts = max(0, int(settings.transport_12306_retry_count)) + 1
@@ -742,6 +806,7 @@ async def _query_12306_with_deadline(
                 query_date,
                 deadline=deadline,
                 timeout=float(settings.transport_12306_timeout_seconds),
+                on_train_duration=on_train_duration,
             )
         except ProviderResponseError as exc:
             logger.info(
@@ -760,288 +825,21 @@ async def _query_12306_with_deadline(
     return None
 
 
-def _parse_autocomplete_payload(payload: Any) -> list[str]:
-    """Parse documented and observed Aviation Edge autocomplete containers."""
-
-    containers = payload if isinstance(payload, list) else [payload]
-    codes: list[str] = []
-    for container in containers:
-        if not isinstance(container, dict) or container.get("error"):
-            continue
-        items: list[Any] = []
-        for key in ("airports", "airportsByCities"):
-            candidate = container.get(key)
-            if isinstance(candidate, list):
-                items.extend(candidate)
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            code = str(item.get("code") or item.get("codeIataAirport") or "").strip().upper()
-            if code and code not in codes:
-                codes.append(code)
-    return codes
-
-
-async def _city_to_iata(
-    client: httpx.AsyncClient,
-    city: str,
-    *,
-    api_key: str,
-    deadline: float,
-    timeout: float,
-) -> list[str]:
-    if city in CITY_IATA_MAP:
-        return list(CITY_IATA_MAP[city])
-    response = await _get(
-        client,
-        f"{AVIATION_EDGE_BASE_URL}/autocomplete",
-        deadline=deadline,
-        provider_timeout=timeout,
-        params={"key": api_key, "query": city},
-    )
-    try:
-        payload = response.json()
-    except ValueError:
-        return []
-    return _parse_autocomplete_payload(payload)
-
-
-def _parse_flights_payload(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict) and not item.get("error")]
-    if not isinstance(payload, dict) or payload.get("error"):
-        return []
-    for key in ("data", "flights", "results"):
-        items = payload.get(key)
-        if isinstance(items, list):
-            return [item for item in items if isinstance(item, dict) and not item.get("error")]
-    if isinstance(payload.get("departure"), dict) and isinstance(payload.get("arrival"), dict):
-        return [payload]
-    return []
-
-
-def _clock_minutes(value: Any) -> int | None:
-    match = _TIME_RE.search(str(value or ""))
-    if match is None:
-        return None
-    hour = int(match.group("hour"))
-    minute = int(match.group("minute"))
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    return hour * 60 + minute
-
-
-def _flight_duration_minutes(departure_time: Any, arrival_time: Any) -> int | None:
-    departure = _clock_minutes(departure_time)
-    arrival = _clock_minutes(arrival_time)
-    if departure is None or arrival is None:
-        return None
-    duration = arrival - departure
-    if duration < 0:
-        duration += 1440
-    return duration if duration > 0 else None
-
-
-def _flight_price_from_static(from_city: str, to_city: str) -> str:
-    entry = get_static_fallback(from_city, to_city) or {}
-    price = str(entry.get("flight_price") or "").strip()
-    return f"{price}（参考价）" if price else "以购票平台为准"
-
-
-async def _fetch_future_flights(
-    client: httpx.AsyncClient,
-    departure_iata: str,
-    query_date: str,
-    *,
-    api_key: str,
-    deadline: float,
-    timeout: float,
-) -> list[dict[str, Any]]:
-    response = await _get(
-        client,
-        f"{AVIATION_EDGE_BASE_URL}/flightsFuture",
-        deadline=deadline,
-        provider_timeout=timeout,
-        params={
-            "key": api_key,
-            "iataCode": departure_iata,
-            "type": "departure",
-            "date": query_date,
-        },
-    )
-    try:
-        payload = response.json()
-    except ValueError:
-        return []
-    return _parse_flights_payload(payload)
-
-
-async def _query_flights_once(
-    from_city: str,
-    to_city: str,
-    query_date: str,
-    *,
-    deadline: float,
-    timeout: float,
-    api_key: str,
-) -> dict[str, Any] | None:
-    async with httpx.AsyncClient(verify=True, follow_redirects=True) as client:
-        from_iatas, to_iatas = await asyncio.gather(
-            _city_to_iata(
-                client,
-                from_city,
-                api_key=api_key,
-                deadline=deadline,
-                timeout=timeout,
-            ),
-            _city_to_iata(
-                client,
-                to_city,
-                api_key=api_key,
-                deadline=deadline,
-                timeout=timeout,
-            ),
-        )
-        if not from_iatas or not to_iatas:
-            return None
-        responses = await asyncio.gather(*[
-            _fetch_future_flights(
-                client,
-                iata,
-                query_date,
-                api_key=api_key,
-                deadline=deadline,
-                timeout=timeout,
-            )
-            for iata in from_iatas
-        ], return_exceptions=True)
-    successful_responses = [
-        response for response in responses if isinstance(response, list)
-    ]
-    if not successful_responses and any(isinstance(item, Exception) for item in responses):
-        if any(isinstance(item, ProviderResponseError) for item in responses):
-            raise ProviderResponseError("flight_schedule_response_rejected")
-        raise ProviderUnavailable("all_flight_schedule_requests_failed")
-    destination_codes = set(to_iatas)
-    parsed: list[FlightOption] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for flights in successful_responses:
-        for flight in flights:
-            departure = flight.get("departure")
-            arrival = flight.get("arrival")
-            airline = flight.get("airline")
-            flight_data = flight.get("flight")
-            if not isinstance(departure, dict) or not isinstance(arrival, dict):
-                continue
-            arrival_iata = str(arrival.get("iataCode") or "").strip().upper()
-            departure_iata = str(departure.get("iataCode") or "").strip().upper()
-            if arrival_iata not in destination_codes or not departure_iata:
-                continue
-            departure_time = str(
-                departure.get("scheduledTime")
-                or departure.get("scheduledTimeUtc")
-                or ""
-            ).strip()
-            arrival_time = str(
-                arrival.get("scheduledTime")
-                or arrival.get("scheduledTimeUtc")
-                or ""
-            ).strip()
-            duration = _flight_duration_minutes(departure_time, arrival_time)
-            if duration is None:
-                continue
-            flight_dict = flight_data if isinstance(flight_data, dict) else {}
-            airline_dict = airline if isinstance(airline, dict) else {}
-            flight_no = str(
-                flight_dict.get("iataNumber")
-                or flight.get("flightNumber")
-                or (
-                    f"{airline_dict.get('iataCode') or ''}{flight_dict.get('number') or ''}"
-                )
-            ).strip()
-            if not flight_no:
-                continue
-            key = (flight_no, departure_time, departure_iata, arrival_iata)
-            if key in seen:
-                continue
-            seen.add(key)
-            parsed.append(FlightOption(
-                flight_no=flight_no,
-                airline=str(
-                    airline_dict.get("name")
-                    or airline_dict.get("iataCode")
-                    or "未知航司"
-                ).strip(),
-                departure_time=(
-                    f"{_clock_minutes(departure_time) // 60:02d}:"
-                    f"{_clock_minutes(departure_time) % 60:02d}"
-                ),
-                arrival_time=(
-                    f"{_clock_minutes(arrival_time) // 60:02d}:"
-                    f"{_clock_minutes(arrival_time) % 60:02d}"
-                ),
-                duration_minutes=duration,
-                departure_airport=departure_iata,
-                arrival_airport=arrival_iata,
-            ))
-    parsed.sort(key=lambda option: (
-        option.duration_minutes,
-        option.departure_time,
-        option.flight_no,
-    ))
-    if not parsed:
-        return None
-    return {
-        "min_duration_minutes": parsed[0].duration_minutes,
-        "price_range": _flight_price_from_static(from_city, to_city),
-        "price_source": "static_reference",
-        "daily_count": len(parsed),
-        "availability_status": "unknown",
-        "availability_checked_at": None,
-        "top_options": parsed[:5],
-    }
-
-
 async def _query_flights_with_deadline(
     from_city: str,
     to_city: str,
     query_date: str,
     *,
     deadline: float,
-) -> dict[str, Any] | None:
+) -> FlightLookup:
     settings = get_settings()
-    api_key = str(settings.aviation_edge_api_key or "").strip()
-    if not api_key:
-        logger.info("Aviation Edge transport lookup skipped: API key missing")
-        return None
-    attempts = max(0, int(settings.transport_12306_retry_count)) + 1
-    for attempt in range(attempts):
-        if _remaining(deadline) <= 0:
-            return None
-        try:
-            return await _query_flights_once(
-                from_city,
-                to_city,
-                query_date,
-                deadline=deadline,
-                timeout=float(settings.transport_flight_timeout_seconds),
-                api_key=api_key,
-            )
-        except ProviderResponseError as exc:
-            logger.info(
-                "Aviation Edge transport lookup rejected type=%s",
-                type(exc).__name__,
-            )
-            return None
-        except (ProviderUnavailable, asyncio.TimeoutError) as exc:
-            logger.info(
-                "Aviation Edge transport lookup failed attempt=%s type=%s",
-                attempt + 1,
-                type(exc).__name__,
-            )
-            if attempt + 1 >= attempts or _remaining(deadline) <= 0.05:
-                return None
-    return None
+    return await query_flight_prices(
+        CITY_CODES[from_city],
+        CITY_CODES[to_city],
+        query_date,
+        api_key=settings.variflight_api_key.strip(),
+        timeout=_request_timeout(deadline, settings.transport_flight_timeout_seconds),
+    )
 
 
 def _need_flight(
@@ -1049,50 +847,25 @@ def _need_flight(
     static_entry: dict[str, Any] | None,
 ) -> bool:
     if train is not None:
-        return int(train.get("min_duration_minutes") or 0) > 180
-    if static_entry is None:
+        return int(train.get("min_duration_minutes") or 0) > HIGH_SPEED_ONLY_MAX_MINUTES
+    if static_entry is None or static_entry.get("train_hours") is None:
         return True
     try:
-        return float(static_entry.get("train_hours") or 0) > 3.0
+        return float(static_entry["train_hours"]) * 60 > HIGH_SPEED_ONLY_MAX_MINUTES
     except (TypeError, ValueError):
         return True
 
 
-def _static_mode(
-    mode: Literal["train", "flight"],
-    entry: dict[str, Any],
-) -> TransportModeSummary | None:
-    hours_value = entry.get(f"{mode}_hours")
-    if hours_value is None:
-        return None
+def _static_duration(entry: dict[str, Any], key: str) -> int | None:
     try:
-        duration = max(1, int(round(float(hours_value) * 60)))
-    except (TypeError, ValueError):
+        return max(1, round(float(entry[key]) * 60))
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
-    if mode == "flight":
-        raw_price = str(entry.get("flight_price") or "").strip()
-        price_range = f"{raw_price}（参考价）" if raw_price else "以购票平台为准"
-    else:
-        price_range = str(entry.get("train_price") or "以购票平台为准")
-    return TransportModeSummary(
-        mode=mode,
-        min_duration_minutes=duration,
-        price_range=price_range,
-        price_source="static_reference",
-        daily_count=0,
-        data_source="static_fallback",
-        availability_status="unknown",
-        availability_checked_at=None,
-        top_options=[],
-    )
 
 
-def _realtime_mode(
-    mode: Literal["train", "flight"],
-    result: dict[str, Any],
-) -> TransportModeSummary:
+def _realtime_train_mode(result: dict[str, Any]) -> TransportModeSummary:
     return TransportModeSummary(
-        mode=mode,
+        mode="train",
         min_duration_minutes=int(result["min_duration_minutes"]),
         price_range=str(result["price_range"]),
         price_source=result.get("price_source", "static_reference"),
@@ -1101,6 +874,8 @@ def _realtime_mode(
         availability_status=result.get("availability_status", "unknown"),
         availability_checked_at=result.get("availability_checked_at"),
         top_options=result.get("top_options") or [],
+        train_class=result.get("train_class"),
+        reference_date=result.get("reference_date"),
     )
 
 
@@ -1109,25 +884,28 @@ def _assemble(
     to_city: str,
     query_date: str | None,
     train: dict[str, Any] | None,
-    flight: dict[str, Any] | None,
-    need_flight: bool,
+    flight: TransportModeSummary | None,
     static_entry: dict[str, Any] | None,
+    *,
+    flight_fare_pending: bool = False,
 ) -> TransportSuggestion | None:
     modes: list[TransportModeSummary] = []
     if train is not None:
-        modes.append(_realtime_mode("train", train))
+        modes.append(_realtime_train_mode(train))
     elif static_entry is not None:
-        static_train = _static_mode("train", static_entry)
-        if static_train is not None:
-            modes.append(static_train)
-
-    if need_flight:
-        if flight is not None:
-            modes.append(_realtime_mode("flight", flight))
-        elif static_entry is not None:
-            static_flight = _static_mode("flight", static_entry)
-            if static_flight is not None:
-                modes.append(static_flight)
+        duration = _static_duration(static_entry, "train_hours")
+        if duration is not None:
+            modes.append(TransportModeSummary(
+                mode="train",
+                min_duration_minutes=duration,
+                price_range=str(static_entry.get("train_price") or "以购票平台为准"),
+                price_source="static_reference",
+                daily_count=0,
+                data_source="static_fallback",
+                train_class="high_speed",
+            ))
+    if flight is not None:
+        modes.append(flight)
 
     if not modes:
         return None
@@ -1145,6 +923,7 @@ def _assemble(
         modes=modes,
         source=source,
         cached_at=_utc_now_iso(),
+        flight_fare_pending=flight_fare_pending,
     )
 
 
@@ -1155,15 +934,7 @@ def _assemble_static_only(
     entry = get_static_fallback(from_city, to_city)
     if entry is None:
         return None
-    suggestion = _assemble(
-        from_city,
-        to_city,
-        None,
-        None,
-        None,
-        _need_flight(None, entry),
-        entry,
-    )
+    suggestion = _assemble(from_city, to_city, None, None, None, entry)
     if suggestion is None:
         return None
     return suggestion.model_copy(update={"cached_at": None})
@@ -1208,7 +979,7 @@ async def _cancel_unfinished(task: asyncio.Task | None) -> None:
 
 
 async def resolve_transport(trip_request: TripRequest) -> TransportSuggestion | None:
-    """Resolve an optional intercity suggestion under one shared 12-second budget."""
+    """Resolve an optional intercity suggestion under one shared budget."""
 
     settings = get_settings()
     if not bool(settings.intercity_transport_enabled):
@@ -1239,7 +1010,8 @@ async def resolve_transport(trip_request: TripRequest) -> TransportSuggestion | 
     if not from_city or not to_city or from_city == to_city:
         return None
 
-    window = _date_window(trip_request.start_date)
+    today = datetime.now(SHANGHAI_TZ).date()
+    window = _date_window(trip_request.start_date, today=today)
     if window == "static_only":
         suggestion = _assemble_static_only(from_city, to_city)
         if suggestion is not None:
@@ -1252,6 +1024,11 @@ async def resolve_transport(trip_request: TripRequest) -> TransportSuggestion | 
         return suggestion
 
     query_date = str(trip_request.start_date or "").strip()
+    reference_date = (
+        today + timedelta(days=TRAIN_REFERENCE_DAYS_AHEAD)
+        if window == "reference" else None
+    )
+    train_date = reference_date.isoformat() if reference_date else query_date
     key = _cache_key(from_city, to_city, query_date)
     cached = await _await_until_deadline(
         asyncio.create_task(_read_cache(key)),
@@ -1261,60 +1038,111 @@ async def resolve_transport(trip_request: TripRequest) -> TransportSuggestion | 
         return cached
 
     static_entry = get_static_fallback(from_city, to_city)
-    train: dict[str, Any] | None = None
-    flight: dict[str, Any] | None = None
-    flight_task: asyncio.Task | None = None
-    no_high_speed_trains = False
-    preflight_need = static_entry is None or _need_flight(None, static_entry)
-    if window in {"both", "flight_only"} and preflight_need:
-        flight_task = asyncio.create_task(_query_flights_with_deadline(
-            from_city,
-            to_city,
-            query_date,
-            deadline=deadline,
-        ))
+    flight_supported = from_city in CITY_CODES and to_city in CITY_CODES
+    flight_task: asyncio.Task[FlightLookup] | None = None
+    ordinary_fares_task: asyncio.Task | None = None
+    flight_lookup: FlightLookup | None = None
+    train_duration: int | None = None
 
-    if window in {"train_only", "both"}:
+    def start_flight() -> None:
+        nonlocal flight_task
+        if flight_supported and flight_task is None and _remaining(deadline) > 0:
+            flight_task = asyncio.create_task(_query_flights_with_deadline(
+                from_city, to_city, query_date, deadline=deadline,
+            ))
+
+    def on_train_duration(minutes: int) -> None:
+        nonlocal train_duration
+        train_duration = minutes
+        if minutes > HIGH_SPEED_ONLY_MAX_MINUTES:
+            start_flight()
+
+    try:
         train_query = await _await_until_deadline(
             asyncio.create_task(_query_12306_with_deadline(
                 from_city,
                 to_city,
-                query_date,
+                train_date,
                 deadline=deadline,
+                on_train_duration=on_train_duration,
             )),
             deadline,
         )
+        no_high_speed = None
         if isinstance(train_query, _NoHighSpeedTrains):
-            no_high_speed_trains = True
+            no_high_speed = train_query
+            # A usable schedule response supersedes historical route assumptions.
+            static_entry = None
             train = None
         else:
             train = train_query
 
-    need_flight = no_high_speed_trains or _need_flight(train, static_entry)
-    if need_flight and (window in {"both", "flight_only"} or no_high_speed_trains):
-        if flight_task is None:
-            flight_task = asyncio.create_task(_query_flights_with_deadline(
-                from_city,
-                to_city,
-                query_date,
-                deadline=deadline,
-            ))
-        flight = await _await_until_deadline(flight_task, deadline)
-    else:
+        need_flight = (
+            train_duration > HIGH_SPEED_ONLY_MAX_MINUTES if train_duration is not None
+            else _need_flight(train, static_entry)
+        )
+        if need_flight:
+            start_flight()
+            if no_high_speed is not None and no_high_speed.ordinary_trains:
+                # Collect fares under the same deadline while the flight lookup runs.
+                ordinary_fares_task = asyncio.create_task(_query_ordinary_train_prices(
+                    no_high_speed.ordinary_trains,
+                    train_date,
+                    deadline=deadline,
+                ))
+            if flight_task is not None:
+                flight_lookup = await _await_until_deadline(flight_task, deadline)
+            if ordinary_fares_task is not None and no_high_speed is not None and (
+                flight_lookup is None or flight_lookup.status != "found"
+            ):
+                fares = await _await_until_deadline(ordinary_fares_task, deadline) or []
+                train = _ordinary_train_result(no_high_speed, fares, from_city, to_city)
+    finally:
         await _cancel_unfinished(flight_task)
+        await _cancel_unfinished(ordinary_fares_task)
 
+    if train is not None and reference_date is not None:
+        train = {**train, "reference_date": reference_date, "availability_status": "unknown"}
+
+    flight = flight_lookup.mode if flight_lookup is not None else None
+    no_direct_flight = flight_lookup is not None and flight_lookup.status == "no_direct_service"
+    flight_lookup_failed = flight_lookup is None or flight_lookup.status == "failed"
+    flight_fare_pending = (
+        need_flight and flight_supported and flight is None and no_high_speed is None
+    )
+    if flight_fare_pending and flight_lookup_failed and static_entry is not None:
+        duration = _static_duration(static_entry, "flight_hours")
+        if duration is not None:
+            flight = TransportModeSummary(
+                mode="flight",
+                min_duration_minutes=duration,
+                price_range=FLIGHT_FARE_PENDING,
+                price_source="static_reference",
+                daily_count=0,
+                data_source="static_fallback",
+            )
     suggestion = _assemble(
         from_city,
         to_city,
         query_date,
         train,
         flight,
-        need_flight,
         static_entry,
+        flight_fare_pending=flight_fare_pending and flight is None,
     )
-    if suggestion is None:
-        return None
-    if _remaining(deadline) > 0:
+    if suggestion is None and no_high_speed is not None and no_direct_flight:
+        suggestion = TransportSuggestion(
+            from_city=from_city,
+            to_city=to_city,
+            query_date=query_date,
+            source="realtime",
+            direct_service_absent=True,
+        )
+    if (
+        suggestion is not None
+        and _remaining(deadline) > 0
+        and not (need_flight and flight_supported and flight_lookup_failed)
+    ):
         await _await_until_deadline(
             asyncio.create_task(_write_cache(
                 key,
@@ -1327,8 +1155,6 @@ async def resolve_transport(trip_request: TripRequest) -> TransportSuggestion | 
 
 
 __all__ = [
-    "CITY_IATA_MAP",
-    "CITY_IATA_MAP_VERSION",
     "canonicalize_transport_city",
     "parse_train_list",
     "recommend_trains",

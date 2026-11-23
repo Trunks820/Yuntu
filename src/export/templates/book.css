@@ -1,0 +1,170 @@
+/* Direction A · A5 travel book */
+@page {
+  size: A5;
+  margin: 12mm 10mm 13mm;
+  @bottom-left {
+    content: "云途旅行册";
+    color: #55625e;
+    font: 8pt "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  }
+  @bottom-right {
+    content: counter(page);
+    color: #55625e;
+    font: 8pt "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  }
+}
+
+@page cover {
+  margin: 9mm;
+  @bottom-left { content: none; }
+  @bottom-right { content: none; }
+}
+
+:root {
+  --paper: #f7f5ef;
+  --surface: #fffef9;
+  --ink: #173b35;
+  --accent: #166c5b;
+  --line: #dcded2;
+  --muted: #55625e;
+  --sans: var(--book-font, "Noto Sans CJK SC"), "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --heading: var(--book-font, "Noto Serif CJK SC"), "Noto Serif SC", var(--sans);
+  color-scheme: light;
+  print-color-adjust: exact;
+  background: var(--paper);
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); font: 10.5pt/1.6 var(--sans); overflow-wrap: anywhere; }
+h1, h2, h3, h4, p, figure, ol { margin: 0; }
+h1, h2 { font-family: var(--heading); line-height: 1.25; }
+h1 { font-size: 34pt; }
+h2 { font-size: 22pt; margin-bottom: 4mm; }
+h3 { font-size: 12pt; }
+h4 { font-size: 10pt; margin-top: 2mm; }
+h2, h3, h4 { break-after: avoid; }
+p { orphans: 2; widows: 2; }
+.eyebrow { color: var(--accent); font-size: 9pt; font-weight: 700; letter-spacing: .12em; margin-bottom: 1.5mm; }
+.prose, .cover-summary { white-space: pre-line; }
+.chapter > .prose { margin-top: 3mm; }
+.muted { color: var(--muted); font-size: 9pt; margin-block: 2.5mm; white-space: pre-line; }
+
+.cover {
+  page: cover;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 5mm;
+  padding: 3mm;
+  min-height: 179mm;
+}
+.cover-copy { padding: 5mm 5mm 6mm; }
+.cover-meta { color: var(--accent); font-weight: 600; margin-top: 3mm; }
+.cover-meta:empty { display: none; }
+.cover-summary { margin-top: 3mm; padding-top: 3mm; border-top: 1px solid var(--line); }
+.art { border-radius: 3mm; overflow: hidden; break-inside: avoid; }
+.art img { display: block; width: 100%; height: 100mm; object-fit: cover; }
+.art figcaption { padding: 1mm 1mm 0; font-size: 7pt; color: var(--muted); }
+.art a { color: var(--accent); }
+.paper-art {
+  min-height: 100mm;
+  background:
+    repeating-linear-gradient(105deg, #fff9ed34 0 1px, transparent 1px 5px),
+    repeating-linear-gradient(23deg, #ae997514 0 1px, transparent 1px 7px),
+    radial-gradient(ellipse at 26% 17%, #fff8e8, #e9dfca 83%);
+}
+
+.chapter { break-before: page; }
+.chapter > .trip-opening {
+  margin-top: 0;
+  margin-bottom: 4mm;
+  padding-bottom: 3mm;
+  border-bottom: 1px solid var(--line);
+}
+.lodging-trip { color: var(--muted); font-size: 8.5pt; white-space: pre-line; margin-bottom: 2.5mm; }
+.day-visuals {
+  display: flex;
+  align-items: flex-start;
+  gap: 2.5mm;
+  break-inside: avoid;
+}
+.day-visuals > * { flex: 1; min-width: 0; }
+.day-visuals .art img { height: 37mm; }
+.day-visuals .paper-art { min-height: 37mm; }
+.route {
+  position: relative;
+  background: #e8efea;
+  border-radius: 3mm;
+  overflow: hidden;
+  height: 37mm;
+  color: var(--accent);
+}
+.route svg { width: 100%; height: calc(100% - 5mm); display: block; }
+.route polyline { stroke: #478378; stroke-width: 2.4; stroke-linejoin: round; stroke-linecap: round; fill: none; }
+.route ellipse { fill: #166c5b; stroke: white; stroke-width: 1.4; }
+.route text { font: 700 10px var(--sans); text-anchor: middle; fill: white; }
+.route figcaption { text-align: center; font-size: 8pt; }
+
+.stops { list-style: none; padding: 0; margin-top: 3mm; }
+.stop, .card {
+  border: 1px solid var(--line);
+  border-radius: 3mm;
+  background: var(--surface);
+  padding: 2.5mm 3mm;
+  margin-bottom: 2.5mm;
+  box-decoration-break: clone;
+}
+.stop { break-inside: avoid; }
+.card .plan-summary { margin-top: 1mm; white-space: pre-wrap; }
+.stop header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 2mm;
+  break-after: avoid;
+}
+.stop h3 { max-width: calc(100% - 7mm); }
+.stop-no {
+  flex: none;
+  width: 5mm;
+  border-radius: 50%;
+  background: #e5efe9;
+  color: var(--accent);
+  font-size: 8pt;
+  font-weight: 700;
+  line-height: 5mm;
+  text-align: center;
+}
+.stop-meta { color: var(--accent); font-weight: 600; font-size: 9pt; }
+.stop .prose { margin-top: 1mm; }
+.onward { margin-top: 1.5mm; padding-top: 1mm; border-top: 1px solid var(--line); color: var(--muted); font-size: 9pt; }
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(33mm, 1fr) minmax(0, 2fr);
+  gap: 0 2.5mm;
+  align-items: baseline;
+  padding-block: 1.15mm;
+  font-size: 10pt;
+  break-inside: avoid;
+}
+.card h4 ~ .row { grid-template-columns: minmax(45mm, 1.25fr) minmax(0, 2fr); }
+.row + .row { border-top: 1px solid var(--line); }
+.row:has(p:empty) { grid-template-columns: 1fr; }
+.row p:empty { display: none; }
+.row-suffix { white-space: nowrap; }
+.route-line { margin-block: 1mm; color: var(--accent); font-weight: 700; }
+.total {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1mm 3mm;
+  padding: 2mm 3mm;
+  margin-bottom: 2mm;
+  background: #e5efe9;
+  border-radius: 3mm;
+  break-inside: avoid;
+  break-after: avoid;
+}
+.total strong { color: var(--accent); }
+.cost-heading { margin-block: 2mm 1mm; }

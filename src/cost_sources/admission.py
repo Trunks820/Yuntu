@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, time, timezone
 from typing import Any
 
 from src.cost_reference.catalog import lookup_admission
-from src.cost_reference.models import MoneyRangeFen, ReferenceCatalog
+from src.cost_reference.models import MoneyRangeFen, ReferenceCatalog, VerifiedAdmissionFact
 
 from .common import aware_datetime, cny_range, reference_observation, utc_now
 from .models import CostSourceResult, SourceObservation
@@ -67,10 +67,11 @@ def resolve_admission_source(
     place_identity: str,
     explicit_ticket_price: dict[str, Any] | None = None,
     verified_free_fact: dict[str, Any] | None = None,
+    verified_fact: VerifiedAdmissionFact | None = None,
     amap_generic_consumption: Any = None,
     captured_at: datetime | None = None,
 ) -> CostSourceResult:
-    """Resolve explicit ticket -> explicit free -> place reference -> missing.
+    """Resolve explicit observations, verified ticket facts, then legacy references.
 
     ``amap_generic_consumption`` is accepted only to make the rejection boundary
     explicit.  It is never parsed or promoted to an admission fact.
@@ -101,6 +102,27 @@ def resolve_admission_source(
             adapter_status="success",
             resolution="policy_zero",
             selected=free,
+        )
+    if verified_fact is not None:
+        if captured.date() >= verified_fact.expires:
+            return CostSourceResult(
+                adapter_status="missing",
+                resolution="missing",
+                reason="verified admission fact expired",
+            )
+        basis = "policy_zero" if verified_fact.price_kind == "free" else "sourced"
+        return CostSourceResult(
+            adapter_status="success",
+            resolution=basis,
+            selected=SourceObservation(
+                source_id=str(verified_fact.sources[0].url),
+                source_type="verified_ticket_facts",
+                price_basis=basis,
+                item_identity=f"admission:{place_identity}",
+                captured_at=captured,
+                observed_at=datetime.combine(verified_fact.checked, time.min, timezone.utc),
+                range_fen=verified_fact.adult_price_cny.as_fen(),
+            ),
         )
     reference = lookup_admission(catalog, place_identity=place_identity)
     if reference is not None:

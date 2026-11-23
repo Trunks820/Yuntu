@@ -236,8 +236,13 @@ export const MobileTripsPage: React.FC = () => {
               "u-trip-secondary",
             ];
     const statusCls = group === "ready" ? "ready" : group === "generating" ? "generating" : "failed";
+    // 完全正常的卡片（详细攻略、额度已结算）不再每张都标状态和套话，只留封面和底部一行；
+    // 基础版、装订中、结算中、失败的照旧显示
+    const plain =
+      (display.status === "detailed" && item.delivery?.quota_state === "CONSUMED") ||
+      display.status === "legacy_success";
     return (
-      <article key={item.trip_id} className="u-trip-card">
+      <article key={item.trip_id} className={`u-trip-card${plain ? " is-plain" : ""}`}>
         <div className="u-trip-cover">
           <img
             src={cover(item.city, cityOrder.get(item.trip_id))}
@@ -263,14 +268,18 @@ export const MobileTripsPage: React.FC = () => {
           </div>
         </div>
         <div className="u-trip-body">
-          <div className="u-status-row">
-            <span className={`u-status ${statusCls}`}>
-              <Icon name={icon} />
-              {display.outcome.label}
-            </span>
-            {display.quotaNotice && <span className="u-example-label">{display.quotaNotice}</span>}
-          </div>
-          <p className="u-trip-desc">{desc}</p>
+          {!plain && (
+            <>
+              <div className="u-status-row">
+                <span className={`u-status ${statusCls}`}>
+                  <Icon name={icon} />
+                  {display.outcome.label}
+                </span>
+                {display.quotaNotice && <span className="u-example-label">{display.quotaNotice}</span>}
+              </div>
+              <p className="u-trip-desc">{desc}</p>
+            </>
+          )}
           <div className="u-trip-card-bottom">
             {/* E6：与电脑历史页一致，时间一律用创建时间，不再用完成时间 */}
             <span className="u-trip-date">{dateTime(item.created_at)}</span>

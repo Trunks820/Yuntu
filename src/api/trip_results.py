@@ -6,6 +6,7 @@ import json
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -20,7 +21,7 @@ from pydantic import (
 )
 from sqlalchemy import text
 
-from src.agents.pretrip_advice import project_public_plan_advice
+from src.agents.pretrip_advice import MAX_TIPS, project_public_plan_advice
 from src.agents.route_planning import classify_transit_detail, format_transit_summary
 from src.agents.route_feasibility import access_status, access_summary
 from src.agents.schema import RouteDayGroup
@@ -34,7 +35,7 @@ from src.agents.schema import (
 from src.agents.itinerary_lines import strip_itinerary
 from src.agents.weather_advisory import is_weather_line
 from src.api.public_guard import verify_public_api_client
-from src.api.result_stops import activity_note, split_day_text, stop_fields
+from src.api.result_stops import activity_note, split_day_text, split_trip_opening, split_trip_tips, stop_fields
 from src.config import get_settings
 from src.cost_estimate.public import (
     CostEstimateProjectionError,
@@ -300,6 +301,14 @@ class ResultPlan(BaseModel):
     cost_estimate: CostEstimateSummary
     packing_checklist: list[PackingChecklistGroup] | None = None
     travel_tips: list[TravelTip] | None = None
+    opening: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_opening(self, handler):
+        payload = handler(self)
+        if payload.get("opening") is None:
+            payload.pop("opening", None)
+        return payload
 
 
 class TripResultResponse(BaseModel):
@@ -638,6 +647,22 @@ def _composition_day_titles(plan: dict[str, Any]) -> dict[int, str]:
     return titles
 
 
+_SHOP_CATEGORIES = {"restaurant", "food", "market"}
+_SHOP_ROLES = {"meal_stop", "coffee_stop", "snack_stop", "cafe_stop"}
+_SHOP_BRANCH_SUFFIX_RE = re.compile(r"\s*(?:（[^（）]*）|\([^()]*\))\s*$")
+
+
+def _place_day_title(places: list[ResultPlace], fallback: str) -> str:
+    names = [
+        place.name for place in places
+        if place.category not in _SHOP_CATEGORIES and place.role not in _SHOP_ROLES
+    ]
+    if not names:
+        names = [_SHOP_BRANCH_SUFFIX_RE.sub("", place.name).strip() for place in places]
+    unique_names = list(dict.fromkeys(name for name in names if name))
+    return " · ".join(unique_names[:3]) or fallback
+
+
 _DAY_HEADING_RE = re.compile(
     r"(?is)(?:^|\n|\s*---\s*)\s*(?:#{1,6}\s*)?(?:"
     r"\*\*\s*(?:Day\s*(?P<day_b>\d+)|第\s*(?P<cn_b>\d+)\s*天)"
@@ -753,10 +778,8 @@ def _extract_day_narrative(
 
 
 def _day_narrative_and_notes(
-    plan_text: str,
-    day_number: int,
+    section: tuple[str, str] | None,
     *,
-    total_days: int,
     place_names: dict[int, str],
 ) -> tuple[str, dict[int, str]]:
     """v0.15.1: place paragraphs move to their cards; the day keeps the rest.
@@ -764,7 +787,6 @@ def _day_narrative_and_notes(
     Without any place paragraph (an unexpected text shape) the narrative is
     the whole day as before, so no prose is lost.
     """
-    section = _day_section(plan_text, day_number, total_days=total_days)
     if section is None:
         return "", {}
     title, body = section
@@ -934,7 +956,15 @@ def _day_clock(day_group: dict[str, Any]):
         return None
 
 
-def _project_days(plan: dict[str, Any], *, cards: bool = True) -> list[ResultDay]:
+@dataclass
+class _TripLevelText:
+    opening: str | None = None
+    tips: str | None = None
+
+
+def _project_days(
+    plan: dict[str, Any], *, cards: bool = True, trip_text: _TripLevelText | None = None,
+) -> list[ResultDay]:
     route_plan = plan.get("route_plan") or {}
     day_groups = route_plan.get("day_groups") or []
     _assert_result_contract(isinstance(day_groups, list) and bool(day_groups), "day_groups are required")
@@ -953,10 +983,17 @@ def _project_days(plan: dict[str, Any], *, cards: bool = True) -> list[ResultDay
         _assert_result_contract(isinstance(raw_places, list) and bool(raw_places), "day places are required")
         place_dicts = [place for place in raw_places if isinstance(place, dict)]
         if cards:
-            narrative, notes = _day_narrative_and_notes(
-                plan_text, day_number, total_days=total_days,
-                place_names={_to_int(p.get("place_id")): str(p.get("name") or "").strip() for p in place_dicts},
-            )
+            place_names = {_to_int(p.get("place_id")): str(p.get("name") or "").strip() for p in place_dicts}
+            section = _day_section(plan_text, day_number, total_days=total_days)
+            if section is not None and trip_text is not None:
+                heading, body = section
+                if day_number == 1:
+                    body, trip_text.opening = split_trip_opening(body, place_names)
+                if index == total_days and place_dicts:
+                    last_name = str(place_dicts[-1].get("name") or "").strip()
+                    body, trip_text.tips = split_trip_tips(body, last_name)
+                section = heading, body
+            narrative, notes = _day_narrative_and_notes(section, place_names=place_names)
             clock = stop_fields(_day_clock(day_group), planned_time=planned_time)
         else:
             narrative, notes, clock = _extract_day_narrative(plan_text, day_number, total_days=total_days), {}, {}
@@ -1041,6 +1078,8 @@ def _project_days(plan: dict[str, Any], *, cards: bool = True) -> list[ResultDay
             or str(day_group.get("area") or "").strip()
             or f"Day {day_number}"
         )
+        if cards:
+            title = _place_day_title(places, title)
         _assert_result_contract(bool(str(title).strip()), "day title is required")
         days.append(ResultDay(
             day=day_number,
@@ -1073,7 +1112,8 @@ def _project_plan(
     cards: bool = False,
 ) -> ResultPlan:
     _assert_result_contract(isinstance(plan, dict), "plan must be an object")
-    days = _project_days(plan, cards=cards)
+    trip_text = _TripLevelText()
+    days = _project_days(plan, cards=cards, trip_text=trip_text)
     _assert_result_contract(bool(days), "plan days are required")
     _assert_result_contract(
         len(days) == expected_days,
@@ -1124,6 +1164,10 @@ def _project_plan(
         plan,
         schema_22_enabled=schema_22_enabled,
     )
+    if trip_text.tips:
+        overall_tip = TravelTip(title="整体提醒", content=trip_text.tips)
+        previous_tips = [tip for tip in travel_tips or [] if tip != overall_tip]
+        travel_tips = [*previous_tips[:MAX_TIPS - 1], overall_tip]
     return ResultPlan(
         plan_id=f"plan_{chr(ord('a') + index)}",
         title=title,
@@ -1144,6 +1188,7 @@ def _project_plan(
         cost_estimate=cost_estimate,
         packing_checklist=packing_checklist,
         travel_tips=travel_tips,
+        opening=trip_text.opening,
     )
 
 

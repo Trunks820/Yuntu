@@ -1,6 +1,20 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { LucideIcon } from "lucide-react";
-import { Bus, Footprints, Route, TrainFront } from "lucide-react";
+import {
+  Bus,
+  ChevronDown,
+  ChevronUp,
+  Footprints,
+  Route,
+  TrainFront,
+} from "lucide-react";
 import type {
   PlaceDetail,
   TransitStep,
@@ -15,6 +29,7 @@ import {
   formatStayMinutes,
   formatTransitStepLine,
   getDayWeather,
+  isReducedMotionPreferred,
   resolveCommutePopup,
   resolveStopCardNote,
   resolveStopKind,
@@ -52,6 +67,7 @@ export interface DayStripProps {
   currentDay: TripDay;
   selectedPlaceId: number | null;
   collapsed?: boolean;
+  folded?: boolean;
   weather: TripWeather | null | undefined;
   flashingWeatherDay?: number | null;
   placeDetails: Record<number, PlaceDetailEntry | undefined>;
@@ -59,6 +75,7 @@ export interface DayStripProps {
   onImageError: (url: string) => void;
   onSelectDay: (dayNumber: number) => void;
   onSelectPlace: (placeId: number) => void;
+  onToggleFold?: () => void;
   registerCardRef?: (placeId: number, el: HTMLButtonElement | null) => void;
 }
 
@@ -67,6 +84,7 @@ export function DayStrip({
   currentDay,
   selectedPlaceId,
   collapsed = false,
+  folded = false,
   weather,
   flashingWeatherDay = null,
   placeDetails,
@@ -74,16 +92,46 @@ export function DayStrip({
   onImageError,
   onSelectDay,
   onSelectPlace,
+  onToggleFold,
   registerCardRef,
 }: DayStripProps) {
   const sectionRef = useRef<HTMLElement>(null);
+  const tabsRef = useRef<HTMLDivElement>(null);
+  const cardsRef = useRef<HTMLDivElement>(null);
+  const currentDayNumRef = useRef(currentDay.day);
+  currentDayNumRef.current = currentDay.day;
+  const hiddenRef = useRef(collapsed || folded);
+  hiddenRef.current = collapsed || folded;
   const [activeLegPopup, setActiveLegPopup] = useState<ActiveLegPopup | null>(
     null,
   );
 
+  // 长卷首次出现和换天时，卡片依次从下方升起（单张 320ms，总长不超过 600ms，不过冲）；
+  // 点卡片等普通重绘不重播，收着时不播，减少动态时不播
+  useLayoutEffect(() => {
+    const box = cardsRef.current;
+    if (!box || hiddenRef.current || isReducedMotionPreferred()) return;
+    const cards = Array.from(box.children) as HTMLElement[];
+    const step = cards.length > 1 ? Math.min(50, 240 / (cards.length - 1)) : 0;
+    cards.forEach((el, idx) => {
+      el.animate?.(
+        [
+          { opacity: 0, transform: "translateY(14px)" },
+          { opacity: 1, transform: "none" },
+        ],
+        {
+          duration: 320,
+          delay: Math.round(idx * step),
+          easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+          fill: "backwards",
+        },
+      );
+    });
+  }, [currentDay.day]);
+
   useEffect(() => {
     setActiveLegPopup(null);
-  }, [currentDay.day, collapsed]);
+  }, [currentDay.day, collapsed, folded]);
 
   useEffect(() => {
     const el = sectionRef.current;
@@ -95,6 +143,66 @@ export function DayStrip({
       el.removeAttribute("inert");
     }
   }, [collapsed]);
+
+  // 页签放不下时（多天或打开详情长卷收窄），把选中的那一天横向滚进视野
+  const ensureActiveTabVisible = useCallback((smooth: boolean) => {
+    const container = tabsRef.current;
+    if (!container) return;
+    const activeTab = container.querySelector<HTMLElement>(
+      `.bk-dtab[data-day="${currentDayNumRef.current}"]`,
+    );
+    if (!activeTab || container.scrollWidth <= container.clientWidth) return;
+    const tabLeft = activeTab.offsetLeft - container.offsetLeft;
+    const tabRight = tabLeft + activeTab.offsetWidth;
+    const viewLeft = container.scrollLeft;
+    const viewRight = viewLeft + container.clientWidth;
+    const behavior: ScrollBehavior =
+      smooth && !isReducedMotionPreferred() ? "smooth" : "auto";
+    if (tabLeft < viewLeft + 8) {
+      const nextLeft = Math.max(0, tabLeft - 8);
+      if (typeof container.scrollTo === "function") {
+        container.scrollTo({ left: nextLeft, behavior });
+      } else {
+        container.scrollLeft = nextLeft;
+      }
+    } else if (tabRight > viewRight - 8) {
+      const nextLeft = Math.max(0, tabRight - container.clientWidth + 8);
+      if (typeof container.scrollTo === "function") {
+        container.scrollTo({ left: nextLeft, behavior });
+      } else {
+        container.scrollLeft = nextLeft;
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (collapsed) return;
+    ensureActiveTabVisible(true);
+  }, [
+    currentDay.day,
+    collapsed,
+    folded,
+    selectedPlaceId,
+    ensureActiveTabVisible,
+  ]);
+
+  useEffect(() => {
+    const container = tabsRef.current;
+    if (!container) return;
+    const handleResize = () => ensureActiveTabVisible(false);
+    window.addEventListener("resize", handleResize);
+    if (typeof ResizeObserver === "undefined") {
+      return () => {
+        window.removeEventListener("resize", handleResize);
+      };
+    }
+    const ro = new ResizeObserver(handleResize);
+    ro.observe(container);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [ensureActiveTabVisible]);
 
   const showPopupForTrigger = (
     key: string,
@@ -144,14 +252,24 @@ export function DayStrip({
     <>
       <section
         ref={sectionRef}
-        className={
-          collapsed ? "bk-float bk-day is-collapsed" : "bk-float bk-day"
-        }
+        className={[
+          "bk-float",
+          "bk-day",
+          collapsed ? "is-collapsed" : "",
+          folded ? "is-folded" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
         aria-label="这一天"
         aria-hidden={collapsed || undefined}
       >
         <header className="bk-dh">
-          <div className="bk-dtabs" role="group" aria-label="切换行程天">
+          <div
+            ref={tabsRef}
+            className="bk-dtabs"
+            role="group"
+            aria-label="切换行程天"
+          >
             {days.map((d) => {
               const weatherDay = getDayWeather(weather, d.day);
               const badge = formatDayWeatherBadge(weatherDay);
@@ -201,10 +319,28 @@ export function DayStrip({
               </p>
             )}
           </div>
+
+          {onToggleFold && (
+            <button
+              type="button"
+              className="bk-fold"
+              aria-expanded={!folded}
+              aria-label={folded ? "展开这一天" : "收起这一天"}
+              onClick={onToggleFold}
+            >
+              {folded ? (
+                <ChevronUp size={18} aria-hidden="true" />
+              ) : (
+                <ChevronDown size={18} aria-hidden="true" />
+              )}
+            </button>
+          )}
         </header>
 
         <div
+          ref={cardsRef}
           className="bk-dcards"
+          aria-hidden={folded || undefined}
           onScroll={() => {
             if (activeLegPopup) setActiveLegPopup(null);
           }}
@@ -336,7 +472,6 @@ export function DayStrip({
                   ) : detailSettled ? (
                     <span className="bk-ph is-kind" aria-hidden="true">
                       <StopKindMark kind={kind} />
-                      <span className="bk-ph-k">{kindLabel}</span>
                     </span>
                   ) : (
                     <span className="bk-ph" aria-hidden="true" />

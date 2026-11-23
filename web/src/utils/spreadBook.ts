@@ -18,6 +18,7 @@ import type {
   CostCategoryKey,
   CostPriceBasis,
   CostScenarioSummary,
+  ScenarioCostStatus,
 } from "@/types/cost";
 import type { LucideIcon } from "lucide-react";
 import { collectWeatherReminders, weatherFaIcon } from "@/constants/weather";
@@ -370,9 +371,22 @@ export function hasValidAccommodationCoords(
   );
 }
 
+export const DEFAULT_BOOK_STRIP_HEIGHT = 215;
+export const DEFAULT_BOOK_STRIP_FOLDED_HEIGHT = 53;
+
+export interface BookMapAvoidMetrics {
+  /** 长卷当前可见高度（px）；未传或 <= 0 时回落到默认估计高度 */
+  stripVisibleHeight?: number;
+  /** 长卷是否处于贴底收起态（贴底时底部不再有 16px 外边距） */
+  stripFolded?: boolean;
+  /** 右栏实际宽度（px）；未传或 <= 0 时按 isReading / hasSidePanel 推导 */
+  sideWidth?: number;
+}
+
 /**
  * 计算高德 setFitView 避让边距 [top, bottom, left, right]：
- * 避让左上书名卡（左留 380）、底部长卷（普通留 300 / 读攻略长卷收起留 70）、右边抽屉（读攻略留 560 / 其它侧栏留 420 / 关着留 140），
+ * 避让左上书名卡（左留 380）、底部长卷（按长卷当前可见高度 + 16 + 44，贴底收起不加 16，阅读模式留 70）、
+ * 右边抽屉（按右栏实际宽度 + 20 + 40，无右栏留 140），
  * 并在小屏幕时等比收敛，确保中间留出至少 120×120 可视视野。
  */
 export function computeBookMapAvoidPadding(
@@ -380,18 +394,44 @@ export function computeBookMapAvoidPadding(
   viewportHeight: number,
   hasSidePanel: boolean,
   isReading = false,
+  metrics?: BookMapAvoidMetrics,
 ): [number, number, number, number] {
-  const topTarget = 90;
-  const bottomTarget = isReading ? 70 : 300;
-  const leftTarget = 380;
-  const rightTarget = isReading ? 560 : hasSidePanel ? 420 : 140;
-
   const w =
     Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 1440;
   const h =
     Number.isFinite(viewportHeight) && viewportHeight > 0
       ? viewportHeight
       : 848;
+
+  const stripFolded = Boolean(metrics?.stripFolded);
+  const measuredStripH = metrics?.stripVisibleHeight;
+  const stripVisibleH =
+    typeof measuredStripH === "number" &&
+    Number.isFinite(measuredStripH) &&
+    measuredStripH > 0
+      ? measuredStripH
+      : stripFolded
+        ? DEFAULT_BOOK_STRIP_FOLDED_HEIGHT
+        : DEFAULT_BOOK_STRIP_HEIGHT;
+
+  const measuredSideW = metrics?.sideWidth;
+  const resolvedSideW =
+    !isReading && !hasSidePanel
+      ? 0
+      : typeof measuredSideW === "number" &&
+          Number.isFinite(measuredSideW) &&
+          measuredSideW > 0
+        ? measuredSideW
+        : isReading
+          ? Math.max(0, Math.min(540, w - 380))
+          : 380;
+
+  const topTarget = 90;
+  const bottomTarget = isReading
+    ? 70
+    : stripVisibleH + (stripFolded ? 0 : 16) + 44;
+  const leftTarget = 380;
+  const rightTarget = resolvedSideW > 0 ? resolvedSideW + 20 + 40 : 140;
 
   const minClearW = 120;
   const maxHoriz = Math.max(40, w - minClearW);
@@ -427,6 +467,13 @@ export function isReducedMotionPreferred(): boolean {
 
 export type BookBarPageId = "guide" | "before" | "go" | "cost";
 export type BookSidePageId = BookBarPageId | "miss" | "stay";
+
+/** 右上一排四页（攻略 / 出发前 / 怎么去 · 住哪 / 花多少）共享同一种阅读模式右栏。 */
+export function isBookReadingPage(page: BookSidePageId | null): boolean {
+  return (
+    page === "guide" || page === "before" || page === "go" || page === "cost"
+  );
+}
 
 /** 换天时关上站点详情与“住处”；攻略 / 出发前 / 怎么去·住哪 / 花多少 / 没排进来的留在右边。 */
 export function shouldKeepSidePageOnDaySwitch(
@@ -473,6 +520,53 @@ export function pickClosestReadingStopId(
     }
   }
   return bestId;
+}
+
+export interface GuideScrollMetrics {
+  asideTop: number;
+  asideHeight: number;
+  scrollTop: number;
+  scrollHeight: number;
+}
+
+/**
+ * 攻略一页一天（底部留白收紧到 28px）时的滚读站点判定：
+ * 常规区间沿用顶部 28% 阅读线；接近页面底部时将阅读线平滑下移至视口下方，
+ * 到达底部时直接落到最后一站，保证最后一站无需 58vh 空白也能被判定为“正在读”。
+ */
+export function pickGuideReadingStopId(
+  samples: readonly ReadingIntersectionSample[],
+  metrics: GuideScrollMetrics,
+): number | null {
+  if (samples.length === 0) return null;
+  if (samples.length === 1) return samples[0].placeId;
+
+  const { asideTop, asideHeight, scrollTop, scrollHeight } = metrics;
+  const maxScroll = Math.max(0, scrollHeight - asideHeight);
+  if (maxScroll <= 1) {
+    return samples[0].placeId;
+  }
+  if (scrollTop <= 2) {
+    return samples[0].placeId;
+  }
+  if (scrollTop >= maxScroll - 4) {
+    return samples[samples.length - 1].placeId;
+  }
+
+  const baseLine = asideTop + asideHeight * 0.28;
+  const bottomLine = asideTop + asideHeight * 0.85;
+  const ramp = Math.min(maxScroll, asideHeight * 0.45);
+  const remaining = Math.max(0, maxScroll - scrollTop);
+  const progress = ramp > 0 && remaining < ramp ? 1 - remaining / ramp : 0;
+  const readingLineY = baseLine + (bottomLine - baseLine) * progress;
+
+  let current: number | null = null;
+  for (const s of samples) {
+    if (s.top <= readingLineY) {
+      current = s.placeId;
+    }
+  }
+  return current ?? samples[0].placeId;
 }
 
 /** 筛出未排入行程的必去地点（同 MustIncludeNotice.tsx 第 11-18 行）。 */
@@ -801,6 +895,8 @@ export interface BookCostCategoryRow {
   key: CostCategoryKey;
   label: string;
   amountText: string;
+  /** 结构化分项峰值金额（已定价取 max_cny、policy_zero 取 0、未定价取 null），供比例条直接计算。 */
+  amountCny: number | null;
   isUnpriced: boolean;
   basisLabel: string | null;
 }
@@ -816,12 +912,15 @@ export function resolveBookCostCategoryRows(
       cat?.coverage === "priced" && Boolean(cat.range) && !isPolicyZero;
 
     let amountText = "待确认";
+    let amountCny: number | null = null;
     let isUnpriced = true;
     if (isPolicyZero) {
       amountText = "¥ 0";
+      amountCny = 0;
       isUnpriced = false;
     } else if (isPriced && cat?.range) {
       amountText = `¥ ${cat.range.max_cny.toLocaleString()}`;
+      amountCny = cat.range.max_cny;
       isUnpriced = false;
     }
 
@@ -829,10 +928,88 @@ export function resolveBookCostCategoryRows(
       key,
       label,
       amountText,
+      amountCny,
       isUnpriced,
       basisLabel: resolveCostPriceBasisLabel(cat?.price_basis),
     };
   });
+}
+
+export type CostBarTone =
+  | "deep"
+  | "green"
+  | "morning"
+  | "afternoon"
+  | "evening";
+
+export const COST_BAR_TONES: readonly CostBarTone[] = [
+  "deep",
+  "green",
+  "morning",
+  "afternoon",
+  "evening",
+];
+
+/**
+ * 将 getScenarioCostStatus 返回的 costText 拆成“前导状态字 + 主金额”两段展示，不自行拼金额。
+ * 例：“预估 ¥ 1,800” -> { prefix: "预估", main: "¥ 1,800" }；
+ * 不可估（showAmount === false）-> { prefix: null, main: "费用暂不可估算" }。
+ */
+export function splitScenarioCostText(
+  status: Pick<ScenarioCostStatus, "costText" | "showAmount">,
+): { prefix: string | null; main: string } {
+  const raw = status.costText.trim();
+  if (!status.showAmount) {
+    return { prefix: null, main: raw };
+  }
+  const spaceIdx = raw.indexOf(" ");
+  if (spaceIdx <= 0) {
+    return { prefix: null, main: raw };
+  }
+  return {
+    prefix: raw.slice(0, spaceIdx),
+    main: raw.slice(spaceIdx + 1).trim(),
+  };
+}
+
+export interface BookCostBarSegment {
+  key: CostCategoryKey;
+  tone: CostBarTone;
+  amountCny: number;
+  ratio: number;
+}
+
+/**
+ * 仅按已定价且金额 > 0 的分项生成比例条与行色块映射，颜色依次取 --deep、--green、--dot-morning、--dot-afternoon（第五项兜底 --dot-evening）。
+ */
+export function resolveBookCostBreakdownVisuals(
+  rows: readonly BookCostCategoryRow[],
+): {
+  segments: BookCostBarSegment[];
+  toneByKey: Partial<Record<CostCategoryKey, CostBarTone>>;
+} {
+  const pricedRows = rows.filter(
+    (row): row is BookCostCategoryRow & { amountCny: number } =>
+      !row.isUnpriced && typeof row.amountCny === "number" && row.amountCny > 0,
+  );
+  const sum = pricedRows.reduce((acc, row) => acc + row.amountCny, 0);
+  if (sum <= 0) {
+    return { segments: [], toneByKey: {} };
+  }
+
+  const toneByKey: Partial<Record<CostCategoryKey, CostBarTone>> = {};
+  const segments: BookCostBarSegment[] = pricedRows.map((row, idx) => {
+    const tone = COST_BAR_TONES[idx % COST_BAR_TONES.length];
+    toneByKey[row.key] = tone;
+    return {
+      key: row.key,
+      tone,
+      amountCny: row.amountCny,
+      ratio: row.amountCny / sum,
+    };
+  });
+
+  return { segments, toneByKey };
 }
 
 /** 预估日期格式化（同 CostEstimateCard.tsx 第 47-59 行未导出的 formatEstimatedAt）。 */

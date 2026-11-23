@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from datetime import date
 
@@ -27,6 +27,7 @@ from src.agents.preferences import (
 )
 
 from src.agents.route_planning import valid_must_include_ids
+from src.agents.route_planner.opening_hours import RouteOpeningHours
 
 from src.agents.schema import (
     CandidatePlace,
@@ -45,6 +46,7 @@ LATE_DINNER = 20 * 60
 PACE_START = {"relaxed": 9 * 60, "default": 8 * 60 + 30, "compact": 8 * 60}
 DEFAULT_START = PACE_START["default"]
 DEFAULT_END = 22 * 60
+LATEST_RETURN_MINUTE = 23 * 60
 EXCURSION_START = 7 * 60 + 30
 NIGHT_DINNER_FLOOR = 17 * 60 + 30
 NIGHT_DINNER_CEILING = 19 * 60 + 30
@@ -52,6 +54,9 @@ PACE_SIGHT_HOURS = {"relaxed": 6, "default": 7, "compact": 8}
 WALK_CAP_MINUTES = 35
 SHORT_WALK_MINUTES = 20
 SHORT_DRIVE_WALK_MINUTES = 15
+RELAXED_WALK_MINUTES = 12
+RELAXED_DRIVE_WALK_MINUTES = 10
+ALWAYS_WALK_KM = 1.0
 EMIT_ERROR_TEXT_LIMIT = 120
 MEAL_NEAR_KM = 1.5
 IDLE_LIMIT_MINUTES = 60
@@ -60,7 +65,6 @@ PRE_DINNER_REST_LEG_CAP = 30
 SIGHT_EXTEND_CAP = 60
 CLUSTER_RADIUS_KM = 1.0
 SCENIC_NEAR_KM = 0.3
-SAME_PLACE_KM = 0.05
 # A straight line longer than this cannot be a walk under the 35-minute cap.
 FAR_WALK_KM = 2.5
 KINDS = {"sight", "lunch", "dinner", "snack", "night", "rest"}
@@ -120,6 +124,7 @@ class PlannerRules:
     require_day_rest: bool = False
     skip_unrequested_snacks: bool = False
     rest_via_lodge_only_when_near: bool = False
+    opening_hours: RouteOpeningHours = field(default_factory=RouteOpeningHours)
 
 
 def sunset_minutes(latitude: float, longitude: float, day: date) -> int:
@@ -174,6 +179,13 @@ def dinner_earliest_minute(rules: PlannerRules, *, has_night: bool) -> int:
 
 def day_has_night(stops) -> bool:
     return any(stop.get("kind") == "night" for stop in (stops or []))
+
+
+def return_limit_minute(rules: PlannerRules, *, urban: bool, has_night: bool) -> int:
+    plain = rules.relaxed_return_plain_minute
+    if urban and not has_night and plain is not None:
+        return min(plain, rules.end_minute)
+    return rules.end_minute
 
 
 def schedule_start_minute(

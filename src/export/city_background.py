@@ -106,17 +106,19 @@ class OfficialImageClient:
             ),
         )
 
-    def generate_background(self, prompt: str) -> GeneratedCityBackground:
+    def generate_background(self, prompt: str, *, size: str | None = None) -> GeneratedCityBackground:
         started = self._clock()
         deadline = started + self.timeout_seconds
         attempts: list[dict[str, Any]] = []
-        if self._cooling_down():
+        if self.is_cooling_down():
             raise BackgroundGenerationError("official_cooling_down", _attempt_summary(attempts, "official_cooling_down"))
         while True:
             attempt_started = self._clock()
             channel_token = image_channel.set(self.endpoint_id)
             try:
-                image_bytes = self._request_once(prompt, timeout=max(1.0, deadline - attempt_started))
+                image_bytes = self._request_once(
+                    prompt, timeout=max(1.0, deadline - attempt_started), size=size,
+                )
                 open_image_bytes(image_bytes)
             except Exception as exc:
                 error_code = _provider_error_code(exc)
@@ -145,9 +147,14 @@ class OfficialImageClient:
             )
 
     @observe_image_call
-    def _request_once(self, prompt: str, *, timeout: float) -> bytes:
+    def _request_once(self, prompt: str, *, timeout: float, size: str | None = None) -> bytes:
         import httpx
 
+        # gpt-image models always return base64. Style and response_format
+        # belong to older models.
+        payload = {"model": self.model, "prompt": prompt, "n": 1, **self.params}
+        if size is not None:
+            payload["size"] = size
         with httpx.Client(timeout=timeout, transport=self.http_transport, follow_redirects=False) as client:
             response = client.post(
                 f"{self.base_url}/images/generations",
@@ -155,9 +162,7 @@ class OfficialImageClient:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                # The current official form. gpt-image models always answer
-                # with base64; style and response_format belong to older models.
-                json={"model": self.model, "prompt": prompt, "n": 1, **self.params},
+                json=payload,
             )
             capture_image_response(response)
             response.raise_for_status()
@@ -166,7 +171,7 @@ class OfficialImageClient:
             raise ValueError("image response did not contain b64_json")
         return decode_base64_image(encoded)
 
-    def _cooling_down(self) -> bool:
+    def is_cooling_down(self) -> bool:
         with self._lock:
             return self._clock() < self._cooldown_until
 
@@ -175,7 +180,7 @@ class OfficialImageClient:
             self._cooldown_until = self._clock() + IMAGE_FAILURE_COOLDOWN_SECONDS
 
 
-def build_city_background_client(settings: Any | None = None) -> CityBackgroundClient | None:
+def build_city_background_client(settings: Any | None = None) -> OfficialImageClient | None:
     """The official image client, or None when its key is not set."""
 
     return OfficialImageClient.from_settings(settings)

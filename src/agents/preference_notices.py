@@ -2,8 +2,8 @@
 
 The Writer does not author these lines. Detailed plans and the basic
 SafePlanRenderer both splice the same strings. A sentence is emitted only from
-facts already on the route: preference decisions, family/tea identity, and
-program day hints. Unknown causes stay neutral.
+facts already on the route, including preference decisions and the schedule.
+Unknown causes stay neutral.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from src.agents.preferences import (
     family_arrangement_active,
     food_preference_active,
 )
-from src.agents.schema import PlanOutput, RoutePlan, TripRequest
+from src.agents.schema import PlanOutput, RouteDayGroup, RoutePlan, TripRequest
 
 
 # Whole-trip night. The time sentence is the accepted wording for a proved
@@ -43,6 +43,14 @@ TEA_TRIP = "这次没排到茶馆：这次没能安排上。"
 FOOD_NO_MATCH = "这次没排到网友提过的正餐店：现有候选里没有能对上的店。"
 FOOD_TIME = "这次没排到网友提过的正餐店：放进来会超出当天能排的时间。"
 FOOD_UNKNOWN = "这次没排到网友提过的正餐店：这次没能安排上。"
+
+_MISSED_MUST_PREFIX = "必去的「"
+_LONG_COMMUTE_NOTICE = "这天路上时间较长，建议早点出发。"
+_LATE_RETURN_PREFIX = "这天回到住处约 "
+_EMPTY_DAY_NOTICES = {
+    "all_closed": "这天候选里的地方都不开放，可以自由安排。",
+    "insufficient_candidates": "这天候选地点不够，可以自由安排。",
+}
 
 ALL_FIXED_SENTENCES: tuple[str, ...] = (
     NIGHT_TRIP_TIME,
@@ -89,6 +97,9 @@ PROTECTED_OPENING_PREFIXES: tuple[str, ...] = (
     "这次没排到孩子能参与的地方",
     "这次没排到茶馆",
     "这次没排到网友提过的正餐店",
+    _MISSED_MUST_PREFIX,
+    _LONG_COMMUTE_NOTICE,
+    _LATE_RETURN_PREFIX,
     PROGRAM_NIGHT_HINT_PREFIX,
     PROGRAM_AFTER_DINNER_PREFIX,
     PROGRAM_REST_HINT,
@@ -135,11 +146,51 @@ def program_day_hints(day_group) -> list[str]:
 def notice_mask_strings(route_plan: RoutePlan, *, day: int | None = None) -> list[str]:
     """Exact strings order checks and repair must not treat as route prose."""
     masks = list(ALL_FIXED_SENTENCES)
+    masks.extend(_missed_must_lines(route_plan))
     for day_group in route_plan.day_groups:
         if day is not None and int(day_group.day or 0) != int(day):
             continue
         masks.extend(program_day_hints(day_group))
+        masks.extend(_schedule_day_lines(day_group))
     return masks
+
+
+def _missed_must_lines(route: RoutePlan) -> list[str]:
+    return [
+        f"{_MISSED_MUST_PREFIX}{name}」这次没排进去"
+        + ("：出游日期内均闭馆。" if reason == "closed_all_days" else "。")
+        for name, reason in route.missed_must_visits.items()
+    ]
+
+
+def mask_missed_must_opening(text: str, route: RoutePlan) -> str:
+    """Preserve offsets while hiding exact route-owned opening lines from name scans."""
+    lines = _missed_must_lines(route)
+    if not lines:
+        return text
+    headings = _valid_headings(text)
+    end = headings[0][0] if headings else len(text)
+    opening = text[:end]
+    for line in lines:
+        opening = re.sub(rf"^{re.escape(line)}(?=\r?$)", " " * len(line), opening, flags=re.M)
+    return opening + text[end:]
+
+
+def empty_day_notice(group: RouteDayGroup) -> str | None:
+    if group.places or group.empty_day_reason is None:
+        return None
+    return _EMPTY_DAY_NOTICES[group.empty_day_reason]
+
+
+def _schedule_day_lines(group: RouteDayGroup) -> list[str]:
+    if notice := empty_day_notice(group):
+        return [notice]
+    lines = []
+    if group.excursion_commute_over_limit:
+        lines.append(_LONG_COMMUTE_NOTICE)
+    if group.return_after_pace_limit and group.timeline is not None:
+        lines.append(f"{_LATE_RETURN_PREFIX}{group.timeline.return_at}，比较晚。")
+    return lines
 
 
 def plan_uses_program_hints(plan: PlanOutput) -> bool:
@@ -163,7 +214,7 @@ def build_preference_notices(
         row["dimension"]: row
         for row in route_preference_decisions(request, [route])
     }
-    trip: list[str] = []
+    trip = _missed_must_lines(route)
     by_day: dict[int, list[str]] = {}
     night = rows.get(NIGHT_VIEW)
     if night is not None:
@@ -200,6 +251,9 @@ def build_preference_notices(
             trip.append(TEA_TRIP)
     if food_preference_active(request.preferences) and not _food_fulfilled(places):
         trip.append(_food_sentence((rows.get(FOOD) or {}).get("search_status")))
+    for group in route.day_groups:
+        if lines := _schedule_day_lines(group):
+            by_day.setdefault(group.day, []).extend(lines)
     return PreferenceNotices(
         trip_lines=tuple(dict.fromkeys(trip)),
         day_lines={

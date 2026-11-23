@@ -177,7 +177,7 @@ def lock_safe_input(
 
     seen_keys: set[tuple[int, int, int]] = set()
     locked_plans: list[LockedSafePlan] = []
-    from src.agents.preference_notices import build_preference_notices, program_day_hints
+    from src.agents.preference_notices import build_preference_notices, empty_day_notice, program_day_hints
     for plan_index, route_plan in enumerate(route_plans, 1):
         notices = (
             build_preference_notices(trip_request, route_plan)
@@ -185,14 +185,21 @@ def lock_safe_input(
         )
         if not route_plan.day_groups:
             raise SafeRenderError("empty_locked_plan")
+        if not any(day_group.places for day_group in route_plan.day_groups):
+            raise SafeRenderError("empty_locked_day")
         seen_days: set[int] = set()
         locked_days: list[LockedSafeDay] = []
         for day_group in route_plan.day_groups:
             if day_group.day in seen_days:
                 raise SafeRenderError("duplicate_locked_day")
             seen_days.add(day_group.day)
+            day_notices = (notices.day_lines or {}).get(int(day_group.day), ()) if notices is not None else ()
             if not day_group.places:
-                raise SafeRenderError("empty_locked_day")
+                explanation = empty_day_notice(day_group)
+                if explanation is None:
+                    raise SafeRenderError("empty_locked_day")
+                if explanation not in day_notices:
+                    day_notices += (explanation,)
             locked_places: list[LockedSafeActionContract] = []
             for place in day_group.places:
                 key = (plan_index, day_group.day, place.place_id)
@@ -266,10 +273,7 @@ def lock_safe_input(
                 places=tuple(locked_places),
                 commute_templates=tuple(locked_commute_templates),
                 accommodation_access_summary=access_summary(day_group) if route_plan.route_policy_version == "selector-route-v2" else "",
-                preference_notices=(
-                    (notices.day_lines or {}).get(int(day_group.day), ())
-                    if notices is not None else ()
-                ),
+                preference_notices=day_notices,
                 program_hints=tuple(program_day_hints(day_group)),
             ))
         locked_plans.append(LockedSafePlan(
@@ -478,10 +482,11 @@ def render_safe_plans(
                 day_names.append(place_name)
                 used_place_ids.append(place_id)
                 used_place_names.append(place_name)
-            text_parts.append(
-                "当天仅安排以上地点，依次完成对应活动；地点之间沿既定路线前往，"
-                "途中可按自身节奏短暂休息，完成后结束当天行程。\n"
-            )
+            if day_names:
+                text_parts.append(
+                    "当天仅安排以上地点，依次完成对应活动；地点之间沿既定路线前往，"
+                    "途中可按自身节奏短暂休息，完成后结束当天行程。\n"
+                )
             day_place_names.append(day_names)
 
         plan_text = "".join(text_parts).rstrip()

@@ -169,11 +169,6 @@
 .ym .result-hero-copy h2 .result-hero-city{display:block;word-break:keep-all;line-break:strict}
 .ym .result-hero-copy h2 .result-hero-plan{display:block;word-break:keep-all;line-break:strict;overflow-wrap:break-word}
 
-/* 切片 6 · E3：城市参考图移到当天内容顶部，并标清它不是第一站的照片 */
-.ym .day-cover{margin:0 0 16px}
-.ym .day-cover-frame{height:148px;border-radius:14px;overflow:hidden}
-.ym .day-cover small{display:block;margin-top:7px;font-size:9px;letter-spacing:.5px;color:var(--muted)}
-
 /* v0.14.3 住宿明细：沿用 manifest-row / 现有色，仅补展开区与开关 */
 .ym .lodging-nearby-toggle{background:transparent;color:var(--green);font-size:11px;padding:0;margin-left:8px;white-space:nowrap;line-height:inherit;vertical-align:baseline}
 .ym .lodging-detail{padding:2px 0 6px 23px;font-size:11px;line-height:1.9;color:#6a7766}
@@ -189,3 +184,146 @@
 /* v0.15.1：当天概述与各站说明保留换行 */
 .ym .result-summary{white-space:pre-line}
 .ym .day-stop p{white-space:pre-line}
+
+/* 2026-11 阅读性：旅行册、首页、我的行程统一字号（正文 14–15、辅助 13、最小 12，英文小标签 10），正文加深一档 */
+.ym .result .result-summary{font-size:14px;line-height:1.85;color:#3c4a43}
+.ym .result .chip{font-size:13px}
+.ym .result .day-tab{font-size:11px}
+.ym .result .day-heading{flex-wrap:wrap;align-items:baseline;column-gap:12px}
+.ym .result .day-heading h3{flex:1 1 auto;font-size:22px}
+.ym .result .day-heading small{font-size:12px;white-space:nowrap}
+.ym .result .stop-top{font-size:12px}
+.ym .result .stop-top strong{font-size:16px}
+.ym .result .day-stop h4{font-size:18px}
+.ym .result .day-stop p{font-size:15px;line-height:1.85;color:#3c4a43}
+.ym .result .reason{font-size:12px}
+.ym .result .stop-commute{font-size:13px!important}
+.ym .result .manifest-row{font-size:14px;line-height:1.85}
+.ym .result .result-disclaimer{font-size:12px}
+.ym .result .lodging-nearby-toggle{font-size:13px}
+.ym .result .lodging-detail{font-size:13px}
+.ym .result .lodging-price-note{font-size:12px}
+.ym .home .hero-copy .eyebrow,.ym .home .home-bottom .tiny-label{font-size:10px}
+.ym .home .hero-copy p{font-size:14px;line-height:1.75}
+.ym .home .home-bottom .sub{font-size:14px;color:#3c4a43}
+.ym .home .entry-left small{font-size:13px}
+.ym .home .entry-tile strong{font-size:15px}
+.ym .home .entry-tile small{font-size:12px;line-height:1.5}
+.ym .home .home-foot,.ym .home .home-foot .text-btn{font-size:12px}
+.ym .u-trips .u-heading .sub{font-size:14px}
+.ym .u-trips .u-trip-stats{font-size:13px}
+.ym .u-trips .u-search input::placeholder{font-size:14px}
+.ym .u-trips .u-filters .chip{font-size:13px}
+.ym .u-trips .u-trip-month{font-size:12px}
+.ym .u-trips .u-trip-cover-top>span,.ym .u-trips .u-days small{font-size:10px}
+.ym .u-trips .u-trip-cover-bottom p{font-size:12px}
+.ym .u-trips .u-status,.ym .u-trips .u-example-label{font-size:12px}
+.ym .u-trips .u-trip-desc{font-size:14px;line-height:1.7;color:#3c4a43}
+.ym .u-trips .u-trip-date{font-size:12px}
+.ym .u-trips .u-trip-card-bottom .primary{font-size:13px}
+.ym .u-trips .u-new-trip small,.ym .u-trips .u-demo-note{font-size:13px}
+
+/* 我的行程：正常的卡片只留封面和底部一行，封面压矮 */
+.ym .u-trips .u-trip-cover{height:124px}
+.ym .u-trip-card.is-plain .u-trip-card-bottom{border-top:0;padding-top:0}
+
+/* 2026-11 第 3 步：手机端攻略页（页签吸顶与滑块、天气行、各站小实拍、当天怎么走、附近酒店一档一行、左右滑、底栏浮起收起） */
+.ym{--read:#3c4a43}
+.ym .result .day-wx{display:flex;align-items:center;gap:8px;margin:-6px 0 6px;font-size:13px;color:var(--read)}
+.ym .result .day-wx svg{flex:none;width:22px;height:22px;color:var(--green);overflow:visible}
+.ym .result .day-wx.wx-sun svg{color:#b0915a}
+.ym .result .day-wx .wx-rays{transform-origin:12px 12px;animation:yuntu-wx-spin 24s linear infinite}
+.ym .result .day-wx .wx-cloud{animation:yuntu-wx-drift 5s ease-in-out infinite alternate}
+.ym .result .day-wx .wx-drop{animation:yuntu-wx-drop 1.4s ease-in infinite}
+.ym .result .day-wx .wx-drop.d2{animation-delay:.45s}
+.ym .result .day-wx .wx-drop.d3{animation-delay:.9s}
+.ym .result .day-wx-tip{margin:0 0 12px;padding-left:30px;font-size:13px;line-height:1.7;color:var(--muted)}
+@keyframes yuntu-wx-spin{to{transform:rotate(360deg)}}
+@keyframes yuntu-wx-drift{from{transform:translateX(-1.5px)}to{transform:translateX(1.5px)}}
+@keyframes yuntu-wx-drop{0%{transform:translateY(-1px);opacity:0}30%{opacity:1}100%{transform:translateY(3px);opacity:0}}
+.ym .result .day-tabs{position:sticky;top:0;z-index:4;margin:0 -22px 14px;padding:10px 22px 12px;background:var(--paper)}
+.ym .result .day-tab{position:relative;z-index:1;transition:color .2s ease .06s,transform .16s cubic-bezier(.22,1,.36,1)}
+.ym .result .day-tab.selected{background:transparent;border-color:transparent}
+.ym .result .day-ind{position:absolute;left:0;top:0;z-index:0;border-radius:12px;background:var(--green);transition:transform .32s cubic-bezier(.22,1,.36,1),width .32s cubic-bezier(.22,1,.36,1);pointer-events:none}
+.ym .result .footer-action{position:absolute;left:0;right:0;bottom:0;padding:8px 16px max(10px,env(safe-area-inset-bottom));transition:transform .3s cubic-bezier(.22,1,.36,1);z-index:6}
+.ym .result .footer-action.is-away{transform:translateY(110%)}
+.ym .result .result-footer{gap:8px}
+.ym .result .footer-action .primary{min-height:44px;padding:9px 16px;border-radius:14px}
+.ym .result .footer-action .small-secondary{min-height:44px;height:44px;border-radius:14px}
+.ym .result .result-body{padding-bottom:88px}
+.ym .is-fading{background:#ebe8df;opacity:0;transition:opacity .35s ease}
+.ym .is-fading.is-loaded{opacity:1}
+.ym .result .stop-head{display:flex;align-items:flex-start;gap:12px}
+.ym .result .stop-main{flex:1;min-width:0}
+.ym .result .stop-ph{flex:none;width:68px;height:68px;border-radius:12px;object-fit:cover;filter:saturate(.85);margin-top:2px}
+.ym .result .day-route{margin:4px 0 14px;border-top:1px solid #dde1d0;border-bottom:1px solid #dde1d0}
+.ym .result .day-route summary{display:flex;align-items:center;justify-content:space-between;padding:12px 0;font-size:14px;color:var(--ink);cursor:pointer;list-style:none}
+.ym .result .day-route summary::-webkit-details-marker{display:none}
+.ym .result .day-route summary i{width:8px;height:8px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(45deg) translateY(-2px);transition:transform .2s}
+.ym .result .day-route[open] summary i{transform:rotate(-135deg) translateY(-2px)}
+.ym .result .day-route ul{margin:0 0 12px;padding:0;list-style:none;display:grid;gap:6px}
+.ym .result .day-route li{font-size:13px;line-height:1.7;color:var(--read)}
+.ym .lodging-rows{margin:4px 0 6px;border-top:1px solid #dde1d0}
+.ym .lodging-rows .lodging-caption{padding:8px 0 4px}
+.ym .lodging-row{display:grid;grid-template-columns:34px 104px minmax(0,1fr);gap:0 10px;align-items:baseline;padding:10px 0;border-bottom:1px solid #dde1d0;font-size:13px;line-height:1.7}
+.ym .lodging-row.is-unpriced{grid-template-columns:34px minmax(0,1fr)}
+.ym .lodging-row b{font-family:var(--serif);font-size:15px;font-weight:500;color:var(--ink)}
+.ym .lodging-row .p{color:var(--green);font-variant-numeric:tabular-nums}
+.ym .lodging-row .h{color:var(--read);overflow-wrap:anywhere}
+.ym .lodging-rows .lodging-price-note{margin-top:8px;font-size:12px}
+.ym .result .day-pane{touch-action:pan-y}
+.ym .result .day-pane.is-dragging{user-select:none}
+.ym .result :is(.stop-title,.footer-action button,.lodging-nearby-toggle){transition:transform .16s cubic-bezier(.22,1,.36,1)}
+.ym .result :is(.day-tab,.footer-action button):active{transform:scale(.96)}
+.ym .result .stop-title:active{transform:scale(.98)}
+@media(prefers-reduced-motion:reduce){.ym .result :is(.day-tab,.footer-action button,.stop-title):active{transform:none}.ym .result .day-wx .wx-drop{opacity:1}}
+
+/* 2026-11 第 5 步：手机旅行册地点详情（纸色宋体弹层，从那一站展开，可按住顶部横杠下拉关闭） */
+.ym .place-overlay{position:absolute;inset:0;z-index:30}
+.ym .place-scrim{position:absolute;inset:0;background:rgba(20,40,34,.42)}
+.ym .place-sheet{position:absolute;left:0;right:0;bottom:0;max-height:86%;display:flex;flex-direction:column;background:var(--paper);border-radius:22px 22px 0 0;box-shadow:0 -12px 40px -16px rgba(20,40,34,.35);transform-origin:0 0;outline:none;color:var(--ink)}
+.ym .place-sheet-inner{position:relative;display:flex;flex-direction:column;min-height:0;flex:1}
+.ym .place-grab{flex:none;height:26px;display:grid;place-items:center;touch-action:none;cursor:grab}
+.ym .place-grab i{width:38px;height:4px;border-radius:2px;background:#d5d8cb}
+.ym .place-close{position:absolute;right:12px;top:8px;z-index:2;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:rgba(247,245,239,.92);color:var(--muted)}
+.ym .place-close svg{width:16px;height:16px}
+.ym .place-scroll{min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:10px 22px 8px}
+.ym .place-gallery{display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;margin:12px 0 14px}
+.ym .place-gallery img,.ym .place-photo-wait{flex:none;width:100%;aspect-ratio:16/10;object-fit:cover;border-radius:14px;scroll-snap-align:start;background:#ebe8df;filter:saturate(.85)}
+.ym .place-gallery.is-multi img{width:88%}
+.ym .place-k{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0;font-size:12px;color:var(--muted)}
+.ym .place-kind{color:var(--green)}
+.ym .place-kind:after{content:'·';margin-left:6px;color:#a4ad9f}
+.ym .place-sheet h2{margin:6px 0 8px;padding-right:36px;font-family:var(--serif);font-size:23px;font-weight:500;line-height:1.35}
+.ym .place-tags{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.ym .place-tags span{font-size:12px;line-height:1.2;color:var(--green);background:#e7eddf;border-radius:30px;padding:4px 9px}
+.ym .place-note{margin:0;font-size:15px;line-height:1.85;color:var(--read);white-space:pre-line}
+.ym .place-sum{margin:10px 0 0;font-size:14px;line-height:1.8;color:var(--muted)}
+.ym .place-sheet h3{margin:18px 0 6px;font-size:12px;font-weight:500;color:var(--muted)}
+.ym .place-reasons{margin:0;padding:0;list-style:none;display:grid;gap:4px}
+.ym .place-reasons li{position:relative;padding-left:12px;font-size:14px;line-height:1.75;color:var(--read)}
+.ym .place-reasons li:before{content:'';position:absolute;left:0;top:.75em;width:4px;height:4px;border-radius:50%;background:#a4ad9f}
+.ym .place-warn{margin:14px 0 0;padding:9px 12px;border-radius:12px;background:#f6ebe6;color:var(--danger);font-size:13px;line-height:1.7}
+.ym .place-warn p{margin:0}
+.ym .place-cred{margin:12px 0 0;font-size:12px;color:var(--muted)}
+.ym .place-empty{margin:14px 0 0;font-size:13px;line-height:1.7;color:var(--muted)}
+.ym .place-next{margin:18px 0 4px;padding-top:14px;border-top:1px solid #dde1d0;font-size:13px;line-height:1.7;color:var(--muted)}
+.ym .place-next b{display:block;font-weight:500;color:var(--ink)}
+.ym .place-foot{flex:none;padding:10px 22px max(18px,env(safe-area-inset-bottom));border-top:1px solid #e2e3d9}
+.ym .place-route{display:flex;align-items:center;justify-content:center;gap:8px;height:46px;border-radius:23px;border:1px solid #d5d8cb;background:#fffef9;color:var(--ink);font-size:14px;text-decoration:none;transition:transform .16s cubic-bezier(.22,1,.36,1)}
+.ym .place-route:active{transform:scale(.97)}
+.ym .place-route svg{width:16px;height:16px;color:var(--green)}
+@media(prefers-reduced-motion:reduce){.ym .place-route:active{transform:none}}
+
+/* 2026-11 出发城市挪到出发票：票面底部「出发城市｜出发日期」两格、出发城市面板 */
+.ym .ticket-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);align-items:stretch;gap:0;padding:0}
+.ym .ticket-split .ticket-cell{min-width:0;min-height:84px;background:transparent;text-align:left;display:flex;flex-direction:column;align-items:stretch;padding:15px 14px 17px 18px}
+.ym .ticket-split .ticket-cell+.ticket-cell{border-left:1px dashed #cacdb8;padding-left:14px;padding-right:18px}
+.ym .ticket-cell-head{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.ym .ticket-cell-head svg{width:14px;height:14px;color:var(--green);flex-shrink:0}
+.ym .ticket-split .ticket-date{overflow-wrap:anywhere}
+.ym .ticket-split .ticket-date.is-empty{color:#a0a695}
+.ym .ticket-hint{margin-top:5px;font-size:11px;line-height:1.5;color:var(--green)}
+.ym .from-city-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+.ym .from-city-row .text-btn{flex-shrink:0;font-size:12px;color:var(--muted)}
+.ym .sheet p.from-city-hint{margin:8px 0 0;font-size:11px;line-height:1.5;color:var(--green)}

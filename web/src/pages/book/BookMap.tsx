@@ -9,10 +9,13 @@ import type {
 } from "@/types/trip";
 import {
   computeBookMapAvoidPadding,
+  DEFAULT_BOOK_STRIP_FOLDED_HEIGHT,
+  DEFAULT_BOOK_STRIP_HEIGHT,
   hasValidAccommodationCoords,
   isReducedMotionPreferred,
   isValidGeoPoint,
   resolveBookMapWeatherVisual,
+  type BookMapAvoidMetrics,
   type SunDropPoint,
 } from "@/utils/spreadBook";
 import { BookWeather } from "./BookWeather";
@@ -122,6 +125,9 @@ export interface BookMapProps {
   selectedStay?: boolean;
   hasSidePanel: boolean;
   isReading?: boolean;
+  stripVisibleHeight?: number;
+  stripFolded?: boolean;
+  sideWidth?: number;
   onSelectPlace: (placeId: number) => void;
   onSelectStay?: () => void;
   onCameraSettling?: () => void;
@@ -164,6 +170,7 @@ function nudgePointIntoClearArea(
   hasSidePanel: boolean,
   isReading: boolean,
   reducedMotion: boolean,
+  avoidMetrics?: BookMapAvoidMetrics,
 ): boolean {
   if (
     !isValidGeoPoint(longitude, latitude) ||
@@ -187,13 +194,35 @@ function nudgePointIntoClearArea(
     : fallbackLabelWidth;
   const rawLabelW = measuredLabelW > 0 ? measuredLabelW : fallbackWithReading;
   const labelClearance = 20 + Math.min(isReading ? 240 : 180, rawLabelW) + 20;
-  const rightGutter = isReading ? 528 : hasSidePanel ? 408 : 24;
+  const measuredSideW = avoidMetrics?.sideWidth;
+  const resolvedSideW =
+    !isReading && !hasSidePanel
+      ? 0
+      : typeof measuredSideW === "number" &&
+          Number.isFinite(measuredSideW) &&
+          measuredSideW > 0
+        ? measuredSideW
+        : isReading
+          ? Math.max(0, Math.min(540, w - 380))
+          : 380;
+  const rightGutter = resolvedSideW > 0 ? resolvedSideW + 28 : 24;
   const safeRight = Math.max(120, w - rightGutter - labelClearance);
-  const bottomMargin = isReading ? 64 : 316;
+  const stripFolded = Boolean(avoidMetrics?.stripFolded);
+  const measuredStripH = avoidMetrics?.stripVisibleHeight;
+  const resolvedStripH =
+    typeof measuredStripH === "number" &&
+    Number.isFinite(measuredStripH) &&
+    measuredStripH > 0
+      ? measuredStripH
+      : stripFolded
+        ? DEFAULT_BOOK_STRIP_FOLDED_HEIGHT
+        : DEFAULT_BOOK_STRIP_HEIGHT;
+  const stripClear = stripFolded ? resolvedStripH : resolvedStripH + 16;
+  const bottomMargin = isReading ? 64 : stripClear + 34;
   const safeBottom = Math.max(140, h - bottomMargin);
   const safeTop = 96;
   const inLeftHudCorner = px.x < 368 && px.y < 300;
-  const watermarkCutY = isReading ? h - 84 : h - 336;
+  const watermarkCutY = h - (bottomMargin + 20);
   const inWatermarkStrip = px.x < 290 && px.y > watermarkCutY;
   const coveredRight = px.x > safeRight;
   const coveredBottom = px.y > safeBottom || inWatermarkStrip;
@@ -263,6 +292,9 @@ export function BookMap({
   selectedStay = false,
   hasSidePanel,
   isReading = false,
+  stripVisibleHeight = 0,
+  stripFolded = false,
+  sideWidth = 0,
   onSelectPlace,
   onSelectStay,
   onCameraSettling,
@@ -290,6 +322,12 @@ export function BookMap({
   hasSidePanelRef.current = hasSidePanel;
   const isReadingRef = useRef(isReading);
   isReadingRef.current = isReading;
+  const stripVisibleHeightRef = useRef(stripVisibleHeight);
+  stripVisibleHeightRef.current = stripVisibleHeight;
+  const stripFoldedRef = useRef(stripFolded);
+  stripFoldedRef.current = stripFolded;
+  const sideWidthRef = useRef(sideWidth);
+  sideWidthRef.current = sideWidth;
   const onSelectPlaceRef = useRef(onSelectPlace);
   onSelectPlaceRef.current = onSelectPlace;
   const onSelectStayRef = useRef(onSelectStay);
@@ -306,6 +344,9 @@ export function BookMap({
 
   const prevDayNumberRef = useRef<number | null>(null);
   const prevIsReadingRef = useRef<boolean>(isReading);
+  const prevStripFoldedRef = useRef<boolean>(stripFolded);
+  const prevStripVisibleHeightRef = useRef<number>(stripVisibleHeight);
+  const prevHasSidePanelRef = useRef<boolean>(hasSidePanel);
   const fitSettlingUntilRef = useRef<number>(0);
   const renderedOverlaySigRef = useRef<string>("");
   const lastPinActivationRef = useRef<{ placeId: number; at: number } | null>(
@@ -364,6 +405,14 @@ export function BookMap({
       h,
       hasSidePanelRef.current,
       isReadingRef.current,
+      {
+        stripVisibleHeight:
+          stripVisibleHeightRef.current > 0
+            ? stripVisibleHeightRef.current
+            : undefined,
+        stripFolded: stripFoldedRef.current,
+        sideWidth: sideWidthRef.current > 0 ? sideWidthRef.current : undefined,
+      },
     );
     const placeMarkers = placeEntriesRef.current.map((e) => e.marker);
     const fitTargets =
@@ -587,7 +636,7 @@ export function BookMap({
     };
   }, [clearDayOverlays, renderDayOverlays]);
 
-  // 当天、住宿或攻略阅读模式变更：更新覆盖物并以对应避让边距框进视野
+  // 当天、住宿、阅读模式或长卷可见高度变更：更新覆盖物并以对应避让边距框进视野
   useEffect(() => {
     const AMap = amapRef.current;
     const map = mapRef.current;
@@ -596,8 +645,22 @@ export function BookMap({
     const nextSig = buildOverlaySignature(day, accommodation);
     const overlayChanged = nextSig !== renderedOverlaySigRef.current;
     const readingChanged = prevIsReadingRef.current !== isReading;
+    const foldChanged = prevStripFoldedRef.current !== stripFolded;
+    const sideToggled = prevHasSidePanelRef.current !== hasSidePanel;
+    const stripHeightChanged =
+      !isReading &&
+      !sideToggled &&
+      Math.abs(stripVisibleHeight - prevStripVisibleHeightRef.current) >= 4;
 
-    if (!overlayChanged && !readingChanged) {
+    prevHasSidePanelRef.current = hasSidePanel;
+    prevStripVisibleHeightRef.current = stripVisibleHeight;
+
+    if (
+      !overlayChanged &&
+      !readingChanged &&
+      !foldChanged &&
+      !stripHeightChanged
+    ) {
       return;
     }
 
@@ -612,6 +675,7 @@ export function BookMap({
         onCameraSettlingRef.current?.();
       }
       prevIsReadingRef.current = isReading;
+      prevStripFoldedRef.current = stripFolded;
       fitSettlingUntilRef.current =
         !immediately && supportsMoveEnd
           ? Date.now() + FIT_VIEW_SETTLE_CAP_MS
@@ -621,6 +685,7 @@ export function BookMap({
     }
 
     prevIsReadingRef.current = isReading;
+    prevStripFoldedRef.current = stripFolded;
     const immediately = isReducedMotionPreferred();
     if (!immediately && supportsMoveEnd) {
       onCameraSettlingRef.current?.();
@@ -631,7 +696,10 @@ export function BookMap({
   }, [
     day,
     accommodation,
+    hasSidePanel,
     isReading,
+    stripVisibleHeight,
+    stripFolded,
     mapReady,
     mapFailed,
     fitDayViewport,
@@ -668,6 +736,12 @@ export function BookMap({
     }
 
     const performNudge = (): boolean => {
+      const avoidMetrics: BookMapAvoidMetrics = {
+        stripVisibleHeight:
+          stripVisibleHeight > 0 ? stripVisibleHeight : undefined,
+        stripFolded,
+        sideWidth: sideWidth > 0 ? sideWidth : undefined,
+      };
       if (selectedEntry) {
         return nudgePointIntoClearArea(
           AMap,
@@ -680,6 +754,7 @@ export function BookMap({
           hasSidePanel,
           isReading,
           reducedMotion,
+          avoidMetrics,
         );
       }
       if (selectedStay && stayEntry) {
@@ -694,6 +769,7 @@ export function BookMap({
           hasSidePanel,
           isReading,
           reducedMotion,
+          avoidMetrics,
         );
       }
       return false;
@@ -818,6 +894,9 @@ export function BookMap({
     selectedStay,
     hasSidePanel,
     isReading,
+    stripVisibleHeight,
+    stripFolded,
+    sideWidth,
     day,
     mapReady,
     mapFailed,

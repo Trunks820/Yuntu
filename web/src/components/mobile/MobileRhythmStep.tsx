@@ -1,26 +1,28 @@
 import React from "react";
 import { useMobileTripStore } from "@/stores/mobileTripStore";
 import type { MobileRhythm } from "@/types/mobile";
-import { CONCEPT_ASSETS } from "@/assets/mobile-concepts/conceptImages";
+import type { ScenePhotoRecord } from "@/utils/scenePhotos.generated";
+import { scenePhotoByPhotoId, sceneSrcSet } from "@/utils/scenePhotoLookup";
 import { Icon, Lines } from "./mobileUi";
 
 interface MobileRhythmStepProps {
   onNext: () => void;
 }
 
-const OPTIONS: { key: MobileRhythm; title: string; sub: string; image: string; alt: string }[] = [
+/* 配图用 R2 已登记的场景大图；原先的概念图只有两三百像素宽，190px 高的卡片上发糊 */
+const OPTIONS: { key: MobileRhythm; title: string; sub: string; photo: ScenePhotoRecord; alt: string }[] = [
   {
     key: "slow",
     title: "留点空白，\n喜欢就多待一会儿",
     sub: "少安排几站，给沿途的偶遇留时间。",
-    image: CONCEPT_ASSETS.lake,
+    photo: scenePhotoByPhotoId("0R2rHjjKWxM"),
     alt: "水边停留的悠闲画面",
   },
   {
     key: "full",
     title: "多走几处，\n让这一天丰富一点",
     sub: "愿意多走一些，多体验几种当地生活。",
-    image: CONCEPT_ASSETS.alley,
+    photo: scenePhotoByPhotoId("XqtoNK6BETo"),
     alt: "探索街巷的旅行画面",
   },
 ];
@@ -55,7 +57,13 @@ export const MobileRhythmStep: React.FC<MobileRhythmStepProps> = ({
                   className={`rhythm-card${selected ? " selected" : ""}`}
                   onClick={() => setRhythm(opt.key)}
                 >
-                  <img src={opt.image} alt={opt.alt} draggable={false} />
+                  <img
+                    src={opt.photo.mobileUrl}
+                    srcSet={sceneSrcSet(opt.photo)}
+                    sizes="(max-width: 480px) 100vw, 480px"
+                    alt={opt.alt}
+                    draggable={false}
+                  />
                   <div className="rhythm-content">
                     <strong style={{ lineHeight: 1.45 }}>
                       <Lines text={opt.title} />

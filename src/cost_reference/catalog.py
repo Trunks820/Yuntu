@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import TypeVar
+
+from pydantic import ValidationError
 
 from .models import (
     AccommodationReference,
@@ -17,16 +20,43 @@ from .models import (
     MealReference,
     ReferenceCatalog,
     ReverseIntercityRule,
+    VerifiedAdmissionFact,
+    VerifiedFacts,
+    VerifiedMealReference,
 )
 
 
 DEFAULT_CATALOG_PATH = Path(__file__).with_name("v1.json")
+VERIFIED_FACTS_PATH = Path(__file__).with_name("facts") / "v0153-facts-2026-11-21.json"
 T = TypeVar("T")
 
 
 def load_reference_catalog(path: Path | None = None) -> ReferenceCatalog:
     payload = json.loads((path or DEFAULT_CATALOG_PATH).read_text(encoding="utf-8"))
     return ReferenceCatalog.model_validate(payload)
+
+
+@lru_cache(maxsize=1)
+def load_verified_facts() -> VerifiedFacts | None:
+    try:
+        return VerifiedFacts.model_validate_json(VERIFIED_FACTS_PATH.read_bytes())
+    except (OSError, ValidationError):
+        return None
+
+
+def lookup_verified_admission(*, city: str, place_label: str) -> VerifiedAdmissionFact | None:
+    """Find an exact city/name or alias match, including rows with expired prices."""
+    facts = load_verified_facts()
+    if facts is None:
+        return None
+    return next(
+        (
+            row
+            for row in facts.admission
+            if row.city == city and (row.name == place_label or place_label in row.aliases)
+        ),
+        None,
+    )
 
 
 def catalog_digest(catalog: ReferenceCatalog) -> str:
@@ -122,6 +152,26 @@ def lookup_admission_by_label(
 def lookup_meal(
     catalog: ReferenceCatalog, *, city: str, meal: str
 ) -> MealReference | None:
+    if meal in ("lunch", "dinner"):
+        facts = load_verified_facts()
+        if facts is not None:
+            table = facts.meal_city_reference
+            for row in table.cities:
+                if row.city == city:
+                    price_range = row.per_person_cny.as_fen()
+                    return VerifiedMealReference(
+                        city=city,
+                        meal=meal,
+                        source_range_fen=price_range,
+                        source_party_size=1,
+                        range_fen=price_range,
+                        version=facts.version,
+                        effective_date=table.queried,
+                        observed_date=table.amap_captured,
+                        provenance=table.method,
+                        review_status="reviewed",
+                        source_ids=("v0153_facts:amap_main_meal_percentiles",),
+                    )
     if catalog.review_status != "reviewed":
         return None
     return next(

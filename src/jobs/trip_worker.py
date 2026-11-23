@@ -27,7 +27,7 @@ from src.agents.publish_gate import (
 from src.agents.schema import TripRequest
 from src.agents.workflow import run_trip_workflow
 from src.api.formatter import format_plans_markdown
-from src.config import get_settings
+from src.config import get_settings, trip_job_timeout_for_days
 from src.jobs.city_batch_store import (
     CityBatchActiveError,
     create_city_crawl_batch,
@@ -529,9 +529,10 @@ class TripWorker:
     async def run(self) -> None:
         settings = get_settings()
         logger.info(
-            "trip worker started concurrency=%s timeout=%ss",
+            "trip worker started concurrency=%s timeout=%ss long_trip_timeout=%ss",
             settings.trip_worker_concurrency,
             settings.trip_job_timeout_seconds,
+            settings.trip_job_long_timeout_seconds,
         )
         next_stale_sweep = 0.0
         try:
@@ -542,6 +543,7 @@ class TripWorker:
                     if now >= next_stale_sweep:
                         expired = await expire_stale_trip_jobs(
                             timeout_seconds=settings.trip_job_timeout_seconds,
+                            long_timeout_seconds=settings.trip_job_long_timeout_seconds,
                         )
                         if expired:
                             logger.warning("trip worker expired stale jobs count=%s", expired)
@@ -592,9 +594,11 @@ class TripWorker:
         )
         logger.info("trip worker executing job_id=%s", job_id)
         execute_t0 = time.monotonic()
-        workflow_deadline_monotonic = (
-            execute_t0 + settings.trip_job_timeout_seconds
+        structured_trip_request = _structured_trip_request_from_job(job)
+        workflow_timeout_seconds = trip_job_timeout_for_days(
+            settings, structured_trip_request.days if structured_trip_request else None
         )
+        workflow_deadline_monotonic = execute_t0 + workflow_timeout_seconds
         runtime_metrics: dict[str, int] = {}
         queue_wait_ms = _datetime_delta_ms(job.started_time, job.created_time)
         if queue_wait_ms is not None:
@@ -606,7 +610,6 @@ class TripWorker:
         latest_workflow_publish_retry_round = 0
         completed_automatic_rewrite_rounds = 0
         pending_success_event: dict | None = None
-        structured_trip_request = _structured_trip_request_from_job(job)
         structured_pre_gate_done = False
         must_include_resolution: MustIncludeResolution | None = None
         persisted_trip_request_json: dict | None = None

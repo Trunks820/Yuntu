@@ -8,25 +8,31 @@ import hashlib
 from src.agents.pace import generation_base_mode
 import logging
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from src.agents.schema import RoutePlan, TripRequest, WorkflowResult
+from src.agents.schema import CandidatePlace, RoutePlan, TripRequest, WorkflowResult
 from src.agents.schema import TransportSuggestion
 from src.agents.food_resolver import FoodAttachment
-from src.cost_reference.catalog import load_reference_catalog
-from src.cost_reference.catalog import lookup_admission_by_label
-from src.cost_reference.models import ReferenceCatalog
+from src.agents.hotel_prices import TIER_TIMEOUT, HotelTier, HotelTierResult
+from src.agents.lodging_section import first_day_lodging_query_pin, parse_price_observed_at
+from src.agents.route_feasibility import valid_coordinate
+from src.cost_reference.catalog import (
+    load_reference_catalog,
+    lookup_admission_by_label,
+    lookup_verified_admission,
+)
+from src.cost_reference.models import MoneyRangeFen, ReferenceCatalog, VerifiedAdmissionFact
 from src.cost_sources.accommodation import resolve_accommodation_source
+from src.cost_sources.admission import resolve_admission_source
 from src.cost_sources.intercity import IntercitySourceBundle, observe_intercity_sources
 from src.cost_sources.local_transport import resolve_local_transport_source
-from src.cost_sources.meals import resolve_meal_source
-from src.cost_sources.admission import resolve_admission_source
+from src.cost_sources.meals import COUNTED_MEAL_SLOTS, resolve_meal_source
 from src.cost_sources.common import cny_range
 from src.cost_sources.models import CostSourceResult, SourceObservation
 from src.config import get_settings
-from src.agents.lodging_section import parse_price_observed_at
 
 from .models import CostEstimateSnapshotV1
 from .resolver import (
@@ -72,49 +78,81 @@ def _lodging_section_v2_enabled() -> bool:
     return bool(getattr(get_settings(), "lodging_section_v2_enabled", False))
 
 
-def _rollinggo_accommodation_source(result, *, captured_at: datetime) -> CostSourceResult | None:
-    """Nightly mid band, then economy, then high. Empty means the caller stays missing."""
-
+def _rollinggo_accommodation_source(
+    result: HotelTierResult | None,
+    *,
+    captured_at: datetime,
+    nearby_basis_label: str | None = None,
+    hotel_name: str = "",
+) -> CostSourceResult | None:
+    """Use a named quote or a mid band for nearby estimates."""
     if result is None:
         return None
-    checkin = getattr(result, "checkin_date", None)
-    checkin_text = checkin.isoformat() if hasattr(checkin, "isoformat") else "unknown"
-    for tier_name in ("mid", "economy", "high"):
-        tier = getattr(result, tier_name, None)
-        if tier is None:
-            continue
-        hotels = getattr(tier, "hotels", ()) or ()
-        low = getattr(tier, "nightly_low", None)
-        high = getattr(tier, "nightly_high", None)
-        if not hotels or low is None or high is None:
-            continue
-        range_fen = cny_range(int(low), int(high))
-        if range_fen is None:
-            continue
+    checkin_text = result.checkin_date.isoformat()
+    tiers = (result.mid, result.economy, result.high)
+
+    def priced(
+        tier: HotelTier,
+        range_fen: MoneyRangeFen,
+        *,
+        hotel_id: str | None = None,
+    ) -> CostSourceResult:
+        identity = f"rollinggo:lodging:checkin:{checkin_text}"
+        if hotel_id is not None:
+            identity += f":hotel:{hotel_id}"
         return CostSourceResult(
             adapter_status="success",
             resolution="sourced",
+            basis_label=nearby_basis_label,
             selected=SourceObservation(
                 source_id="rollinggo",
                 source_type="rollinggo",
                 price_basis="sourced",
-                item_identity=f"rollinggo:lodging:checkin:{checkin_text}",
+                item_identity=identity,
                 captured_at=captured_at,
-                observed_at=parse_price_observed_at(
-                    str(getattr(tier, "queried_at", "") or ""),
-                    captured_at,
-                ),
+                observed_at=parse_price_observed_at(tier.queried_at, captured_at),
                 range_fen=range_fen,
             ),
         )
+
+    def hotel_name_key(name: str) -> str:
+        return "".join(unicodedata.normalize("NFKC", name).split()).casefold()
+
+    name_key = hotel_name_key(hotel_name)
+    if name_key:
+        matches = sorted(
+            (
+                (hotel, tier)
+                for tier in tiers
+                for hotel in (tier.priced_offers or tier.hotels)
+                if hotel_name_key(hotel.name) == name_key
+            ),
+            key=lambda pair: (pair[0].distance_meters, pair[0].hotel_id),
+        )
+        for hotel, tier in matches:
+            price = round(hotel.nightly_price, 2)
+            range_fen = cny_range(price, price, allow_zero=False)
+            if range_fen is not None:
+                return priced(tier, range_fen, hotel_id=hotel.hotel_id)
+
+    # System-selected lodging keeps the economy/high fallback for an empty mid tier.
+    fallback_tiers = (result.mid,) if nearby_basis_label else tiers
+    for tier in fallback_tiers:
+        if tier.hotels:
+            range_fen = cny_range(
+                tier.nightly_low, tier.nightly_high, allow_zero=nearby_basis_label is None,
+            )
+            if range_fen is not None:
+                return priced(tier, range_fen)
     return None
 
 
-def _missing_source(reason: str) -> CostSourceResult:
+def _missing_source(reason: str, *, basis_label: str | None = None) -> CostSourceResult:
     return CostSourceResult(
         adapter_status="missing",
         resolution="missing",
         reason=reason,
+        basis_label=basis_label,
     )
 
 
@@ -292,6 +330,73 @@ def _area_identity_for_plan(
     return next(iter(matches)) if len(matches) == 1 else None
 
 
+def _route_admissions(
+    route_plan: RoutePlan,
+    *,
+    city: str,
+    catalog: ReferenceCatalog,
+    estimated_at: datetime,
+) -> tuple[AdmissionCostInput, ...]:
+    unique_places = {
+        place.place_id: place
+        for day_group in route_plan.day_groups
+        for place in day_group.places
+    }
+    place_facts = [
+        (place, lookup_verified_admission(city=city, place_label=place.name))
+        for place in sorted(unique_places.values(), key=lambda place: place.place_id)
+        if place.place_type.lower() in ADMISSION_PLACE_TYPES
+    ]
+    estimate_date = estimated_at.date()
+    child_tickets: dict[int, str] = {}
+    for place, fact in place_facts:
+        if fact is not None and fact.ticket_key:
+            parent = lookup_verified_admission(city=city, place_label=fact.ticket_key)
+            child_tickets[place.place_id] = parent.name if parent is not None else fact.ticket_key
+
+    shared_tickets = set(child_tickets.values())
+    groups: dict[int | str, list[tuple[CandidatePlace, VerifiedAdmissionFact | None]]] = {}
+    for place, fact in place_facts:
+        name = fact.name if fact is not None else place.name
+        ticket = child_tickets.get(place.place_id, name)
+        key = ticket if ticket in shared_tickets else place.place_id
+        groups.setdefault(key, []).append((place, fact))
+
+    admissions: list[AdmissionCostInput] = []
+    for ticket, stops in groups.items():
+        place, fact = next(
+            (stop for stop in stops if stop[0].place_id not in child_tickets),
+            stops[0],
+        )
+        identity = f"canonical-place:{place.place_id}"
+        if isinstance(ticket, str) and (fact is None or estimate_date >= fact.expires):
+            # Keep the shared ticket together even when all of its prices have expired.
+            ticket_facts = [row for _, row in stops if row is not None]
+            fact = next((row for row in ticket_facts if estimate_date < row.expires), ticket_facts[0])
+        if fact is not None:
+            source = resolve_admission_source(
+                catalog,
+                place_identity=f"ticket:{city}:{ticket}" if isinstance(ticket, str) else identity,
+                verified_fact=fact,
+                captured_at=estimated_at,
+            )
+        else:
+            ref = lookup_admission_by_label(catalog, place_label=place.name, city=city)
+            source = (
+                resolve_admission_source(
+                    catalog, place_identity=ref.place_identity, captured_at=estimated_at,
+                )
+                if ref is not None
+                else _missing_source(f"no catalog entry for {place.name} in {city}")
+            )
+        if len(stops) > 1:
+            included = "、".join(stop.name for stop, _ in stops if stop.place_id != place.place_id)
+            note = f"{included}已含在{ticket}门票中"
+            source = source.model_copy(update={"reason": f"{source.reason}。{note}" if source.reason else note})
+        admissions.append(AdmissionCostInput(place_identity=identity, source=source))
+    return tuple(admissions)
+
+
 async def _plan_inputs(
     result: WorkflowResult,
     *,
@@ -309,18 +414,39 @@ async def _plan_inputs(
     accommodation_source = _missing_source(
         "stable accommodation area identity is unavailable"
     )
-    use_rollinggo_lodging = (
-        _lodging_section_v2_enabled()
-        and plan.accommodation is not None
-        and plan.accommodation.source != "user_specified"
-    )
-    if use_rollinggo_lodging:
+    if _lodging_section_v2_enabled():
+        prices = result.lodging_price_result
+        stay = plan.accommodation
+        basis_label = None
+        hotel_name = ""
+        missing_label = None
+        if stay is None:
+            basis_label = "按行程附近同档酒店参考"
+            if first_day_lodging_query_pin(route_plan) is None:
+                missing_label = "首日行程缺少有效坐标，暂无法查住宿价"
+        elif stay.source == "user_specified":
+            basis_label = "按你住处附近同档酒店参考"
+            anchor = route_plan.accommodation_anchor
+            if request.accommodation and anchor and anchor.location_precision == "point":
+                hotel_name = request.accommodation.name or ""
+            if not valid_coordinate(stay.latitude, stay.longitude):
+                missing_label = "住处缺少有效坐标，暂无法查住宿价"
+        if basis_label and missing_label is None:
+            if prices is not None and prices.mid.failure == TIER_TIMEOUT:
+                missing_label = "住宿查价超时"
+            elif prices is None or prices.failure_reason or prices.mid.failure:
+                missing_label = "住宿查价暂不可用"
+            else:
+                missing_label = "附近暂无可用的中档住宿报价"
         priced = _rollinggo_accommodation_source(
-            getattr(result, "lodging_price_result", None),
+            prices,
             captured_at=estimated_at,
+            hotel_name=hotel_name,
+            nearby_basis_label=basis_label,
         )
         accommodation_source = priced or _missing_source(
-            "rollinggo lodging price is unavailable"
+            "rollinggo lodging price is unavailable",
+            basis_label=missing_label,
         )
     elif plan.accommodation is not None:
         area_identity = _area_identity_for_plan(
@@ -389,36 +515,12 @@ async def _plan_inputs(
                     source=_missing_source("accommodation access location and fare are unknown"),
                 ))
 
-    unique_places = {
-        place.place_id: place
-        for day_group in route_plan.day_groups
-        for place in day_group.places
-    }
-    admissions: list[AdmissionCostInput] = []
-    for place_id in sorted(unique_places):
-        place = unique_places[place_id]
-        if place.place_type.lower() not in ADMISSION_PLACE_TYPES:
-            continue
-        identity = f"canonical-place:{place.place_id}"
-        # Try catalog lookup by place name + city
-        ref = lookup_admission_by_label(
-            catalog, place_label=place.name, city=city,
-        )
-        if ref is not None:
-            source = resolve_admission_source(
-                catalog,
-                place_identity=ref.place_identity,
-                captured_at=estimated_at,
-            )
-        else:
-            source = _missing_source(
-                f"no catalog entry for {place.name} in {city}"
-            )
-        admissions.append(AdmissionCostInput(
-            place_identity=identity,
-            charging_basis="person_entry",
-            source=source,
-        ))
+    route_restaurants: dict[tuple[int, str], CandidatePlace] = {}
+    for day_group in route_plan.day_groups:
+        for place in day_group.places:
+            slot = day_group.stop_kinds.get(place.place_id)
+            if slot in COUNTED_MEAL_SLOTS:
+                route_restaurants.setdefault((day_group.day, slot), place)
 
     meals = tuple(
         MealCostInput(
@@ -429,6 +531,7 @@ async def _plan_inputs(
                 city=city,
                 meal_slot=slot,
                 attachment=meal_attachments.get((plan_index, day, slot)),
+                route_restaurant=route_restaurants.get((day, slot)),
                 assigned_meal_slot=slot,
                 captured_at=estimated_at,
             ),
@@ -446,7 +549,9 @@ async def _plan_inputs(
         intercity=intercity,
         accommodation=accommodation_source,
         local_transport=tuple(local_transport),
-        admissions=tuple(admissions),
+        admissions=_route_admissions(
+            route_plan, city=city, catalog=catalog, estimated_at=estimated_at,
+        ),
         meals=meals,
     )
 

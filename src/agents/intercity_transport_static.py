@@ -121,9 +121,6 @@ def get_catalog_fallback(from_city: str, to_city: str) -> dict | None:
 
 
 def get_static_fallback(from_city: str, to_city: str) -> dict[str, Any] | None:
-    # Try catalog first (expanded 16-city coverage)
-    catalog_result = get_catalog_fallback(from_city, to_city)
-    if catalog_result is not None:
-        return catalog_result
-    # Fall back to hardcoded dict (legacy 15 pairs)
-    return STATIC_TRANSPORT.get((from_city, to_city))
+    static_entry = STATIC_TRANSPORT.get((from_city, to_city)) or {}
+    catalog_prices = get_catalog_fallback(from_city, to_city) or {}
+    return {**static_entry, **catalog_prices} or None

@@ -38,9 +38,13 @@ from src.agents.route_planner.places import (
     _protected_ids,
 )
 
-from src.agents.route_planner.legs import _apply_scheduled_legs
+from src.agents.route_planner.legs import CachingEstimator, _apply_scheduled_legs, prefetch_long_legs
+
+from src.agents.route_planner.scenic import included_scenic_places, merge_scenic_stops, record_scenic_visit
 
 from src.agents.route_planner.schedule import (
+    _BACKUP_GAP_REST,
+    _movement_pairs,
     _stay,
     diversify_same_day_pots,
     drop_unrequested_snacks,
@@ -77,6 +81,7 @@ def _attach_places(plan: dict, by_id: dict[int, CandidatePlace], rules: PlannerR
                 adjustments.append(f"第{day.get('day')}天时间窗 {_fmt(rules.end_minute)} 结束，删去晚饭／夜景 {len(dropped)} 站")
         kept = []
         for stop in day.get("stops") or []:
+            stop.pop("_scenic_stops", None)
             if stop.get("kind") == "rest":
                 stop["_place"] = None
                 kept.append(stop)
@@ -109,12 +114,15 @@ async def arrange(
     hotel_cache=None,
     preset_lodging: CandidatePlace | None = None,
     amap_ids: set[int] | None = None,
+    search_hotels: bool = True,
+    fit_opening_hours: bool = False,
+    keep_day_sight: bool = False,
 ) -> tuple[dict, list[str], CandidatePlace | None, str, str]:
     adjustments = []
     # None, or a settings object with the flag off, keeps the model anchor.
     # A preset is the lodging picked before the prompt. User lodging still wins.
     # Without a preset, hotel lodging stays the package U search.
-    if hotel_lodging_enabled(settings):
+    if (search_hotels and hotel_lodging_enabled(settings)) or (not search_hotels and preset_lodging is not None):
         taken = _take_user_lodging(request, pool, by_id, lodging_anchor)
         if taken is not None:
             lodge, source, name, lodging_notes = taken
@@ -143,22 +151,47 @@ async def arrange(
         by_id[lodge.place_id] = lodge
     adjustments.extend(_attach_places(plan, by_id, rules))
     adjustments.extend(drop_unrequested_snacks(plan, rules))
+    adjustments.extend(await merge_scenic_stops(plan, session))
+    days = plan.get("days") or []
+    if isinstance(estimator, CachingEstimator):
+        # A conditional return to lodging during a rest is decided by the day's scheduler.
+        pairs = (
+            pair for day in days for pair in _movement_pairs(
+                [stop for stop in day.get("stops") or []
+                 if stop.get("kind") != "rest" or not rules.rest_via_lodge_only_when_near],
+                lodge,
+            )
+        )
+        await prefetch_long_legs(
+            estimator, pairs, rules.commute_mode, deadline_monotonic=_estimator_deadline(estimator),
+        )
+    protected = _protected_ids(list(by_id.values()), rules)
+
+    def day_protected(day: dict) -> set[int]:
+        return protected | {
+            stop["place_id"]
+            for stop in day.get("stops") or []
+            if any(place.place_id in protected for place in included_scenic_places(stop))
+        }
+
     used = {
         stop["_place"].place_id
-        for day in plan.get("days") or []
+        for day in days
         for stop in day.get("stops") or []
         if stop.get("_place") is not None and stop.get("kind") in {"lunch", "dinner"}
     }
-    for day in plan.get("days") or []:
+    for day in days:
         adjustments.extend(
             await schedule_day(
                 day,
                 rules=rules,
                 lodge=lodge,
-                protected=_protected_ids(list(by_id.values()), rules),
+                protected=day_protected(day),
                 estimator=estimator,
                 request=request,
                 settings=settings,
+                fit_opening_hours=fit_opening_hours,
+                keep_day_sight=keep_day_sight,
             )
         )
         swaps = await repick_meals(
@@ -168,6 +201,8 @@ async def arrange(
             session=session,
             city=rules.city,
             used_ids=used,
+            must_ids=rules.must_ids,
+            opening_hours=rules.opening_hours,
         )
         if swaps:
             adjustments.extend(swaps)
@@ -176,10 +211,12 @@ async def arrange(
                     day,
                     rules=rules,
                     lodge=lodge,
-                    protected=_protected_ids(list(by_id.values()), rules),
+                    protected=day_protected(day),
                     estimator=estimator,
                     request=request,
                     settings=settings,
+                    fit_opening_hours=fit_opening_hours,
+                    keep_day_sight=keep_day_sight,
                 )
             )
     swapped_days: list[dict] = []
@@ -203,10 +240,12 @@ async def arrange(
                 day,
                 rules=rules,
                 lodge=lodge,
-                protected=_protected_ids(list(by_id.values()), rules),
+                protected=day_protected(day),
                 estimator=estimator,
                 request=request,
                 settings=settings,
+                fit_opening_hours=fit_opening_hours,
+                keep_day_sight=keep_day_sight,
             )
         )
     for place in (stop.get("_place") for day in plan.get("days") or [] for stop in day.get("stops") or []):
@@ -370,6 +409,13 @@ async def emit_route_plan(
         for index, stop in enumerate(stops):
             if stop.get("kind") != "rest":
                 continue
+            slot = stop.get("_rest_slot")
+            if stop.get("_backup_gap_rest") is _BACKUP_GAP_REST and slot in {"pre_lunch", "pre_night"}:
+                where = "回住处休息" if stop.get("_rest_via_lodge") else "在附近找地方休息"
+                when = "夜景前" if slot == "pre_night" else "午饭前"
+                suffix = "，傍晚再出门" if slot == "pre_night" and stop.get("_rest_via_lodge") else ""
+                group.time_hints.append(f"{when}{where}{suffix}")
+                continue
             nxt_kind = next(
                 (item.get("kind") for item in stops[index + 1 :] if item.get("kind") != "rest"),
                 "",
@@ -397,6 +443,7 @@ async def emit_route_plan(
         if inplace_dinner and INPLACE_DINNER_REST_HINT not in group.time_hints:
             group.time_hints.append(INPLACE_DINNER_REST_HINT)
         for stop in stops:
+            record_scenic_visit(group, stop)
             if stop.get("kind") == "night" and stop.get("_place") is not None:
                 group.time_hints.append(f"晚饭后去{stop['_place'].name}")
     _seal_model_route(route)

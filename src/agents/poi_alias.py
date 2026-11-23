@@ -444,12 +444,13 @@ def mask_evidenced_place_references(
 def mask_plan_place_references(
     plan, *, route_plan: RoutePlan, plan_index: int, candidate_names: list[str],
 ) -> str:
-    """Exempt prose references only inside an intact, correctly owned Day span."""
+    """Mask route-owned opening notices and evidenced references in owned Day spans."""
     from src.agents.food_review import parse_food_spans
     from src.agents.poi_fragments import fragment_registry_is_intact
+    from src.agents.preference_notices import mask_missed_must_opening
     from src.agents.route_planning import _is_day_heading_line, _parse_day_heading_number
 
-    text = plan.plan_text or ""
+    text = mask_missed_must_opening(plan.plan_text or "", route_plan)
     if not plan.poi_fragments or not fragment_registry_is_intact(plan):
         return text
     headings = []

@@ -1,7 +1,9 @@
 import React, { useState } from "react";
+import { useMobileFromCity } from "@/hooks/useMobileFromCity";
 import { useMobileTripStore } from "@/stores/mobileTripStore";
 import { computeEndDate, isDateInPast, isValidCalendarDate } from "@/utils/mobileDraft";
-import type { MobileRhythm } from "@/types/mobile";
+import { GEO_GUESS_HINT_TEXT } from "@/utils/fromCityPrefill";
+import { MOBILE_FROM_CITY_MAX, type MobileRhythm } from "@/types/mobile";
 import { Icon, Logo, MobileSheet } from "./mobileUi";
 import { findCachedDestination, formatMonthDay } from "./mobileFormat";
 
@@ -40,7 +42,10 @@ export const MobileDepartureStep: React.FC<MobileDepartureStepProps> = ({
   const hasExactDate =
     draft.dateMode === "exact" && !!draft.startDate && isValidCalendarDate(draft.startDate);
   const cityCode = findCachedDestination(draft.cityId, draft.cityName)?.nameEn || "";
+  const { fromCity, showGeoHint, setFromCity } = useMobileFromCity();
+  const cleanFromCity = fromCity.trim();
 
+  const [fromCityOpen, setFromCityOpen] = useState(false);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarYear, setCalendarYear] = useState(0);
   const [calendarMonth, setCalendarMonth] = useState(0); // 0-indexed
@@ -77,6 +82,48 @@ export const MobileDepartureStep: React.FC<MobileDepartureStepProps> = ({
   const dateText = hasExactDate
     ? `${formatMonthDay(draft.startDate!)} — ${formatMonthDay(computeEndDate(draft.startDate!, days))}`
     : "日子还没定，先期待着";
+
+  const renderFromCitySheet = () => (
+    <MobileSheet title="从哪出发？" onClose={() => setFromCityOpen(false)} closeLabel="关闭出发城市">
+      <p>选填，不填也能照常排。</p>
+      <div className="from-city-row">
+        <input
+          className="u-input"
+          type="text"
+          name="from_city"
+          autoComplete="address-level2"
+          aria-label="从哪出发"
+          aria-describedby={showGeoHint ? "mobile-from-city-hint" : undefined}
+          maxLength={MOBILE_FROM_CITY_MAX}
+          placeholder="如：上海"
+          value={fromCity}
+          onChange={(e) => setFromCity(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") setFromCityOpen(false);
+          }}
+        />
+        {fromCity ? (
+          <button
+            type="button"
+            className="text-btn"
+            aria-label="清空出发城市"
+            onClick={() => setFromCity("")}
+          >
+            清空
+          </button>
+        ) : null}
+      </div>
+      {showGeoHint ? (
+        <p id="mobile-from-city-hint" className="from-city-hint" role="status">
+          {GEO_GUESS_HINT_TEXT}
+        </p>
+      ) : null}
+      <button type="button" className="primary" onClick={() => setFromCityOpen(false)}>
+        <span>{cleanFromCity ? "就从这里出发" : "先不填"}</span>
+        <Icon name="arrow" />
+      </button>
+    </MobileSheet>
+  );
 
   const renderCalendar = () => {
     const first = new Date(calendarYear, calendarMonth, 1);
@@ -185,20 +232,40 @@ export const MobileDepartureStep: React.FC<MobileDepartureStepProps> = ({
               </div>
             </div>
             <div className="ticket-perforation" />
-            <button
-              type="button"
-              className="ticket-bottom ticket-date-button"
-              onClick={openCalendar}
-              aria-label={`选择出发日期，${hasExactDate ? dateText : "日期未定"}`}
-            >
-              <span>
-                <span className="tiny" style={{ display: "block" }}>
-                  出发日期（选填）
+            <div className="ticket-bottom ticket-split">
+              <button
+                type="button"
+                className="ticket-cell"
+                onClick={() => setFromCityOpen(true)}
+                aria-label={`填写出发城市，${cleanFromCity || "未填"}`}
+                aria-describedby={showGeoHint ? "mobile-from-city-cell-hint" : undefined}
+              >
+                <span className="ticket-cell-head">
+                  <span className="tiny">出发城市（选填）</span>
+                  <Icon name="pen" />
+                </span>
+                <span className={cleanFromCity ? "ticket-date" : "ticket-date is-empty"}>
+                  {cleanFromCity || "未填"}
+                </span>
+                {showGeoHint ? (
+                  <span id="mobile-from-city-cell-hint" className="ticket-hint">
+                    {GEO_GUESS_HINT_TEXT}
+                  </span>
+                ) : null}
+              </button>
+              <button
+                type="button"
+                className="ticket-cell"
+                onClick={openCalendar}
+                aria-label={`选择出发日期，${hasExactDate ? dateText : "日期未定"}`}
+              >
+                <span className="ticket-cell-head">
+                  <span className="tiny">出发日期（选填）</span>
+                  <Icon name="pen" />
                 </span>
                 <span className="ticket-date">{dateText}</span>
-              </span>
-              <Icon name="pen" />
-            </button>
+              </button>
+            </div>
           </article>
 
           <div className="section-kicker">
@@ -246,7 +313,7 @@ export const MobileDepartureStep: React.FC<MobileDepartureStepProps> = ({
           <p className="ticket-optional">
             只选天数，也可以继续。
             <br />
-            想好哪天出发，再点票面补上。
+            从哪出发、哪天出发，想好了再点票面补上。
           </p>
         </div>
       </div>
@@ -261,6 +328,7 @@ export const MobileDepartureStep: React.FC<MobileDepartureStepProps> = ({
       </div>
 
       {calendarOpen && renderCalendar()}
+      {fromCityOpen && renderFromCitySheet()}
     </>
   );
 };

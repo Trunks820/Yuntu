@@ -554,6 +554,7 @@ async def get_projection_source_metrics_endpoint(request: Request):
         publisher_enabled=bool(settings.projection_publisher_enabled),
         runtime_policy={
             "trip_job_timeout_seconds": settings.trip_job_timeout_seconds,
+            "trip_job_long_timeout_seconds": settings.trip_job_long_timeout_seconds,
             "stale_sweep_interval_seconds": (
                 settings.trip_stale_sweep_interval_seconds
             ),

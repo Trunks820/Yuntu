@@ -7,6 +7,7 @@ The model is asked for order and stay minutes only.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date
 
 from src.agents.preferences import (
@@ -373,7 +374,7 @@ def _soft_rules(rules, *, lodging_first_name: str | None = None) -> list[str]:
         rows.append("亲子又要轻松：午饭后安排 kind=rest 回住处歇脚。")
     rows.append(
         f"城市日路上总时间尽量短，尽量不超过 {rules.urban_commute_cap} 分钟；"
-        "偏长会提示。超过这个上限时第一稿会要求改一次，改完仍超只记提示。"
+        "偏长会记在排线记录里。首稿超过这个上限时会要求改一次。"
     )
     if rules.food:
         rows.append("午饭晚饭尽量选当地特色店。")
@@ -576,3 +577,24 @@ def candidate_block(
             line += _lodging_distance_suffix(place, lodging)
             lines.append(line)
     return "\n".join(lines)
+
+
+def opening_hours_block(rules, places: Iterable[CandidatePlace]) -> str:
+    candidates = list(places)
+    rows = []
+    for number, day in rules.opening_hours.by_day.items():
+        for place in candidates:
+            limits = rules.opening_hours.for_place(number, place)
+            if limits.closed:
+                facts = ["闭馆，该天不能安排"]
+            else:
+                facts = []
+                if limits.last_entry is not None:
+                    facts.append(f"{_fmt(limits.last_entry)} 停止入场，须在此时或之前到达")
+                if limits.closing is not None:
+                    facts.append(f"{_fmt(limits.closing)} 关门，须在此时或之前离开")
+            if facts:
+                rows.append(f"- 第{number}天（{day.date}）{place.place_id}「{place.name}」：" + "，".join(facts))
+    if not rows:
+        return ""
+    return "开放时间硬限制（当地日期）。按这些限制调整分天、顺序和停留时长。\n" + "\n".join(rows)

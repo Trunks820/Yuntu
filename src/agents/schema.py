@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -212,7 +213,7 @@ class DayTrafficPolicy(BaseModel):
 
 
 class TrainOption(BaseModel):
-    """One recommended G/D train returned by the runtime provider."""
+    """One recommended direct train returned by the runtime provider."""
 
     train_no: str
     departure_time: str
@@ -236,6 +237,10 @@ class FlightOption(BaseModel):
     arrival_airport: str
 
 
+TrainClass = Literal["high_speed", "ordinary"]
+FLIGHT_FARE_PENDING = "票价待确认"
+
+
 class TransportModeSummary(BaseModel):
     """Mode-level intercity transport recommendation."""
 
@@ -252,6 +257,16 @@ class TransportModeSummary(BaseModel):
     ] = "unknown"
     availability_checked_at: str | None = None
     top_options: list[TrainOption] | list[FlightOption] = Field(default_factory=list)
+    train_class: TrainClass | None = None
+    reference_date: date | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_train_metadata(self, handler):
+        payload = handler(self)
+        for field in ("train_class", "reference_date"):
+            if payload.get(field) is None:
+                payload.pop(field, None)
+        return payload
 
 
 class TransportSuggestion(BaseModel):
@@ -263,6 +278,9 @@ class TransportSuggestion(BaseModel):
     modes: list[TransportModeSummary] = Field(default_factory=list)
     source: Literal["realtime", "mixed", "static_fallback"]
     cached_at: str | None = None
+    direct_service_absent: bool = Field(default=False, exclude=True)
+    # The cost adapter retains the flight scenario when no schedule duration is available.
+    flight_fare_pending: bool = Field(default=False, exclude=True)
 
 
 class TripRequest(BaseModel):
@@ -908,6 +926,15 @@ class PlanOutput(BaseModel):
     # exempts that span only; reloaded plan JSON does not carry it.
     code_lodging_section: str = Field(default="", exclude=True)
 
+    @field_validator("transport")
+    @classmethod
+    def _omit_transport_without_direct_service(
+        cls, value: TransportSuggestion | None,
+    ) -> TransportSuggestion | None:
+        if value is not None and value.direct_service_absent:
+            return None
+        return value
+
     def poi_fragment(
         self,
         *,
@@ -1050,6 +1077,10 @@ class RouteDayGroup(BaseModel):
     # v0.15.1: model-route clock, kept in plan_json. Old rows and selector
     # routes have none; route_timeline.day_timeline() estimates one.
     timeline: DayTimeline | None = None
+    # Facts for fixed notices on the already scheduled day.
+    excursion_commute_over_limit: bool = Field(default=False, exclude=True)
+    return_after_pace_limit: bool = Field(default=False, exclude=True)
+    empty_day_reason: Literal["all_closed", "insufficient_candidates"] | None = Field(default=None, exclude=True)
 
     @field_validator("stop_kinds", mode="before")
     @classmethod
@@ -1082,7 +1113,7 @@ SelectedDropReason = Literal[
     "ROUTE_FEASIBILITY_LIMIT",
     "NOT_CHOSEN_FOR_FINAL_ROUTE",
 ]
-QualifiedSupplementReason = Literal["REPLACE_DROPPED", "FILL_EMPTY_DAY", "FILL_MUST_INCLUDE_DAY"]
+QualifiedSupplementReason = Literal["REPLACE_DROPPED", "FILL_EMPTY_DAY", "FILL_MUST_INCLUDE_DAY", "FILL_MEAL_SLOT"]
 
 
 class SelectedRouteMembership(BaseModel):
@@ -1154,6 +1185,8 @@ class RoutePlan(BaseModel):
     dropped_place_ids: list[int] = Field(default_factory=list)
     optimized: bool = True
     fallback_reason: str | None = None
+    # The known closure reason, or None if the scheduler has no confirmed cause.
+    missed_must_visits: dict[str, Literal["closed_all_days"] | None] = Field(default_factory=dict, exclude=True)
     membership_ledger: RouteMembershipLedger | None = Field(
         default=None,
         exclude=True,

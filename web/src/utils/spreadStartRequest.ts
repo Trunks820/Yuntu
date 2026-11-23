@@ -117,6 +117,8 @@ export interface SpreadStartDraft {
   mustInclude: MobileMustIncludePlace[];
   accommodation: string;
   fromCity: string;
+  fromCityTouched?: boolean;
+  fromCitySource?: "history" | "storage" | "geo" | null;
   rawNotes: string;
   ownerUserId: string | null;
   updatedAt: number;
@@ -404,6 +406,8 @@ export function createInitialSpreadStartDraft(
     mustInclude: [],
     accommodation: "",
     fromCity: "",
+    fromCityTouched: false,
+    fromCitySource: null,
     rawNotes: "",
     ownerUserId,
     updatedAt: Date.now(),
@@ -635,6 +639,15 @@ export function sanitizeSpreadStartDraft(raw: unknown): SpreadStartDraft | null 
     typeof d.fromCity === "string"
       ? d.fromCity.slice(0, SPREAD_START_FROM_CITY_MAX)
       : "";
+  const fromCityTouched = d.fromCityTouched === true;
+  const fromCitySource: SpreadStartDraft["fromCitySource"] =
+    !fromCityTouched &&
+    fromCity.trim().length > 0 &&
+    (d.fromCitySource === "history" ||
+      d.fromCitySource === "storage" ||
+      d.fromCitySource === "geo")
+      ? d.fromCitySource
+      : null;
   const rawNotes =
     typeof d.rawNotes === "string"
       ? d.rawNotes.slice(0, SPREAD_START_NOTES_MAX)
@@ -670,6 +683,8 @@ export function sanitizeSpreadStartDraft(raw: unknown): SpreadStartDraft | null 
     mustInclude,
     accommodation,
     fromCity,
+    fromCityTouched,
+    fromCitySource,
     rawNotes,
     ownerUserId,
     updatedAt:
@@ -809,6 +824,8 @@ export function scrubSpreadStartDraftOnAuthChange(
     mustInclude: [],
     accommodation: "",
     fromCity: "",
+    fromCityTouched: false,
+    fromCitySource: null,
     rawNotes: "",
     ownerUserId: nextUserId,
     updatedAt: Date.now(),

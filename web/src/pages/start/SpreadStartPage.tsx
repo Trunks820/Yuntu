@@ -12,6 +12,7 @@ import { useDestinations } from "@/hooks/useDestinations";
 import { useTripSubmission } from "@/hooks/useTripSubmission";
 import { ApiRequestError } from "@/services/api";
 import { showToast } from "@/stores/toastStore";
+import { useTripStore } from "@/stores/tripStore";
 import {
   COMPANION_BOUNDARIES,
   MOBILE_AVOID_OPTIONS,
@@ -24,6 +25,12 @@ import {
   isValidCalendarDate,
 } from "@/utils/mobileDraft";
 import { clearCinematicSubmission } from "@/utils/cinematicSubmission";
+import {
+  GEO_GUESS_HINT_TEXT,
+  saveLastFromCity,
+  useFromCityPrefill,
+  type FromCityPrefillSource,
+} from "@/utils/fromCityPrefill";
 import { clearPendingSubmission } from "@/utils/pendingSubmission";
 import {
   SPREAD_START_ACCOMMODATION_MAX,
@@ -415,6 +422,51 @@ export default function SpreadStartPage() {
   const draftRef = useRef(draft);
   draftRef.current = draft;
 
+  const handleApplyFromCityPrefill = useCallback(
+    (city: string, source: FromCityPrefillSource) => {
+      setDraft((prev) => {
+        if (prev.fromCityTouched || prev.fromCity.trim().length > 0) {
+          return prev;
+        }
+        return {
+          ...prev,
+          fromCity: city,
+          fromCitySource: source,
+          updatedAt: Date.now(),
+        };
+      });
+    },
+    [],
+  );
+
+  const {
+    showGeoHint: showFromCityGeoHint,
+    markUserEdited: markFromCityEdited,
+  } = useFromCityPrefill({
+    value: draft.fromCity,
+    onApplyPrefill: handleApplyFromCityPrefill,
+    authStatus: "authenticated",
+    bootstrapped: true,
+    userId: "guest",
+    maxLength: SPREAD_START_FROM_CITY_MAX,
+    initialTouched: Boolean(draft.fromCityTouched),
+    initialSource: draft.fromCitySource ?? null,
+  });
+
+  const handleChangeFromCity = (nextRaw: string) => {
+    setSubmitError(null);
+    markFromCityEdited();
+    const value = nextRaw.slice(0, SPREAD_START_FROM_CITY_MAX);
+    setDraft((prev) => ({
+      ...prev,
+      revision: prev.revision + 1,
+      fromCity: value,
+      fromCityTouched: true,
+      fromCitySource: null,
+      updatedAt: Date.now(),
+    }));
+  };
+
   const {
     data: destinationsData,
     isError: isDestinationsError,
@@ -757,6 +809,10 @@ export default function SpreadStartPage() {
       return buildSpreadStartRequest(currentDraft);
     },
     onSuccess: () => {
+      saveLastFromCity(
+        useTripStore.getState().formData?.from_city,
+        SPREAD_START_FROM_CITY_MAX,
+      );
       setSubmitError(null);
       clearSpreadStartSubmitIntent();
       clearPendingSubmission();
@@ -1139,6 +1195,11 @@ export default function SpreadStartPage() {
           </div>
           <div className="t-main">
             <div>
+              {draft.fromCity.trim() ? (
+                <p className="t-code" style={{ marginTop: 0, marginBottom: 2 }}>
+                  {`从 ${draft.fromCity.trim()} 出发`}
+                </p>
+              ) : null}
               <p className="t-city">{cleanCity}</p>
               {cityCode ? <p className="t-code">{cityCode}</p> : null}
             </div>
@@ -1575,7 +1636,6 @@ export default function SpreadStartPage() {
   const extraFilledCount = [
     draft.mustInclude.length,
     draft.accommodation.trim(),
-    draft.fromCity.trim(),
     draft.rawNotes.trim(),
   ].filter(Boolean).length;
 
@@ -1999,22 +2059,68 @@ export default function SpreadStartPage() {
                     </div>
                   </div>
                   <div className="split">
-                    <div className="field">
-                      <p className="field-label kicker" id="dateLabel">
-                        哪天出发<span>选填</span>
-                      </p>
-                      {renderCalendar()}
-                      {draft.dateMode === "exact" && draft.startDate ? (
-                        <button
-                          type="button"
-                          className="text-btn cal-clear"
-                          onClick={handleClearDate}
+                    <div className="split-col">
+                      <div className="field">
+                        <label
+                          className="field-label kicker"
+                          htmlFor="fromCityInput"
                         >
-                          改成暂不确定日期
-                        </button>
-                      ) : (
-                        <p className="cal-note">不选也能先排，日子以后再补。</p>
-                      )}
+                          从哪出发<span>选填</span>
+                        </label>
+                        <div className="from-city-row">
+                          <input
+                            type="text"
+                            id="fromCityInput"
+                            className="input"
+                            name="from_city"
+                            autoComplete="address-level2"
+                            aria-label="从哪出发"
+                            aria-describedby={
+                              showFromCityGeoHint ? "fromCityHint" : undefined
+                            }
+                            maxLength={SPREAD_START_FROM_CITY_MAX}
+                            placeholder="如：上海"
+                            value={draft.fromCity}
+                            onChange={(e) => handleChangeFromCity(e.target.value)}
+                          />
+                          {draft.fromCity ? (
+                            <button
+                              type="button"
+                              className="text-btn"
+                              aria-label="清空出发城市"
+                              onClick={() => handleChangeFromCity("")}
+                            >
+                              清空
+                            </button>
+                          ) : null}
+                        </div>
+                        {showFromCityGeoHint ? (
+                          <p
+                            className="field-help is-guess"
+                            id="fromCityHint"
+                            role="status"
+                          >
+                            {GEO_GUESS_HINT_TEXT}
+                          </p>
+                        ) : null}
+                      </div>
+                      <div className="field">
+                        <p className="field-label kicker" id="dateLabel">
+                          哪天出发<span>选填</span>
+                        </p>
+                        {renderCalendar()}
+                        {draft.dateMode === "exact" && draft.startDate ? (
+                          <button
+                            type="button"
+                            className="text-btn cal-clear"
+                            onClick={handleClearDate}
+                          >
+                            改成暂不确定日期
+                          </button>
+                        ) : (
+                          <p className="cal-note">不选也能先排，日子以后再补。</p>
+                        )}
+                      </div>
                     </div>
                     <div className="field">
                       <p className="field-label kicker" id="compLabel">
@@ -2058,7 +2164,7 @@ export default function SpreadStartPage() {
                       <span>
                         {extraFilledCount > 0
                           ? `已填 ${extraFilledCount} 项`
-                          : "必去地点、住哪一带、从哪出发、备注，都可以不填"}
+                          : "必去地点、住哪一带、备注，都可以不填"}
                       </span>
                     </summary>
                     <div className="more-body">
@@ -2219,66 +2325,36 @@ export default function SpreadStartPage() {
                         />
                       </div>
 
-                      <div className="field-row">
-                        <div className="field">
-                          <label className="field-label" htmlFor="fromCityInput">
-                            从哪里出发
-                          </label>
-                          <input
-                            type="text"
-                            id="fromCityInput"
-                            className="input"
-                            name="from_city"
-                            autoComplete="address-level2"
-                            maxLength={SPREAD_START_FROM_CITY_MAX}
-                            placeholder="如：上海…"
-                            value={draft.fromCity}
-                            onChange={(e) => {
-                              setSubmitError(null);
-                              const value = e.target.value.slice(
-                                0,
-                                SPREAD_START_FROM_CITY_MAX,
-                              );
-                              setDraft((prev) => ({
-                                ...prev,
-                                revision: prev.revision + 1,
-                                fromCity: value,
-                                updatedAt: Date.now(),
-                              }));
-                            }}
-                          />
-                        </div>
-                        <div className="field">
-                          <label
-                            className="field-label"
-                            htmlFor="draftNoteInput"
-                          >
-                            还有什么要交代
-                          </label>
-                          <input
-                            type="text"
-                            id="draftNoteInput"
-                            className="input"
-                            name="note"
-                            autoComplete="off"
-                            maxLength={SPREAD_START_NOTES_MAX}
-                            placeholder="如：第一天下午两点才到…"
-                            value={draft.rawNotes}
-                            onChange={(e) => {
-                              setSubmitError(null);
-                              const value = e.target.value.slice(
-                                0,
-                                SPREAD_START_NOTES_MAX,
-                              );
-                              setDraft((prev) => ({
-                                ...prev,
-                                revision: prev.revision + 1,
-                                rawNotes: value,
-                                updatedAt: Date.now(),
-                              }));
-                            }}
-                          />
-                        </div>
+                      <div className="field">
+                        <label
+                          className="field-label"
+                          htmlFor="draftNoteInput"
+                        >
+                          还有什么要交代
+                        </label>
+                        <input
+                          type="text"
+                          id="draftNoteInput"
+                          className="input"
+                          name="note"
+                          autoComplete="off"
+                          maxLength={SPREAD_START_NOTES_MAX}
+                          placeholder="如：第一天下午两点才到…"
+                          value={draft.rawNotes}
+                          onChange={(e) => {
+                            setSubmitError(null);
+                            const value = e.target.value.slice(
+                              0,
+                              SPREAD_START_NOTES_MAX,
+                            );
+                            setDraft((prev) => ({
+                              ...prev,
+                              revision: prev.revision + 1,
+                              rawNotes: value,
+                              updatedAt: Date.now(),
+                            }));
+                          }}
+                        />
                       </div>
                     </div>
                   </details>

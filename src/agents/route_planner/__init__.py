@@ -82,6 +82,7 @@ from src.agents.route_planner.rules import (
     WALK_CAP_MINUTES,
     SHORT_WALK_MINUTES,
     SHORT_DRIVE_WALK_MINUTES,
+    ALWAYS_WALK_KM,
     EMIT_ERROR_TEXT_LIMIT,
     MEAL_NEAR_KM,
     IDLE_LIMIT_MINUTES,
@@ -90,7 +91,6 @@ from src.agents.route_planner.rules import (
     SIGHT_EXTEND_CAP,
     CLUSTER_RADIUS_KM,
     SCENIC_NEAR_KM,
-    SAME_PLACE_KM,
     FAR_WALK_KM,
     KINDS,
     PACE_LIMIT,
@@ -149,7 +149,6 @@ from src.agents.route_planner.legs import (
     _estimated_commute,
     _fallback_minutes,
     _chosen_hop,
-    _synthetic_one_minute_walk,
     _meters,
     _commute_from_hop,
     _access_from_hop,
@@ -191,7 +190,6 @@ from src.agents.route_planner.checks import (
     classify_day,
     _commute_class,
     urban_commute_notes,
-    _soften_urban_commute_issues,
     _estimated_leg_count,
     _stop_label,
     _lodge_label,
@@ -246,6 +244,8 @@ from src.agents.route_planner.planner import (
     _fail,
     plan_route,
 )
+
+from src.agents.route_planner.backup import ScheduledBackupResult, plan_backup
 
 import importlib as _importlib
 _importlib.import_module("src.agents.route_planner_prompt")

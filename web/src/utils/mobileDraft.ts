@@ -10,6 +10,7 @@ import type {
 import {
   COMPANION_BOUNDARIES,
   MOBILE_AVOID_OPTIONS,
+  MOBILE_FROM_CITY_MAX,
   MOBILE_MUST_INCLUDE_LIMIT,
   MOBILE_SCENES,
   SCENE_CATEGORY_INTEREST_MAP,
@@ -50,6 +51,9 @@ export function createInitialMobileDraft(
     cityId: null,
     cityName: null,
     cityConfirmed: false,
+    fromCity: "",
+    fromCityTouched: false,
+    fromCitySource: null,
     days: 3,
     dateMode: "undecided",
     startDate: null,
@@ -292,6 +296,14 @@ export function buildMobileTripRequest(
     request.must_include = draft.mustInclude.map((p) => ({ place_id: p.placeId, name: p.name }));
   }
 
+  // 7. 出发城市：去空格、限长与 PC 一致，为空时不传
+  const cleanFromCity = (draft.fromCity || "")
+    .trim()
+    .slice(0, MOBILE_FROM_CITY_MAX);
+  if (cleanFromCity) {
+    request.from_city = cleanFromCity;
+  }
+
   return request;
 }
 
@@ -382,6 +394,20 @@ export function sanitizeMobileDraft(raw: unknown): MobileTripDraft | null {
   const cityId = typeof d.cityId === "string" ? d.cityId : null;
   const cityName = typeof d.cityName === "string" ? d.cityName : null;
   const cityConfirmed = Boolean(d.cityConfirmed && cityName);
+
+  const fromCity =
+    typeof d.fromCity === "string"
+      ? d.fromCity.slice(0, MOBILE_FROM_CITY_MAX)
+      : "";
+  const fromCityTouched = d.fromCityTouched === true;
+  const fromCitySource: MobileTripDraft["fromCitySource"] =
+    !fromCityTouched &&
+    fromCity.trim().length > 0 &&
+    (d.fromCitySource === "history" ||
+      d.fromCitySource === "storage" ||
+      d.fromCitySource === "geo")
+      ? d.fromCitySource
+      : null;
 
   // 严格要求有限正整数 1-7
   let days: number | null = null;
@@ -480,6 +506,9 @@ export function sanitizeMobileDraft(raw: unknown): MobileTripDraft | null {
     cityId,
     cityName,
     cityConfirmed,
+    fromCity,
+    fromCityTouched,
+    fromCitySource,
     days,
     dateMode,
     startDate,
@@ -528,11 +557,14 @@ export function handleAccountSwitchForMobileDraft(
     newUserId &&
     currentDraft.ownerUserId !== newUserId
   ) {
-    // 换号：擦除敏感备注与自定义同伴设置
+    // 换号：擦除敏感备注、出发城市与自定义同伴设置
     const bounds = COMPANION_BOUNDARIES.solo;
     return {
       ...currentDraft,
       ownerUserId: newUserId,
+      fromCity: "",
+      fromCityTouched: false,
+      fromCitySource: null,
       rawNotes: "",
       companion: "solo",
       adults: bounds.defaultAdults,
@@ -543,11 +575,14 @@ export function handleAccountSwitchForMobileDraft(
   }
 
   if (currentDraft.ownerUserId && !newUserId) {
-    // 主动登出：清除敏感备注，恢复为匿名草稿
+    // 主动登出：清除敏感备注与出发城市，恢复为匿名草稿
     const bounds = COMPANION_BOUNDARIES.solo;
     return {
       ...currentDraft,
       ownerUserId: null,
+      fromCity: "",
+      fromCityTouched: false,
+      fromCitySource: null,
       rawNotes: "",
       companion: "solo",
       adults: bounds.defaultAdults,

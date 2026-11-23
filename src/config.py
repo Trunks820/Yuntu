@@ -9,14 +9,23 @@ _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 _FROZEN_WRITER_STREAM_ATTEMPT_CAP_SECONDS = 60.0
-_FROZEN_WORKFLOW_WALL_SECONDS = 180.0
+_SPECULATIVE_DS_TIMEOUT_CAP_SECONDS = 180.0
 _MAX_LLM_RECOVERY_PROBE_TIMEOUT_SECONDS = 45.0
+DEFAULT_TRIP_JOB_TIMEOUT_SECONDS = 180
+DEFAULT_TRIP_JOB_LONG_TIMEOUT_SECONDS = 240
+
+
+def is_long_trip(days: int | str | None) -> bool:
+    try:
+        return days is not None and int(days) >= 4
+    except (TypeError, ValueError):
+        return False
 
 
 class Settings(BaseSettings):
     # D1 migration must precede enabling this ingestion-only fold.
     place_same_amap_fold_enabled: bool = False
-    app_version: str = "0.15.1-oss"
+    app_version: str = "0.15.4-oss"
     database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/yuntu_travel"
     # Global open-source LLM fallback keys (one key is enough to run locally).
     gemini_api_key: str = ""
@@ -70,7 +79,10 @@ class Settings(BaseSettings):
     yuntu_travel_internal_credential: str = ""
     yuntu_travel_bff_internal_admin_credential: str = ""
     trip_worker_concurrency: int = 5
-    trip_job_timeout_seconds: int = 180
+    trip_job_timeout_seconds: int = DEFAULT_TRIP_JOB_TIMEOUT_SECONDS
+    trip_job_long_timeout_seconds: int = Field(
+        default=DEFAULT_TRIP_JOB_LONG_TIMEOUT_SECONDS, gt=0
+    )
     trip_stale_sweep_interval_seconds: int = 30
     trip_worker_enabled: bool = True
     # v0.12+ generation policy enabled by default for open-source delivery metadata & route diagnostics.
@@ -124,7 +136,8 @@ class Settings(BaseSettings):
     transport_12306_timeout_seconds: float = 5.0
     transport_12306_retry_count: int = 1
     aviation_edge_api_key: str = ""
-    transport_flight_timeout_seconds: float = 5.0
+    variflight_api_key: str = Field(default="", repr=False)
+    transport_flight_timeout_seconds: float = 15.0
     transport_cache_ttl_seconds: int = 900
     transport_station_map_ttl_hours: int = 24
     transport_resolver_total_budget_seconds: float = 12.0
@@ -303,8 +316,9 @@ class Settings(BaseSettings):
     route_planner_taxi_ratio: float = 0.5
     # v0.14 / v0.15.1 route planner enabled by default for open-source deployments.
     route_planner_enabled: bool = True
-    # Cap for one model route, also limited by the writer/review reserve.
-    route_planner_deadline_seconds: float = 70.0
+    # The model's per-call timeout grows on longer trips.
+    route_planner_timeout_per_extra_day_seconds: float = 5.0
+    route_planner_timeout_max_seconds: float = 70.0
     # Amap wall clock for the model route. It starts when scheduling starts,
     # after the model call, and is not the backup route's 60s budget.
     # Hotel-area lookup, when enabled, spends this same clock before scheduling.
@@ -424,7 +438,7 @@ class Settings(BaseSettings):
             raise ValueError("SPECULATIVE_DS_TIMEOUT_SECONDS must be positive")
         effective_workflow_wall_seconds = min(
             float(self.trip_job_timeout_seconds),
-            _FROZEN_WORKFLOW_WALL_SECONDS,
+            _SPECULATIVE_DS_TIMEOUT_CAP_SECONDS,
         )
         if self.speculative_ds_timeout_seconds > effective_workflow_wall_seconds:
             raise ValueError(
@@ -468,7 +482,7 @@ class Settings(BaseSettings):
         positive_fields = (
             "grouping_wall_timeout_seconds",
             "route_planner_timeout_seconds",
-            "route_planner_deadline_seconds",
+            "route_planner_timeout_max_seconds",
             "route_planner_amap_time_budget_seconds",
             "route_planner_hotel_lodging_radius_meters",
             "route_planner_hotel_lodging_pages",
@@ -600,3 +614,11 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def trip_job_timeout_for_days(settings: Settings, days: int | None) -> int:
+    if is_long_trip(days):
+        return getattr(
+            settings, "trip_job_long_timeout_seconds", DEFAULT_TRIP_JOB_LONG_TIMEOUT_SECONDS
+        )
+    return getattr(settings, "trip_job_timeout_seconds", DEFAULT_TRIP_JOB_TIMEOUT_SECONDS)

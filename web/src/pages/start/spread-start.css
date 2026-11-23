@@ -1136,6 +1136,34 @@
   align-items: start;
 }
 
+.yuntu-spread .desk #view-start .split-col {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+
+/* 从哪出发 */
+.yuntu-spread .desk #view-start .from-city-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.yuntu-spread .desk #view-start .from-city-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.yuntu-spread .desk #view-start .from-city-row .text-btn {
+  color: var(--muted);
+}
+
+.yuntu-spread .desk #view-start .field-help.is-guess {
+  margin-top: -4px;
+  color: var(--green);
+}
+
 /* 日历 */
 .yuntu-spread .desk #view-start .cal-head {
   display: flex;

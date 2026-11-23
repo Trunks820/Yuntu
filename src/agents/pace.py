@@ -40,6 +40,8 @@ COMPACT_PACE_MARKERS = (
     "不浪费时间",
 )
 
+RELAXED_COMPANION_MARKERS = ("带老人", "带小孩", "带孩子", "带娃")
+
 
 def detect_pace_mode(request: TripRequest) -> PaceMode:
     """Return the requested itinerary pace.
@@ -51,16 +53,18 @@ def detect_pace_mode(request: TripRequest) -> PaceMode:
     relaxed_text = " ".join([*request.preferences, *request.avoid, request.notes])
     if any(marker in relaxed_text for marker in RELAXED_PACE_MARKERS):
         return "relaxed"
+    requested_text = " ".join([*request.preferences, request.notes])
+    if any(marker in requested_text for marker in RELAXED_COMPANION_MARKERS):
+        return "relaxed"
 
     compact_avoid_text = " ".join(request.avoid)
     compact_vetoed = any(
         marker in compact_avoid_text
         for marker in COMPACT_PACE_MARKERS
     )
-    compact_text = " ".join([*request.preferences, request.notes])
     if (
         not compact_vetoed
-        and any(marker in compact_text for marker in COMPACT_PACE_MARKERS)
+        and any(marker in requested_text for marker in COMPACT_PACE_MARKERS)
     ):
         return "compact"
 

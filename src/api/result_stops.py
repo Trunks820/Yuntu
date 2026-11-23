@@ -12,11 +12,27 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from src.agents.article_writer import _TRIP_TIPS_HEAD, _plain
 from src.agents.composition_blueprint import COFFEE_TYPES, FOOD_TYPES, SNACK_TYPES
 from src.agents.schema import DayTimeline, parse_hhmm
 
 _MEAL_PLACE_TYPES = FOOD_TYPES | SNACK_TYPES | COFFEE_TYPES
 _MARKUP_RE = re.compile(r"<!--.*?-->|\*\*", flags=re.S)
+_TRIP_OPENING_TITLE = re.compile(
+    r"^[\u4e00-\u9fff]{2,12}\s*[0-9一二三四五六七八九十]+\s*[日天](?:游)?\s*(?:[·・｜|：:—-]|$)"
+)
+_TRIP_OPENING_DETAIL = re.compile(
+    r"^(?:\d{1,2}\s*月\s*\d{1,2}\s*日[^。]*[｜|]|"
+    r"[0-9一二三四五六七八九十]+天(?:日落|都|行程)|全程|这份行程|这趟行程|下面每站)"
+)
+_DAY_INTRO_SENTENCE = re.compile(r"(?<=[。！？!?])\s*(?:今天|当天|今日|今早|今晚|第[一1]天|住宿往返)")
+# Same labels as article_writer._TRIP_TIPS_INLINE. Persisted prose can also
+# end the label with a sentence break, as in "几点整体提醒。", or a line break.
+_TRIP_TIPS_INLINE = re.compile(
+    r"(?:^|(?<=[。！？!?；;]))\s*[^\w。！？!?，,；;：:\s]{0,3}\s*"
+    r"(?:几点|几个|几条|最后的?|行前|出行|随身|全程|旅行|[0-9一二三四五六七八九十]+月(?:出行)?)"
+    r"[^。！？，,：:]{0,8}(?:提醒|贴士|叮嘱|装备|须知|清单)(?:[：:。！？!?]|$)"
+)
 OPEN_TIME_MAX_CHARS = 30
 NOTE_MAX_CHARS = 600
 
@@ -37,6 +53,68 @@ def _dropped(text: str) -> bool:
     return text.startswith("通勤参考") or text in BASIC_FILLER_LINES
 
 
+def _place_prefixes(name: str) -> tuple[str, str]:
+    return f"{name}：", f"到{name}后，"
+
+
+def split_trip_opening(body: str, place_names: dict[int, str]) -> tuple[str, str | None]:
+    """Move the article's trip title and introductory copy out of Day 1."""
+    lines = body.splitlines(keepends=True)
+    prefixes = tuple(prefix for name in place_names.values() if name for prefix in _place_prefixes(name))
+    for index, raw in enumerate(lines):
+        line = _line(raw)
+        if line.startswith(prefixes):
+            break
+        if not _TRIP_OPENING_TITLE.match(_plain(raw)):
+            continue
+        for end in range(index, len(lines)):
+            detail = lines[end]
+            line = _line(detail)
+            if end > index and line and (line.startswith(prefixes) or not _TRIP_OPENING_DETAIL.match(line)):
+                break
+            day_intro = _DAY_INTRO_SENTENCE.search(detail)
+            if day_intro:
+                opening = "".join(lines[index:end]) + detail[:day_intro.start()]
+                lines[end] = detail[day_intro.start():]
+                return "".join(lines[:index] + lines[end:]), opening.strip()
+        else:
+            end = len(lines)
+        return "".join(lines[:index] + lines[end:]), "".join(lines[index:end]).strip()
+    return body, None
+
+
+def split_trip_tips(body: str, last_place_name: str) -> tuple[str, str | None]:
+    """Cut the trip tips from the final stop or from the lines following it."""
+    if not last_place_name:
+        return body, None
+    lines = body.splitlines(keepends=True)
+    prefixes = _place_prefixes(last_place_name)
+    last_stop_seen = False
+    for index, raw in enumerate(lines):
+        line = _line(raw)
+        prefix = next((prefix for prefix in prefixes if line.startswith(prefix)), None)
+        if prefix:
+            last_stop_seen = True
+        if not last_stop_seen:
+            continue
+        label_at = raw.find(prefix) if prefix else -1
+        start = label_at + len(prefix) if label_at >= 0 else 0
+        prose = raw[start:].rstrip()
+        inline = _TRIP_TIPS_INLINE.search(prose)
+        if inline:
+            split_at = start + inline.start()
+        elif _TRIP_TIPS_HEAD.fullmatch(_plain(prose)):
+            split_at = start
+        else:
+            continue
+        end = next((i for i in range(index + 1, len(lines)) if _dropped(_line(lines[i]))), len(lines))
+        tips = (raw[split_at:] + "".join(lines[index + 1:end])).strip()
+        # Keep the stop's own sentence and the boundary before any code-written footer.
+        kept = raw[:split_at] + raw[len(raw.rstrip("\r\n")):] if split_at else ""
+        return "".join(lines[:index]) + kept + "".join(lines[end:]), tips
+    return body, None
+
+
 def split_day_text(body: str, place_names: dict[int, str]) -> tuple[list[str], dict[int, str]]:
     """Day body lines that are not a place's own paragraph, and each place's paragraph.
 
@@ -49,8 +127,9 @@ def split_day_text(body: str, place_names: dict[int, str]) -> tuple[list[str], d
     labels: list[tuple[str, int, bool]] = []
     for place_id, name in place_names.items():
         if name:
-            labels.append((f"{name}：", place_id, False))
-            labels.append((f"到{name}后，", place_id, True))
+            keyed, basic = _place_prefixes(name)
+            labels.append((keyed, place_id, False))
+            labels.append((basic, place_id, True))
     labels.sort(key=lambda item: -len(item[0]))
     lines = [text for text in (_line(raw) for raw in body.splitlines()) if text]
     matched = [next((label for label in labels if text.startswith(label[0])), None) for text in lines]

@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { MapPin, Plane, TrainFront, TriangleAlert, X } from "lucide-react";
-import { getScenarioCostStatus, type CostEstimateSummary } from "@/types/cost";
+import {
+  ChevronDown,
+  MapPin,
+  Plane,
+  TrainFront,
+  TriangleAlert,
+  X,
+} from "lucide-react";
+import {
+  formatPartialAdmissionText,
+  getScenarioCostStatus,
+  type CostEstimateSummary,
+} from "@/types/cost";
 import type { AccommodationInfo, TripPlan, TripResult } from "@/types/trip";
 import {
   filterPackingChecklist,
@@ -15,9 +26,11 @@ import {
   hasValidAccommodationCoords,
   pickDefaultCostScenarioId,
   resolveBeforeWeatherSection,
+  resolveBookCostBreakdownVisuals,
   resolveBookCostCategoryRows,
   resolveBookLodgingPresentation,
   resolveTransportFooterNote,
+  splitScenarioCostText,
   type BookSidePageId,
 } from "@/utils/spreadBook";
 
@@ -200,21 +213,25 @@ function LodgingBlockContent({
       {presentation.caption && (
         <p className="bk-ga-caption">{presentation.caption}</p>
       )}
-      {presentation.tiers.length > 0 && (
-        <div className="bk-gtier">
-          {presentation.tiers.map((tier, idx) => (
-            <div className="bk-gtier-item" key={`${tier.kind}-${idx}`}>
-              <b>{tier.label}</b>
-              {tier.priceText && (
-                <span className="bk-gtier-price">{tier.priceText}</span>
-              )}
-              {tier.hotelsText && (
-                <span className="bk-gtier-hotels">{tier.hotelsText}</span>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      {presentation.tiers.length > 0 && (() => {
+        const hasAnyPrice = presentation.tiers.some((t) => Boolean(t.priceText));
+        return (
+          <div className="bk-gtier2">
+            {presentation.tiers.map((tier, idx) => (
+              <div
+                className={`bk-gtier2-row${hasAnyPrice ? "" : " is-unpriced"}`}
+                key={`${tier.kind}-${idx}`}
+              >
+                <b>{tier.label}</b>
+                {hasAnyPrice && (
+                  <span className="p">{tier.priceText ?? ""}</span>
+                )}
+                <span className="h">{tier.hotelsText ?? ""}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })()}
       {presentation.holidayNotices.map((notice, idx) => (
         <p className="bk-lodging-holiday" key={`holiday-${idx}`}>
           {notice.text}
@@ -406,7 +423,15 @@ function CostSection({
   const activeScenario =
     scenarios.find((s) => s.scenario_id === selectedScenarioId) ?? scenarios[0];
   const costStatus = getScenarioCostStatus(activeScenario, false);
-  const categoryRows = resolveBookCostCategoryRows(activeScenario);
+  const totalParts = splitScenarioCostText(costStatus);
+  const categoryRows = resolveBookCostCategoryRows(activeScenario).map((row) => {
+    if (!row.isUnpriced || row.key !== "admission") return row;
+    const cat = activeScenario.categories.find((c) => c.category === row.key);
+    const partialText = formatPartialAdmissionText(cat);
+    return partialText ? { ...row, amountText: partialText } : row;
+  });
+  const { segments: barSegments, toneByKey } =
+    resolveBookCostBreakdownVisuals(categoryRows);
   const noteLabels = [
     ...(costEstimate.assumptions ?? []).map((a) => a.label),
     ...(costEstimate.exclusions ?? []).map((e) => e.label),
@@ -416,69 +441,101 @@ function CostSection({
   const estimatedDate = formatCostEstimatedDate(costEstimate.estimated_at);
 
   return (
-    <div className="bk-pg">
+    <div className="bk-pg bk-cost2">
       <h2>花多少</h2>
-      <div className="bk-ga-block">
-        {scenarios.length > 1 && (
-          <div
-            className="bk-cost-tabs"
-            role="radiogroup"
-            aria-label="大交通出行场景选择"
-          >
-            {scenarios.map((sc) => {
-              const active = sc.scenario_id === activeScenario.scenario_id;
-              return (
-                <button
-                  key={sc.scenario_id}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  onClick={() => setSelectedScenarioId(sc.scenario_id)}
-                >
-                  {sc.label}
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        <div className="bk-ga-p">
-          <span>
-            {activeScenario.label} · 全程 · {peopleCount} 人
-          </span>
-          <div className="bk-gcost-row">
-            <b className="bk-gcost">{costStatus.costText}</b>
-            {costStatus.costBadge && (
-              <span className="bk-cost-badge">{costStatus.costBadge}</span>
-            )}
-          </div>
+      {scenarios.length > 1 && (
+        <div
+          className="bk-cost-tabs"
+          role="radiogroup"
+          aria-label="大交通出行场景选择"
+        >
+          {scenarios.map((sc) => {
+            const active = sc.scenario_id === activeScenario.scenario_id;
+            return (
+              <button
+                key={sc.scenario_id}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                onClick={() => setSelectedScenarioId(sc.scenario_id)}
+              >
+                {sc.label}
+              </button>
+            );
+          })}
         </div>
+      )}
 
-        <ul className="bk-gled">
-          {categoryRows.map((row) => (
-            <li key={row.key}>
-              <div className="bk-gled-main">
-                <b>{row.label}</b>
-                <i aria-hidden="true" />
-                <em className={row.isUnpriced ? "is-unpriced" : undefined}>
-                  {row.amountText}
-                </em>
-              </div>
-              {row.basisLabel && (
-                <small className="bk-gled-basis">{row.basisLabel}</small>
-              )}
-            </li>
-          ))}
-        </ul>
-
-        {noteLabels.length > 0 && (
-          <p className="bk-ga-fine">{noteLabels.join(" · ")}</p>
+      <p className="c2-scn">
+        {activeScenario.label} · 全程 · {peopleCount} 人
+      </p>
+      <p className={`c2-total${costStatus.showAmount ? "" : " is-unavailable"}`}>
+        {totalParts.prefix && (
+          <>
+            <small>{totalParts.prefix}</small>{" "}
+          </>
         )}
-        {estimatedDate && <p className="bk-ga-fine">预估于 {estimatedDate}</p>}
-        <p className="bk-ga-fine">
-          {costEstimate.notice || "费用为规划参考，实际花费以出行行为准"}
-        </p>
-      </div>
+        <b>{totalParts.main}</b>
+      </p>
+      {costStatus.costBadge && <p className="c2-flag">{costStatus.costBadge}</p>}
+
+      {barSegments.length > 0 && (
+        <div className="c2-bar" aria-hidden="true">
+          {barSegments.map((seg) => (
+            <i
+              key={seg.key}
+              className={`c2-seg-${seg.tone}`}
+              style={{ flex: seg.ratio }}
+            />
+          ))}
+        </div>
+      )}
+
+      <ul className="c2-rows">
+        {categoryRows.map((row) => {
+          const tone = toneByKey[row.key];
+          const isHollowDot = row.isUnpriced || !tone;
+          return (
+            <li
+              key={row.key}
+              className={row.isUnpriced ? "is-unpriced" : undefined}
+            >
+              <i
+                className={
+                  isHollowDot ? "dot is-hollow" : `dot c2-seg-${tone}`
+                }
+                aria-hidden="true"
+              />
+              <b>{row.label}</b>
+              <small>{row.basisLabel ?? ""}</small>
+              <em className={row.isUnpriced ? "is-unpriced" : undefined}>
+                {row.amountText}
+              </em>
+            </li>
+          );
+        })}
+      </ul>
+
+      {(noteLabels.length > 0 || estimatedDate) && (
+        <details className="c2-how">
+          <summary>
+            怎么算的
+            <ChevronDown size={14} aria-hidden="true" />
+          </summary>
+          {noteLabels.length > 0 && (
+            <ul>
+              {noteLabels.map((label, idx) => (
+                <li key={`cost-note-${idx}`}>{label}</li>
+              ))}
+            </ul>
+          )}
+          {estimatedDate && <p>预估于 {estimatedDate}</p>}
+        </details>
+      )}
+
+      <p className="c2-note">
+        {costEstimate.notice || "费用为规划参考，实际花费以出行行为准"}
+      </p>
     </div>
   );
 }

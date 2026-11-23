@@ -1,8 +1,7 @@
-"""Public-holiday overlap for the lodging reminder.
+"""Read the public-holiday calendar and check overlap for the lodging reminder.
 
-The shipped table is an empty placeholder. A year that appears in the table
-uses only that year's rows. A year that does not appear uses three fixed
-dates: 1 January, 1 May, and 1–7 October.
+For lodging reminders, years not in the table fall back to 1 January, 1 May
+and 1–7 October. Callers requiring verified dates can read the table directly.
 """
 
 from __future__ import annotations

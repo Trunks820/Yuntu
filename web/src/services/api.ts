@@ -397,6 +397,64 @@ export async function fetchArtifactBlob(
   return res.blob();
 }
 
+export interface GeoGuessCityResponse {
+  ok: boolean;
+  city: string | null;
+  source?: string;
+}
+
+/**
+ * 按网络位置猜测出发城市（GET /api/geo/guess-city）。
+ * 开源版若无 BFF IP 猜测端点，静默返回 { ok: false, city: null }。
+ */
+export async function guessCity(options?: {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<GeoGuessCityResponse> {
+  if (USE_MOCK) {
+    return { ok: true, city: null, source: "ip" };
+  }
+
+  const timeoutMs = options?.timeoutMs ?? 4000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      controller.abort();
+    } else {
+      options.signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/geo/guess-city`, {
+      method: "GET",
+      credentials: "include",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return { ok: false, city: null };
+    }
+    const data: unknown = await res.json();
+    if (!data || typeof data !== "object") {
+      return { ok: false, city: null };
+    }
+    const raw = data as { ok?: unknown; city?: unknown; source?: unknown };
+    return {
+      ok: raw.ok === true,
+      city: typeof raw.city === "string" ? raw.city : null,
+      source: typeof raw.source === "string" ? raw.source : undefined,
+    };
+  } catch {
+    return { ok: false, city: null };
+  } finally {
+    clearTimeout(timeoutId);
+    options?.signal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+
 /* ---------- Destinations API ---------- */
 
 /**

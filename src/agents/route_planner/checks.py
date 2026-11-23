@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from typing import NamedTuple
+
 from src.agents.composition_blueprint import is_light_food_place
 
 from src.agents.accommodation_policy import day_policy
@@ -15,14 +18,18 @@ from src.agents.preferences import (
 from src.agents.schema import (
     AccommodationPlanningContext,
     CandidatePlace,
+    RoutePlan,
     TripRequest,
 )
 
 from src.config import Settings
 
 from src.agents.route_planner.rules import (
+    LATEST_RETURN_MINUTE,
+    return_limit_minute,
     LUNCH,
     LATE_LUNCH,
+    ALWAYS_WALK_KM,
     WALK_CAP_MINUTES,
     IDLE_LIMIT_MINUTES,
     PlannerRules,
@@ -41,10 +48,52 @@ from src.agents.route_planner.places import (
 )
 
 from src.agents.route_planner.schedule import (
+    _stay,
     _visitor_meal,
     _proper_meal,
 )
+from src.agents.route_planner.scenic import included_scenic_places
 
+
+_OPENING_ISSUE_PREFIX = "开放时间冲突："
+_DAY_PREFIX = re.compile(r"^第\d+天")
+_HARD_DAY_ISSUE = re.compile(
+    r"(?:重复安排了编号 \d+$|「.*」名字带停业字样$"
+    r"|「.*」.*晚于 \d+:\d{2} (?:停止入场|关门)$"
+    r"|餐饮店不当景点：|(?:午饭|晚饭)不是正经吃饭的店$"
+    r"|夜景没写到夜景、亮灯或夜游$|夜景是 \d+:\d{2}，天还没黑$"
+    r"|没有查到路(?:：|$)|步行 \d+ 分钟，超过 \d+ 分钟："
+    r"|没有游览点$|缺少午饭$)"
+)
+_RETURN_ISSUE = re.compile(r"^(?:没排夜景，)?回到住处约 (\d+):(\d{2})，超过 ")
+_REPAIR_PREFIXES = ("用户想看夜景，", "用户喜欢美食，", "用户想去茶馆喝茶，", "亲子出行，")
+
+
+class RouteIssueTiers(NamedTuple):
+    hard: list[str]
+    repair: list[str]
+    record: list[str]
+
+
+def classify_issues(issues: list[str]) -> RouteIssueTiers:
+    """Group the shared check messages without matching words in place names."""
+    tiers = RouteIssueTiers([], [], [])
+    for issue in issues:
+        day_issue = _DAY_PREFIX.sub("", issue, count=1)
+        returned = _RETURN_ISSUE.match(day_issue)
+        if (
+            issue.startswith(("行程天数不对：", _OPENING_ISSUE_PREFIX))
+            or _HARD_DAY_ISSUE.match(day_issue)
+            or (returned and int(returned[1]) * 60 + int(returned[2]) > LATEST_RETURN_MINUTE)
+        ):
+            tiers.hard.append(issue)
+        elif issue.startswith(_REPAIR_PREFIXES) or (
+            issue.startswith("必去点「") and issue.endswith("」没有排上")
+        ):
+            tiers.repair.append(issue)
+        else:
+            tiers.record.append(issue)
+    return tiers
 
 
 def _day_stop_places(day: dict) -> list[CandidatePlace]:
@@ -102,11 +151,7 @@ def urban_commute_notes(
     request: TripRequest | None = None,
     settings: Settings | None = None,
 ) -> list[str]:
-    """City days over the scoring budget, including over the cap, are a note.
-
-    The first check still reports a city day over the cap so the model gets one
-    repair. After that repair the same sentence is the only record.
-    """
+    """Record city days over the scoring budget up to the separate cap."""
     notes = []
     for day in plan.get("days") or []:
         travel = day.get("_travel_minutes")
@@ -115,40 +160,9 @@ def urban_commute_notes(
         kind, _limit = _commute_class(day, rules, lodge, request, settings)
         if kind == "excursion":
             continue
-        if travel > rules.commute_budget:
+        if rules.commute_budget < travel <= rules.urban_commute_cap:
             notes.append(f"第{day.get('day')}天路上约 {travel} 分钟，偏长")
     return notes
-
-
-def _soften_urban_commute_issues(issues: list[str]) -> list[str]:
-    """After the one repair, a city day over the cap is no longer a failure.
-
-    An excursion day over its own limit still says 远郊上限 and stays a failure.
-    """
-    kept = []
-    for issue in issues:
-        if "路上总时间" in issue and "远郊上限" not in issue:
-            continue
-        kept.append(issue)
-    return kept
-
-
-def _issues_after_one_repair(issues: list[str]) -> list[str]:
-    """Problems that still fail the plan after the single repair.
-
-    A city day over the cap, a same-day pair of pot meals, a relaxed day
-    missing its rest, a daytime sight past the relaxed wrap, and a
-    no-night relaxed return past the earlier clock are reported on the
-    first draft. After that repair they are notes.
-    """
-    return [
-        issue
-        for issue in _soften_urban_commute_issues(issues)
-        if "午饭和晚饭都是锅子" not in issue
-        and "没有一段至少 60 分钟的歇" not in issue
-        and "超过白天" not in issue
-        and "没排夜景，回到住处" not in issue
-    ]
 
 
 def missing_preference_notes(rules: PlannerRules) -> list[str]:
@@ -171,23 +185,6 @@ def missing_preference_notes(rules: PlannerRules) -> list[str]:
 
 def pot_pair_note(number, lunch_name: str, dinner_name: str) -> str:
     return f"第{number}天午饭和晚饭都是锅子：{lunch_name}、{dinner_name}"
-
-
-def pot_meal_notes(plan: dict, by_id: dict[int, CandidatePlace] | None = None) -> list[str]:
-    """Same-day lunch and dinner that are both pot meals, after the swap attempt."""
-    notes = []
-    known = by_id or {}
-    for day in plan.get("days") or []:
-        stops = day.get("stops") or []
-        lunch = _resolved_place(_meal_stop(stops, "lunch"), known)
-        dinner = _resolved_place(_meal_stop(stops, "dinner"), known)
-        if is_pot_meal(lunch) and is_pot_meal(dinner):
-            notes.append(pot_pair_note(
-                day.get("day"),
-                _place_name(lunch, "午饭"),
-                _place_name(dinner, "晚饭"),
-            ))
-    return notes
 
 
 def _meal_stop(stops: list[dict], kind: str) -> dict | None:
@@ -219,7 +216,11 @@ def _estimated_leg_count(plan: dict | None) -> int:
     count = 0
     for day in plan.get("days") or []:
         for hop in day.get("_chosen_hops") or []:
-            if isinstance(hop, dict) and hop.get("source") == "estimate":
+            if (
+                isinstance(hop, dict)
+                and hop.get("source") == "estimate"
+                and hop.get("from_id") != hop.get("to_id")
+            ):
                 count += 1
     return count
 
@@ -378,38 +379,85 @@ def day_end_note(number, name: str, end_at: int, limit: int) -> str:
     return f"第{number}天「{name}」约 {_fmt(end_at)} 结束，超过白天 {_fmt(limit)}"
 
 
-def plain_return_note(number, end: int, limit: int) -> str:
-    return f"第{number}天没排夜景，回到住处约 {_fmt(end)}，超过 {_fmt(limit)}"
+def _return_overrun(day: dict, rules: PlannerRules, *, urban: bool) -> tuple[int, str] | None:
+    pace_limit = return_limit_minute(rules, urban=urban, has_night=day_has_night(day.get("stops")))
+    limit = min(pace_limit, LATEST_RETURN_MINUTE)
+    end = day.get("_return_minute")
+    if not isinstance(end, int) or end <= limit:
+        return None
+    prefix = "没排夜景，" if pace_limit < rules.end_minute else ""
+    return end - limit, f"第{day.get('day')}天{prefix}回到住处约 {_fmt(end)}，超过 {_fmt(limit)}"
 
 
-def relaxed_pace_notes(
+def attach_schedule_notice_facts(
+    route: RoutePlan,
     plan: dict,
     rules: PlannerRules,
     by_id: dict[int, CandidatePlace],
-    amap_ids: set[int] | None = None,
     *,
-    lodge: CandidatePlace | None = None,
-    request: TripRequest | None = None,
-    settings: Settings | None = None,
-) -> list[str]:
-    """Soft relaxed leftovers after the one repair. Same channel as pots."""
-    if not (
-        rules.require_day_rest
-        or rules.relaxed_day_end_minute is not None
-        or rules.relaxed_return_plain_minute is not None
-    ):
+    lodge: CandidatePlace | None,
+    request: TripRequest,
+    settings: Settings,
+) -> None:
+    """Keep the chosen schedule's facts for the fixed-sentence channel."""
+    scheduled: set[int] = set()
+    for day, group in zip(plan["days"], route.day_groups):
+        scheduled.update(place.place_id for place in group.places)
+        scheduled.update(
+            place.place_id for stop in day.get("stops") or [] for place in included_scenic_places(stop)
+        )
+        kind, limit = _commute_class(day, rules, lodge, request, settings)
+        travel = day.get("_travel_minutes")
+        group.excursion_commute_over_limit = kind == "excursion" and isinstance(travel, int) and travel > limit
+        returned = day.get("_return_minute")
+        group.return_after_pace_limit = (
+            lodge is not None and group.timeline is not None
+            and isinstance(returned, int) and returned <= LATEST_RETURN_MINUTE
+            and _return_overrun(day, rules, urban=kind != "excursion") is not None
+        )
+    requested_names = {item.place_id: item.name for item in request.must_include}
+    for place_id in rules.must_ids:
+        if place_id in scheduled:
+            continue
+        place = by_id.get(place_id)
+        name = place.name if place is not None else requested_names.get(place_id)
+        if not name:
+            continue
+        closed = place is not None and all(
+            rules.opening_hours.for_place(number, place).closed for number in range(1, rules.days + 1)
+        )
+        if name not in route.missed_must_visits or not closed:
+            route.missed_must_visits[name] = "closed_all_days" if closed else None
+
+
+def _walk_exceeds_cap(move: dict) -> bool:
+    minutes = move.get("minutes")
+    distance = move.get("_straight_km")
+    return (
+        move.get("mode") == "步行"
+        and isinstance(minutes, int)
+        and minutes > WALK_CAP_MINUTES
+        and (distance is None or distance > ALWAYS_WALK_KM)
+    )
+
+
+def _opening_issues(rules: PlannerRules, number, stop: dict, place: CandidatePlace) -> list[str]:
+    limits = rules.opening_hours.for_place(number, place)
+    label = f"{_OPENING_ISSUE_PREFIX}第{number}天「{place.name}」"
+    if limits.closed:
+        return [f"{label}闭馆"]
+    if limits.last_entry is None and limits.closing is None:
         return []
-    notes = []
-    for issue in collect_issues(
-        plan, rules, by_id, amap_ids, lodge=lodge, request=request, settings=settings,
-    ):
-        if (
-            "没有一段至少 60 分钟的歇" in issue
-            or "超过白天" in issue
-            or "没排夜景，回到住处" in issue
-        ):
-            notes.append(issue)
-    return notes
+    at = _clock(stop.get("time"))
+    if at is None:
+        return [f"{label}缺少有效到达时间"]
+    issues = []
+    if limits.last_entry is not None and at > limits.last_entry:
+        issues.append(f"{label}{_fmt(at)} 到达，晚于 {_fmt(limits.last_entry)} 停止入场")
+    leaves = at + _stay(stop)
+    if limits.closing is not None and leaves > limits.closing:
+        issues.append(f"{label}{_fmt(leaves)} 离开，晚于 {_fmt(limits.closing)} 关门")
+    return issues
 
 
 def collect_issues(
@@ -421,8 +469,9 @@ def collect_issues(
     lodge: CandidatePlace | None = None,
     request: TripRequest | None = None,
     settings: Settings | None = None,
+    backup_shortages: list[str] | None = None,
 ) -> list[str]:
-    """Every acceptance check. This does not call a model."""
+    """Check the schedule. Backup records unavailable lunches and empty days as shortages."""
     issues: list[str] = []
     amap_ids = amap_ids or set()
     days = plan.get("days") or []
@@ -451,7 +500,8 @@ def collect_issues(
         has_night = day_has_night(stops)
         lodge_name = _lodge_label(lodge)
         named_gap = False
-        urban = _day_is_urban(day, rules, lodge, request, settings)
+        commute_kind, commute_limit = _commute_class(day, rules, lodge, request, settings)
+        urban = commute_kind != "excursion"
         for index, stop in enumerate(stops):
             if stop.get("kind") == "rest":
                 move = stop.get("move_to_next") or {}
@@ -462,20 +512,23 @@ def collect_issues(
                     mode_text = f" {mode}" if isinstance(mode, str) and mode else ""
                     issues.append(f"第{number}天没有查到路：{origin}→{dest}{mode_text}")
                     named_gap = True
-                elif move.get("mode") == "步行" and isinstance(minutes, int) and minutes > WALK_CAP_MINUTES:
+                elif _walk_exceeds_cap(move):
                     issues.append(f"第{number}天步行 {minutes} 分钟，超过 {WALK_CAP_MINUTES} 分钟：{origin}→{dest}")
                 continue
             place = stop.get("_place")
             if place is None:
                 token = coerce_place_id(stop.get("place_id"))
                 place = by_id.get(token) if isinstance(token, int) else None
-            if place is not None:
-                scheduled.add(place.place_id)
-                if place.place_id in seen:
-                    issues.append(f"第{number}天重复安排了编号 {place.place_id}")
-                seen[place.place_id] = number
-                if _closed(place):
-                    issues.append(f"第{number}天「{place.name}」名字带停业字样")
+            visit_places = (place, *included_scenic_places(stop)) if place is not None else ()
+            for point in visit_places:
+                scheduled.add(point.place_id)
+                if point.place_id in seen:
+                    issues.append(f"第{number}天重复安排了编号 {point.place_id}")
+                seen[point.place_id] = number
+                if _closed(point):
+                    issues.append(f"第{number}天「{point.name}」名字带停业字样")
+                if rules.opening_hours.by_day:
+                    issues.extend(_opening_issues(rules, number, stop, point))
             kind = stop.get("kind")
             if _is_real_sight(stop, place):
                 sights += 1
@@ -513,7 +566,7 @@ def collect_issues(
                 if at is not None and not window[0] <= at <= window[1]:
                     issues.append(f"第{number}天{label}是 {_fmt(at)}，不在饭点")
             if kind == "night":
-                if place is None or not candidate_is_night_place(place):
+                if not any(candidate_is_night_place(point) for point in visit_places):
                     issues.append(f"第{number}天夜景没写到夜景、亮灯或夜游")
                 else:
                     night_ok = True
@@ -540,7 +593,7 @@ def collect_issues(
                             end_at,
                             rules.relaxed_day_end_minute,
                         ))
-            if place is not None and candidate_is_family_place(place) and kind in {"sight", "night"}:
+            if kind in {"sight", "night"} and any(candidate_is_family_place(point) for point in visit_places):
                 family_ok = True
             if place is not None and candidate_is_tea_place(place) and kind not in {"lunch", "dinner"}:
                 tea_ok = True
@@ -556,7 +609,7 @@ def collect_issues(
                 mode_text = f" {mode}" if isinstance(mode, str) and mode else ""
                 issues.append(f"第{number}天没有查到路：{origin}→{dest}{mode_text}")
                 named_gap = True
-            elif move.get("mode") == "步行" and isinstance(minutes, int) and minutes > WALK_CAP_MINUTES:
+            elif _walk_exceeds_cap(move):
                 issues.append(f"第{number}天步行 {minutes} 分钟，超过 {WALK_CAP_MINUTES} 分钟：{origin}→{dest}")
         if dinner_at is not None:
             for stop in stops[dinner_at + 1 :]:
@@ -564,7 +617,8 @@ def collect_issues(
                     issues.append(f"第{number}天晚饭后只排夜景")
                     break
         if sights == 0:
-            issues.append(f"第{number}天没有游览点")
+            target = backup_shortages if backup_shortages is not None and not stops else issues
+            target.append(f"第{number}天没有游览点")
         if len(snacks) > 1:
             issues.append(f"第{number}天有 {len(snacks)} 个小吃或补充能量点（{'、'.join(snacks)}），最多 1 个")
         if rules.day_sight_limit is not None:
@@ -582,27 +636,14 @@ def collect_issues(
         if rules.require_day_rest and urban and not day_has_qualifying_rest(stops, rules):
             issues.append(rest_gap_note(number))
         travel = day.get("_travel_minutes")
-        if isinstance(travel, int):
-            kind, limit = _commute_class(day, rules, lodge, request, settings)
+        if isinstance(travel, int) and travel > commute_limit:
             detail = _longest_leg_clause(day, lodge)
             suffix = f"；{detail}" if detail else ""
-            if kind == "excursion" and travel > limit:
-                issues.append(f"第{number}天路上总时间 {travel} 分钟，超过远郊上限 {limit} 分钟{suffix}")
-            elif kind != "excursion" and travel > rules.urban_commute_cap:
-                issues.append(f"第{number}天路上总时间 {travel} 分钟，超过 {rules.urban_commute_cap} 分钟{suffix}")
-        end = day.get("_return_minute")
-        if isinstance(end, int) and end > rules.end_minute:
-            issues.append(f"第{number}天回到住处约 {_fmt(end)}，超过 {_fmt(rules.end_minute)}")
-        plain = rules.relaxed_return_plain_minute
-        if (
-            urban
-            and not has_night
-            and isinstance(end, int)
-            and plain is not None
-            and plain < rules.end_minute
-            and end > plain
-        ):
-            issues.append(plain_return_note(number, end, plain))
+            limit_label = "远郊上限 " if commute_kind == "excursion" else " "
+            issues.append(f"第{number}天路上总时间 {travel} 分钟，超过{limit_label}{commute_limit} 分钟{suffix}")
+        overrun = _return_overrun(day, rules, urban=urban)
+        if overrun is not None:
+            issues.append(overrun[1])
         depart = day.get("_depart_move") or {}
         depart_minutes = depart.get("minutes")
         depart_missing = depart_minutes is None and bool(depart)
@@ -613,14 +654,15 @@ def collect_issues(
             mode = depart.get("mode")
             mode_text = f" {mode}" if isinstance(mode, str) and mode else ""
             issues.append(f"第{number}天没有查到路：{lodge_name}→{first_name}{mode_text}")
-        elif depart.get("mode") == "步行" and isinstance(depart_minutes, int) and depart_minutes > WALK_CAP_MINUTES:
+        elif _walk_exceeds_cap(depart):
             issues.append(
                 f"第{number}天步行 {depart_minutes} 分钟，超过 {WALK_CAP_MINUTES} 分钟：{lodge_name}→{first_name}"
             )
         has_lunch = any(stop.get("kind") == "lunch" for stop in stops)
         has_dinner = any(stop.get("kind") == "dinner" for stop in stops)
         if not has_lunch:
-            issues.append(f"第{number}天缺少午饭")
+            target = backup_shortages if backup_shortages is not None else issues
+            target.append(f"第{number}天缺少午饭")
         if rules.dinner and not has_dinner:
             issues.append(f"第{number}天缺少晚饭")
         lunch_place = _resolved_place(_meal_stop(stops, "lunch"), by_id)

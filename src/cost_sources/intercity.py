@@ -15,7 +15,13 @@ from src.agents.intercity_transport_resolver import (
     resolve_transport,
 )
 from src.agents.intercity_transport_static import STATIC_TRANSPORT_VERSION
-from src.agents.schema import TransportModeSummary, TransportSuggestion, TripRequest
+from src.agents.schema import (
+    FLIGHT_FARE_PENDING,
+    TrainClass,
+    TransportModeSummary,
+    TransportSuggestion,
+    TripRequest,
+)
 from src.cost_reference.models import FrozenModel, MoneyRangeFen
 
 from .common import aware_datetime, cny_range, utc_now
@@ -38,6 +44,7 @@ class IntercityLegInput(FrozenModel):
     to_city: str = Field(min_length=1)
     query_date: date | None
     mode: IntercityMode
+    train_class: TrainClass | None = None
     adapter_status: AdapterStatus
     observation: SourceObservation | None = None
     reason: str = ""
@@ -73,6 +80,7 @@ class IntercitySourceBundle(FrozenModel):
     status: Literal[
         "available",
         "missing_from_city",
+        "no_direct_service",
         "malformed",
         "unavailable",
     ]
@@ -117,8 +125,20 @@ def _leg_from_mode(
             to_city=suggestion.to_city,
             query_date=source_query_date,
             mode=mode.mode,
+            train_class=mode.train_class,
             adapter_status="malformed",
             reason="intercity source query date does not match requested date",
+        )
+    fare_pending = mode.mode == "flight" and mode.price_range == FLIGHT_FARE_PENDING
+    if fare_pending:
+        return _missing_leg(
+            direction=direction,
+            from_city=suggestion.from_city,
+            to_city=suggestion.to_city,
+            query_date=query_date,
+            mode="flight",
+            status="unavailable",
+            reason=FLIGHT_FARE_PENDING,
         )
     price_range = _price_range(mode.price_range)
     if price_range is None:
@@ -128,12 +148,16 @@ def _leg_from_mode(
             to_city=suggestion.to_city,
             query_date=query_date,
             mode=mode.mode,
+            train_class=mode.train_class,
             adapter_status="malformed",
             reason="intercity price range is missing or malformed",
         )
+    fare_date = source_query_date
+    if mode.mode == "train" and mode.price_source == "realtime" and mode.reference_date:
+        fare_date = mode.reference_date
     identity = (
         f"route:{suggestion.from_city}->{suggestion.to_city}:"
-        f"{source_query_date.isoformat() if source_query_date else 'no-date'}:"
+        f"{fare_date.isoformat() if fare_date else 'no-date'}:"
         f"{mode.mode}"
     )
     if mode.price_source == "realtime":
@@ -174,6 +198,7 @@ def _leg_from_mode(
         to_city=suggestion.to_city,
         query_date=query_date,
         mode=mode.mode,
+        train_class=mode.train_class,
         adapter_status="success",
         observation=observation,
     )
@@ -285,8 +310,7 @@ async def observe_intercity_sources(
 ) -> IntercitySourceBundle:
     """Query opposite directions and expose outbound-mode-only round trips.
 
-    A return-only mode never creates a scenario and a return mode is matched by
-    equality, so train/flight facts cannot be mixed.
+    Return fares must match the outbound mode and rail class.
     """
 
     captured = captured_at or utc_now()
@@ -352,38 +376,54 @@ async def observe_intercity_sources(
     )
     outbound_status, outbound_suggestion, _ = outbound_result
     return_status, return_suggestion, return_reason = return_result
-    if outbound_suggestion is None:
+    if outbound_suggestion is None or outbound_suggestion.direct_service_absent:
+        status = "unavailable"
+        if outbound_suggestion is not None:
+            status = "no_direct_service"
+        elif outbound_status == "malformed":
+            status = "malformed"
         return IntercitySourceBundle(
             from_city=from_city,
             to_city=to_city,
             outbound_date=outbound_date,
             return_date=return_date,
-            status=(
-                "malformed"
-                if outbound_status == "malformed"
-                else "unavailable"
-            ),
+            status=status,
         )
 
     return_modes = {
-        mode.mode: mode
+        (mode.mode, mode.train_class == "ordinary"): mode
         for mode in (return_suggestion.modes if return_suggestion is not None else [])
     }
-    round_trips: list[IntercityRoundTripInput] = []
-    for outbound_mode in outbound_suggestion.modes:
-        outbound_leg = _leg_from_mode(
+    return_direction_matches = (
+        return_suggestion is not None
+        and return_suggestion.from_city == outbound_suggestion.to_city
+        and return_suggestion.to_city == outbound_suggestion.from_city
+    )
+    outbound_legs = [
+        _leg_from_mode(
             direction="outbound",
             suggestion=outbound_suggestion,
             mode=outbound_mode,
             query_date=outbound_date,
             captured_at=captured,
-        )
-        return_mode = return_modes.get(outbound_mode.mode)
-        return_direction_matches = (
-            return_suggestion is not None
-            and return_suggestion.from_city == outbound_suggestion.to_city
-            and return_suggestion.to_city == outbound_suggestion.from_city
-        )
+        ) for outbound_mode in outbound_suggestion.modes
+    ]
+    if outbound_suggestion.flight_fare_pending:
+        outbound_legs.append(_missing_leg(
+            direction="outbound",
+            from_city=from_city,
+            to_city=to_city,
+            query_date=outbound_date,
+            mode="flight",
+            status="unavailable",
+            reason=FLIGHT_FARE_PENDING,
+        ))
+
+    round_trips: list[IntercityRoundTripInput] = []
+    for outbound_leg in outbound_legs:
+        return_mode = return_modes.get((
+            outbound_leg.mode, outbound_leg.train_class == "ordinary",
+        ))
         if return_direction_matches and return_mode is not None:
             return_leg = _leg_from_mode(
                 direction="return",
@@ -398,14 +438,12 @@ async def observe_intercity_sources(
                 from_city=to_city,
                 to_city=from_city,
                 query_date=return_date,
-                mode=outbound_mode.mode,
+                mode=outbound_leg.mode,
                 status=(
-                    return_status
-                    if return_direction_matches or return_suggestion is None
-                    else "malformed"
+                    "unavailable" if return_direction_matches else return_status
                 ),
                 reason=(
-                    return_reason
+                    (FLIGHT_FARE_PENDING if outbound_leg.mode == "flight" else return_reason)
                     or (
                         "same-mode return source is unavailable"
                         if return_direction_matches or return_suggestion is None
@@ -414,7 +452,7 @@ async def observe_intercity_sources(
                 ),
             )
         round_trips.append(IntercityRoundTripInput(
-            mode=outbound_mode.mode,
+            mode=outbound_leg.mode,
             outbound=outbound_leg,
             return_leg=return_leg,
         ))

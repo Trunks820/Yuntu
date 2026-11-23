@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
 import { TransportCard } from "@/components/detail/TransportCard";
 import type { TripTransport } from "@/types/trip";
@@ -152,5 +152,71 @@ describe("TransportCard Component Tests (Equal Weight Spec §2.2)", () => {
     expect(
       screen.getByText("查询时段车票已售罄，请以购票平台实时余票为准"),
     ).toBeInTheDocument();
+  });
+
+  it("使用 lucide 线描图标，不再渲染 🚄 或 ✈️ 表情符号", () => {
+    const mockTransport: TripTransport = {
+      from_city: "北京",
+      to_city: "广州",
+      query_date: "2026-08-20",
+      source: "realtime",
+      modes: [
+        {
+          mode: "train",
+          min_duration_minutes: 480,
+          price_range: "¥862",
+          price_source: "realtime",
+          daily_count: 12,
+          data_source: "realtime",
+          availability_status: "available_at_query",
+          availability_checked_at: null,
+          options: [
+            {
+              type: "train",
+              no: "G79",
+              departure_time: "10:00",
+              arrival_time: "18:00",
+              duration_minutes: 480,
+              price: "¥862",
+              departure_station: "北京西",
+              arrival_station: "广州南",
+              airline: null,
+            },
+          ],
+        },
+        {
+          mode: "flight",
+          min_duration_minutes: 190,
+          price_range: "¥1200",
+          price_source: "realtime",
+          daily_count: 30,
+          data_source: "realtime",
+          availability_status: "available_at_query",
+          availability_checked_at: null,
+          options: [
+            {
+              type: "flight",
+              no: "CA1301",
+              departure_time: "08:30",
+              arrival_time: "11:40",
+              duration_minutes: 190,
+              price: "¥1200",
+              departure_station: "首都机场",
+              arrival_station: "白云机场",
+              airline: "国航",
+            },
+          ],
+        },
+      ],
+    };
+
+    const { container } = render(<TransportCard data={mockTransport} />);
+    fireEvent.click(screen.getByRole("button", { name: /车次参考/ }));
+    fireEvent.click(screen.getByRole("button", { name: /航班参考/ }));
+
+    expect(container.textContent).not.toContain("🚄");
+    expect(container.textContent).not.toContain("✈");
+    expect(container.querySelectorAll("svg.lucide-train-front").length).toBeGreaterThanOrEqual(3);
+    expect(container.querySelectorAll("svg.lucide-plane").length).toBeGreaterThanOrEqual(3);
   });
 });

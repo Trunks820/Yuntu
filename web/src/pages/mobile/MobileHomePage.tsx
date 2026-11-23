@@ -1,13 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMobileTripStore } from "@/stores/mobileTripStore";
-import { CONCEPT_ASSETS, HOME_HERO_IMAGE } from "@/assets/mobile-concepts/conceptImages";
 import { MobileTopBar } from "@/components/mobile/MobileTopBar";
 import { Icon, MobileSheet } from "@/components/mobile/mobileUi";
 import { MobileLiveCityPicker } from "@/components/mobile/MobileCitySheet";
 import type { Destination } from "@/types/destination";
 import { useTripTaskStore, type StoredTripTask } from "@/stores/tripTaskStore";
 import { mobileHomeCardTarget, selectMobileHomeCard } from "@/utils/mobileHomeCard";
+import { scenePhotoByPhotoId, sceneSrcSet } from "@/utils/scenePhotoLookup";
 import "@/styles/mobile.css";
 
 /** 原型 .resume 卡片在生成中 / 已成形时的文案；失败态原型没有，按同一语气补齐 */
@@ -17,28 +17,40 @@ const TASK_CARD_COPY = {
   failed: { title: "这次没能成册", hint: "看看原因，再试一次" },
 } as const;
 
-/** 首页轮播：01 为原型原文；02、03 对应草稿流程里的「节奏」「同行」两步，配图为同组氛围图 */
+/**
+ * 首页轮播：01 为原型原文；02、03 对应草稿流程里的「节奏」「同行」两步。
+ * 配图用 R2 已登记的场景大图（开源版无 CDN 时自动回退到打包图）。
+ */
+const HERO_PHOTOS = {
+  heart: scenePhotoByPhotoId("Y-HwuSKt6gM"),
+  pace: scenePhotoByPhotoId("BdoKOXaKv48"),
+  company: scenePhotoByPhotoId("lny58iNNdHc"),
+};
+
 const HERO_SLIDES = [
   {
     label: "01 / 心动",
-    image: HOME_HERO_IMAGE,
-    alt: "旅行场景概念配图",
+    photo: HERO_PHOTOS.heart,
+    position: "50% 60%",
+    alt: "凤凰古城江边的吊脚楼",
     eyebrow: "A TRIP THAT FEELS LIKE YOU",
     title: ["下一段旅程，", "先找到心动。"],
     desc: ["不必想好所有答案。", "挑几个喜欢的画面，旅程就有了开头。"],
   },
   {
     label: "02 / 节奏",
-    image: CONCEPT_ASSETS.coast,
-    alt: "旅行节奏概念配图",
+    photo: HERO_PHOTOS.pace,
+    position: "40% 50%",
+    alt: "安静的石板小巷",
     eyebrow: "AT YOUR OWN PACE",
     title: ["走快走慢，", "都随你的步子。"],
     desc: ["想早起追日出，还是睡到自然醒？", "每天排多满，由你来定。"],
   },
   {
     label: "03 / 同行",
-    image: CONCEPT_ASSETS.food,
-    alt: "同行旅伴概念配图",
+    photo: HERO_PHOTOS.company,
+    position: "50% 55%",
+    alt: "树下茶馆里围坐的人们",
     eyebrow: "WHO YOU GO WITH",
     title: ["和谁同行，", "旅程就有了样子。"],
     desc: ["一个人自在，一家人热闹。", "说说这次和谁去，安排会更合你们。"],
@@ -142,7 +154,10 @@ export const MobileHomePage: React.FC = () => {
               {HERO_SLIDES.map((s, i) => (
                 <img
                   key={s.label}
-                  src={s.image}
+                  src={s.photo.mobileUrl}
+                  srcSet={sceneSrcSet(s.photo)}
+                  sizes="(max-width: 480px) 100vw, 480px"
+                  style={{ objectPosition: s.position }}
                   alt={i === slideIndex ? s.alt : ""}
                   aria-hidden={i !== slideIndex}
                   className={`hero-slide${i === slideIndex ? " is-active" : ""}`}

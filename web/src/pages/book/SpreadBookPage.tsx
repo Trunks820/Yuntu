@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Link,
   useNavigate,
@@ -27,9 +34,12 @@ import {
   type ResultOpenError,
 } from "@/utils/planLinkError";
 import {
+  DEFAULT_BOOK_STRIP_FOLDED_HEIGHT,
+  DEFAULT_BOOK_STRIP_HEIGHT,
   filterUnscheduledMustInclude,
   findCommuteLeg,
   getDayWeather,
+  isBookReadingPage,
   isReducedMotionPreferred,
   resolveBookCardCopy,
   resolveBookMapWeatherVisual,
@@ -112,6 +122,12 @@ function SpreadBookContent({
   const [activeSidePage, setActiveSidePage] = useState<BookSidePageId | null>(
     null,
   );
+  const [stripFolded, setStripFolded] = useState(false);
+  const [layoutMetrics, setLayoutMetrics] = useState({
+    stripHeight: 0,
+    headerHeight: 0,
+    sideWidth: 0,
+  });
   const [readingPlaceId, setReadingPlaceId] = useState<number | null>(null);
   const [guideAnchorPlaceId, setGuideAnchorPlaceId] = useState<number | null>(
     null,
@@ -154,6 +170,8 @@ function SpreadBookContent({
 
   const atlasRef = useRef<HTMLElement>(null);
   const mountedRef = useRef(true);
+  const stripFoldedRef = useRef(stripFolded);
+  stripFoldedRef.current = stripFolded;
   const attemptedPlaceIdsRef = useRef<Set<number>>(new Set());
   const detailCacheRef = useRef<Map<number, PlaceDetail>>(new Map());
   const inFlightRetryRef = useRef<Set<number>>(new Set());
@@ -280,6 +298,93 @@ function SpreadBookContent({
   );
 
   const isGuideOpen = activeSidePage === "guide";
+  const isReadingMode = isBookReadingPage(activeSidePage);
+
+  // 测量长卷与右栏的实际尺寸：同步 --bk-fold / --bk-strip-vis / --bk-strip-clear 给样式，并传给地图避让
+  useLayoutEffect(() => {
+    const atlas = atlasRef.current;
+    if (!atlas || !result || !plan) return;
+
+    const syncLayoutMetrics = () => {
+      const stripEl = atlas.querySelector<HTMLElement>(".bk-day");
+      const headerEl = stripEl?.querySelector<HTMLElement>(".bk-dh") ?? null;
+      const sideEl = atlas.querySelector<HTMLElement>(".bk-side");
+
+      const rawStripH = stripEl ? Math.round(stripEl.offsetHeight) : 0;
+      const rawHeaderH = headerEl ? Math.round(headerEl.offsetHeight) : 0;
+      const rawSideW = sideEl ? Math.round(sideEl.offsetWidth) : 0;
+
+      const foldPx =
+        stripFolded && rawStripH > 0 && rawHeaderH > 0
+          ? Math.max(0, rawStripH - rawHeaderH + 16)
+          : 0;
+      if (stripEl) {
+        stripEl.style.setProperty("--bk-fold", `${foldPx}px`);
+      }
+
+      const visibleStripH = isReadingMode
+        ? 0
+        : stripFolded
+          ? rawHeaderH > 0
+            ? rawHeaderH
+            : DEFAULT_BOOK_STRIP_FOLDED_HEIGHT
+          : rawStripH > 0
+            ? rawStripH
+            : DEFAULT_BOOK_STRIP_HEIGHT;
+
+      const stripClearPx = isReadingMode
+        ? 0
+        : stripFolded
+          ? visibleStripH
+          : visibleStripH + 16;
+
+      atlas.style.setProperty("--bk-strip-vis", `${visibleStripH}px`);
+      atlas.style.setProperty("--bk-strip-clear", `${stripClearPx}px`);
+
+      setLayoutMetrics((prev) =>
+        prev.stripHeight === rawStripH &&
+        prev.headerHeight === rawHeaderH &&
+        prev.sideWidth === rawSideW
+          ? prev
+          : {
+              stripHeight: rawStripH,
+              headerHeight: rawHeaderH,
+              sideWidth: rawSideW,
+            },
+      );
+    };
+
+    syncLayoutMetrics();
+    window.addEventListener("resize", syncLayoutMetrics);
+
+    if (typeof ResizeObserver === "undefined") {
+      return () => {
+        window.removeEventListener("resize", syncLayoutMetrics);
+      };
+    }
+
+    const ro = new ResizeObserver(syncLayoutMetrics);
+    ro.observe(atlas);
+    const stripEl = atlas.querySelector<HTMLElement>(".bk-day");
+    const headerEl = stripEl?.querySelector<HTMLElement>(".bk-dh");
+    const sideEl = atlas.querySelector<HTMLElement>(".bk-side");
+    if (stripEl) ro.observe(stripEl);
+    if (headerEl) ro.observe(headerEl);
+    if (sideEl) ro.observe(sideEl);
+
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", syncLayoutMetrics);
+    };
+  }, [
+    result,
+    plan,
+    currentDay?.day,
+    isReadingMode,
+    stripFolded,
+    activeSidePage,
+    selectedPlaceId,
+  ]);
 
   useEffect(() => {
     clearSunTimers();
@@ -426,9 +531,14 @@ function SpreadBookContent({
   const handleSelectDay = useCallback((dayNum: number) => {
     setSelectedDayNum(dayNum);
     setSelectedPlaceId(null);
+    setStripFolded(false);
     setActiveSidePage((prev) =>
       shouldKeepSidePageOnDaySwitch(prev) ? prev : null,
     );
+  }, []);
+
+  const handleToggleStripFold = useCallback(() => {
+    setStripFolded((prev) => !prev);
   }, []);
 
   const handleSelectPlace = useCallback(
@@ -452,13 +562,15 @@ function SpreadBookContent({
 
       setActiveSidePage(null);
       setSelectedPlaceId(placeId);
-      const cardEl = cardRefs.current.get(placeId);
-      if (cardEl && typeof cardEl.scrollIntoView === "function") {
-        cardEl.scrollIntoView({
-          inline: "nearest",
-          block: "nearest",
-          behavior: isReducedMotionPreferred() ? "auto" : "smooth",
-        });
+      if (!stripFoldedRef.current) {
+        const cardEl = cardRefs.current.get(placeId);
+        if (cardEl && typeof cardEl.scrollIntoView === "function") {
+          cardEl.scrollIntoView({
+            inline: "nearest",
+            block: "nearest",
+            behavior: isReducedMotionPreferred() ? "auto" : "smooth",
+          });
+        }
       }
     },
     [activeSidePage, plan],
@@ -495,7 +607,7 @@ function SpreadBookContent({
   );
 
   const handleReadingStopChange = useCallback(
-    (placeId: number, dayNum: number) => {
+    (placeId: number | null, dayNum: number) => {
       setReadingPlaceId(placeId);
       setSelectedDayNum((prev) => (prev === dayNum ? prev : dayNum));
     },
@@ -693,6 +805,19 @@ function SpreadBookContent({
       ? findCommuteLeg(currentDay, selectedPlace.place_id, nextPlace.place_id)
       : undefined;
   const hasSidePanel = Boolean(selectedPlace || activeSidePage);
+  const hasStopPanel = !isReadingMode && Boolean(selectedPlace);
+  const measuredStripVisibleHeight = isReadingMode
+    ? 0
+    : stripFolded
+      ? layoutMetrics.headerHeight
+      : layoutMetrics.stripHeight;
+  const atlasClassName = [
+    "bk-atlas",
+    isReadingMode ? "is-reading" : "",
+    hasStopPanel ? "has-stop" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   const mapSelectedPlaceId = isGuideOpen
     ? readingPlaceId
     : (selectedPlace?.place_id ?? null);
@@ -700,6 +825,7 @@ function SpreadBookContent({
     ? '.bk-rtab[aria-pressed="true"] .bk-wx-icon'
     : '.bk-dtab[aria-pressed="true"] .bk-wx-icon';
   const showSunDrop = Boolean(
+    (!isReadingMode || isGuideOpen) &&
     currentDay &&
     currentWeatherDay &&
     currentWeatherVisual.kind === "sun" &&
@@ -709,16 +835,15 @@ function SpreadBookContent({
       collectingSunDay === currentDay.day),
   );
   const showSunBubble = Boolean(
-    currentDay && sunBubble && sunBubble.day === currentDay.day,
+    (!isReadingMode || isGuideOpen) &&
+    currentDay &&
+    sunBubble &&
+    sunBubble.day === currentDay.day,
   );
 
   return (
     <>
-      <main
-        ref={atlasRef}
-        className={isGuideOpen ? "bk-atlas is-reading" : "bk-atlas"}
-        aria-label="旅行册"
-      >
+      <main ref={atlasRef} className={atlasClassName} aria-label="旅行册">
         {currentDay && (
           <BookMap
             day={currentDay}
@@ -727,7 +852,10 @@ function SpreadBookContent({
             selectedPlaceId={mapSelectedPlaceId}
             selectedStay={activeSidePage === "stay"}
             hasSidePanel={hasSidePanel}
-            isReading={isGuideOpen}
+            isReading={isReadingMode}
+            stripVisibleHeight={measuredStripVisibleHeight}
+            stripFolded={stripFolded}
+            sideWidth={layoutMetrics.sideWidth}
             onSelectPlace={handleSelectPlace}
             onSelectStay={handleToggleStay}
             onCameraSettling={handleCameraSettling}
@@ -744,7 +872,7 @@ function SpreadBookContent({
               weatherDay={currentWeatherDay}
               stageWidth={settledCameraSnapshot.stageWidth}
               stageHeight={settledCameraSnapshot.stageHeight}
-              isReading={isGuideOpen}
+              isReading={isReadingMode}
               avoidPoints={settledCameraSnapshot.avoidPoints}
               collecting={collectingSunDay === currentDay.day}
               targetIconSelector={activeTabIconSelector}
@@ -841,7 +969,8 @@ function SpreadBookContent({
             days={plan.days}
             currentDay={currentDay}
             selectedPlaceId={selectedPlace?.place_id ?? null}
-            collapsed={isGuideOpen}
+            collapsed={isReadingMode}
+            folded={stripFolded}
             weather={result.weather}
             flashingWeatherDay={flashingWxDay}
             placeDetails={placeDetails}
@@ -849,6 +978,7 @@ function SpreadBookContent({
             onImageError={handleImageError}
             onSelectDay={handleSelectDay}
             onSelectPlace={handleSelectPlace}
+            onToggleFold={handleToggleStripFold}
             registerCardRef={registerCardRef}
           />
         )}

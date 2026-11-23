@@ -599,17 +599,6 @@ export default function PlanDetailPage() {
           onPdf={() => pdf.start()}
           onShare={() => setShareOpen(true)}
           onBack={() => navigate(searchParams.get("from") === "history" ? "/history" : "/")}
-          onOpenPlace={openPlace}
-        />
-        <PlaceDetailModal
-          place={detailPlace}
-          isMustInclude={Boolean(
-            detailPlace &&
-              result.must_include?.some(
-                (mi) => mi.status === "scheduled" && mi.place_id != null && mi.place_id === detailPlace.place_id,
-              ),
-          )}
-          onClose={() => setDetailPlace(null)}
         />
         {resultId && (
           <ShareDialog

@@ -311,6 +311,9 @@ export interface MobileMustIncludePlace {
 /** 生成请求 must_include 上限，与 BFF poi-catalog/selection 一致 */
 export const MOBILE_MUST_INCLUDE_LIMIT = 5;
 
+/** 出发城市最大长度，与 PC 端 SPREAD_START_FROM_CITY_MAX 保持一致 */
+export const MOBILE_FROM_CITY_MAX = 60;
+
 export interface MobileTripDraft {
   version: 1;
   revision: number;
@@ -326,6 +329,9 @@ export interface MobileTripDraft {
   cityId: string | null;
   cityName: string | null;
   cityConfirmed: boolean;
+  fromCity: string;
+  fromCityTouched?: boolean;
+  fromCitySource?: "history" | "storage" | "geo" | null;
   days: number | null; // 1-7 或 null
   dateMode: "undecided" | "exact";
   startDate: string | null; // "YYYY-MM-DD"

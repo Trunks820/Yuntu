@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, model_serializer, model_validator
 
 from src.cost_estimate.models import (
     CATEGORY_ORDER,
@@ -53,6 +53,17 @@ class CostCategorySummary(FrozenModel):
     range: PublicMoneyRangeCny | None = None
     price_basis: AggregatePriceBasis | None = None
     basis_label: str = Field(min_length=1)
+    known_range: PublicMoneyRangeCny | None = None
+    priced_item_count: int | None = Field(default=None, strict=True, ge=0)
+    unpriced_item_count: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_admission_fields(self, handler):
+        payload = handler(self)
+        for field in ("known_range", "priced_item_count", "unpriced_item_count"):
+            if payload.get(field) is None:
+                payload.pop(field, None)
+        return payload
 
     @model_validator(mode="after")
     def validate_coverage(self) -> "CostCategorySummary":
@@ -72,6 +83,16 @@ class CostScenarioSummary(FrozenModel):
     total_range: PublicMoneyRangeCny | None = None
     categories: tuple[CostCategorySummary, ...]
     missing_categories: tuple[CostCategory, ...] = ()
+    total_range_with_known_admission: PublicMoneyRangeCny | None = None
+    unpriced_admission_count: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_admission_fields(self, handler):
+        payload = handler(self)
+        for field in ("total_range_with_known_admission", "unpriced_admission_count"):
+            if payload.get(field) is None:
+                payload.pop(field, None)
+        return payload
 
     @model_validator(mode="after")
     def validate_scenario(self) -> "CostScenarioSummary":
@@ -223,6 +244,13 @@ def project_cost_estimate_summary(
                 ),
                 price_basis=category.price_basis,
                 basis_label=category.basis_label,
+                known_range=(
+                    _public_range(category.known_range_fen)
+                    if category.known_range_fen is not None
+                    else None
+                ),
+                priced_item_count=category.priced_item_count,
+                unpriced_item_count=category.unpriced_item_count,
             )
             for category in scenario.categories
         )
@@ -238,6 +266,12 @@ def project_cost_estimate_summary(
             ),
             categories=categories,
             missing_categories=scenario.missing_categories,
+            total_range_with_known_admission=(
+                _public_range(scenario.total_range_with_known_admission_fen)
+                if scenario.total_range_with_known_admission_fen is not None
+                else None
+            ),
+            unpriced_admission_count=scenario.unpriced_admission_count,
         ))
 
     try:

@@ -25,15 +25,13 @@ function formatApproxRange(
   return null;
 }
 
-function formatGroupLine(group: LodgingDisplayGroup): string {
-  const hotels = (group.hotels ?? []).join("、");
-  const price = hasNightlyPrice(group)
-    ? formatApproxRange(group.nightly_low_cny, group.nightly_high_cny, "元/晚")
-    : null;
-  if (price && hotels) return `${group.label}  ${price} · ${hotels}`;
-  if (price) return `${group.label}  ${price}`;
-  if (hotels) return `${group.label}  ${hotels}`;
-  return group.label;
+function formatGroupPrice(group: LodgingDisplayGroup): string | null {
+  if (!hasNightlyPrice(group)) return null;
+  return formatApproxRange(
+    group.nightly_low_cny,
+    group.nightly_high_cny,
+    "元/晚",
+  );
 }
 
 function formatUserLodgingText(display: LodgingDisplay): string {
@@ -93,10 +91,10 @@ export function MobileLodgingRow({
   const holiday = notices.filter((n) => n.kind === "holiday");
   const caption = display.caption ?? "";
   const hasGroups = groups.length > 0;
+  const hasAnyPrice = hasGroups && groups.some(hasNightlyPrice);
   const detailsVisible = !hasGroups || expanded;
   const hasDetailBody = Boolean(caption) || hasGroups || holiday.length > 0;
-  const showPriceNote =
-    detailsVisible && hasGroups && groups.some(hasNightlyPrice);
+  const showPriceNote = detailsVisible && hasAnyPrice;
 
   return (
     <>
@@ -124,14 +122,25 @@ export function MobileLodgingRow({
         </span>
       </div>
       {detailsVisible && hasDetailBody && (
-        <div className="lodging-detail">
+        <div className={hasGroups ? "lodging-detail lodging-rows" : "lodging-detail"}>
           {caption ? <div className="lodging-caption">{caption}</div> : null}
           {hasGroups
-            ? groups.map((group, i) => (
-                <div className="lodging-group" key={`${group.kind}-${i}`}>
-                  {formatGroupLine(group)}
-                </div>
-              ))
+            ? groups.map((group, i) => {
+                const price = formatGroupPrice(group);
+                const hotelsText = (group.hotels ?? []).join("、");
+                return (
+                  <div
+                    className={`lodging-row${hasAnyPrice ? "" : " is-unpriced"}`}
+                    key={`${group.kind}-${i}`}
+                  >
+                    <b>{group.label}</b>
+                    {hasAnyPrice ? (
+                      <span className="p">{price ?? ""}</span>
+                    ) : null}
+                    <span className="h">{hotelsText}</span>
+                  </div>
+                );
+              })
             : null}
           {holiday.map((n, i) => (
             <div className="lodging-holiday" key={`holiday-${i}`}>

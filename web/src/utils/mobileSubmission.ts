@@ -2,6 +2,7 @@ import type { MobileSubmission } from "@/types/mobile";
 import type { TripSubmitRequest } from "@/types/tripRequest";
 import { generateFingerprint } from "./pendingSubmission";
 import { isValidCalendarDate } from "./mobileDraft";
+import { saveLastFromCity } from "./fromCityPrefill";
 
 export { generateFingerprint };
 
@@ -177,6 +178,9 @@ export function clearMobileSubmission(owner?: string): void {
 export function markSubmissionConfirmed(jobId: string, owner?: string): void {
   const current = getMobileSubmission(owner);
   if (current) {
+    if (current.status !== "integrity_error") {
+      saveLastFromCity(current.trip_request.from_city);
+    }
     current.status = "confirmed";
     current.job_id = jobId;
     memorySubmissions.set(current.owner, current);

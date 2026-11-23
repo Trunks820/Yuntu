@@ -25,9 +25,10 @@ export type CostAssumptionCode =
   | "itinerary_days_minus_one_nights"
   | "four_travellers_per_taxi"
   | "adult_full_fare"
-  | "two_main_meals_per_day";
+  | "two_main_meals_per_day"
+  | (string & {});
 
-export type CostExclusionCode = "cycling_cost_not_included";
+export type CostExclusionCode = "cycling_cost_not_included" | (string & {});
 
 export interface CostMoneyRange {
   min_cny: number;
@@ -48,6 +49,12 @@ export interface CostCategorySummary {
   range: CostMoneyRange | null;
   price_basis: CostPriceBasis;
   basis_label: string;
+  /** 门票部分已知时，已知部分的费用区间（老结果缺省） */
+  known_range?: CostMoneyRange | null;
+  /** 门票部分已知时，已查到价格的景点数（老结果缺省） */
+  priced_item_count?: number | null;
+  /** 门票部分已知时，未查到价格的景点数（老结果缺省） */
+  unpriced_item_count?: number | null;
 }
 
 export interface CostScenarioSummary {
@@ -56,6 +63,10 @@ export interface CostScenarioSummary {
   label: string;
   total_scope: CostScope;
   total_range: CostMoneyRange | null;
+  /** 门票部分已知时，含已知门票的总价区间（老结果缺省） */
+  total_range_with_known_admission?: CostMoneyRange | null;
+  /** 门票部分已知时，未计入总价的待确认门票处数（老结果缺省） */
+  unpriced_admission_count?: number | null;
   categories: CostCategorySummary[];
   missing_categories: CostCategoryKey[];
 }
@@ -85,12 +96,62 @@ export interface ScenarioCostStatus {
   status: "unselected" | "complete" | "partial" | "unavailable";
   costText: string;
   costBadge: string | null;
+  unpricedAdmissionNote?: string | null;
   showAmount: boolean;
 }
 
 export function formatMoneyPeak(range?: CostMoneyRange | null): string {
   if (!range) return "";
   return `¥ ${range.max_cny.toLocaleString()}`;
+}
+
+/**
+ * 场景对外展示的总价区间：有含已知门票的总价时优先用它，否则照旧用 total_range。
+ */
+export function resolveScenarioTotalRange(
+  scenario?: CostScenarioSummary | null,
+): CostMoneyRange | null {
+  if (!scenario) return null;
+  return scenario.total_range_with_known_admission ?? scenario.total_range;
+}
+
+/**
+ * 场景总价后面的未计入门票说明：仅在 unpriced_admission_count > 0 时返回。
+ */
+export function formatUnpricedAdmissionNote(
+  scenario?: CostScenarioSummary | null,
+): string | null {
+  const count = scenario?.unpriced_admission_count;
+  if (typeof count !== "number" || !Number.isFinite(count) || count <= 0) {
+    return null;
+  }
+  return `另有 ${count} 处门票未计入`;
+}
+
+/**
+ * 门票部分已知时的待确认文案（仅 admission + missing + 有 known_range + unpriced_item_count > 0）。
+ * 老结果或其它类别返回 null，调用方照旧展示“待确认”。
+ */
+export function formatPartialAdmissionText(
+  category?: CostCategorySummary | null,
+): string | null {
+  if (
+    !category ||
+    category.category !== "admission" ||
+    category.coverage !== "missing" ||
+    !category.known_range ||
+    !Number.isFinite(category.known_range.min_cny) ||
+    !Number.isFinite(category.known_range.max_cny) ||
+    category.priced_item_count === 0 ||
+    typeof category.unpriced_item_count !== "number" ||
+    !Number.isFinite(category.unpriced_item_count) ||
+    category.unpriced_item_count <= 0
+  ) {
+    return null;
+  }
+  const knownText = formatMoneyRange(category.known_range);
+  if (!knownText) return null;
+  return `已知 ${knownText}，另有 ${category.unpriced_item_count} 处待确认`;
 }
 
 /**
@@ -107,6 +168,7 @@ export function getScenarioCostStatus(
       status: "unselected",
       costText: "选择交通方式查看预估",
       costBadge: null,
+      unpricedAdmissionNote: null,
       showAmount: false,
     };
   }
@@ -116,23 +178,29 @@ export function getScenarioCostStatus(
       status: "unavailable",
       costText: "费用暂不可估算",
       costBadge: null,
+      unpricedAdmissionNote: null,
       showAmount: false,
     };
   }
 
+  const effectiveTotalRange = resolveScenarioTotalRange(scenario);
+  const unpricedAdmissionNote = formatUnpricedAdmissionNote(scenario);
+
   if (scenario.total_scope === "full_trip") {
     return {
       status: "complete",
-      costText: `预估 ${formatMoneyPeak(scenario.total_range)}`,
-      costBadge: null,
+      costText: `预估 ${formatMoneyPeak(effectiveTotalRange)}`,
+      costBadge: unpricedAdmissionNote,
+      unpricedAdmissionNote,
       showAmount: true,
     };
   }
 
   return {
     status: "partial",
-    costText: `已估 ${formatMoneyPeak(scenario.total_range)}`,
-    costBadge: "部分费用待确认",
+    costText: `已估 ${formatMoneyPeak(effectiveTotalRange)}`,
+    costBadge: unpricedAdmissionNote ?? "部分费用待确认",
+    unpricedAdmissionNote,
     showAmount: true,
   };
 }

@@ -9,12 +9,10 @@ from typing import Any
 
 from src.api import trip_results
 
-# Share-image cache identity is frozen because the v0.9.9.9 delivery changes
-# only PDF content and presentation. Existing paid share images stay reusable.
-SHARE_IMAGE_EXPORT_VERSION = "v0.9.9.6-schema-2.2-r1"
-PDF_EXPORT_VERSION = "v0.9.9.9-pdf-light-routebook-layout-3"
-# Compatibility alias for store-level tests and callers that mean "current PDF".
-EXPORT_VERSION = PDF_EXPORT_VERSION
+SHARE_IMAGE_EXPORT_VERSION = "v0.15.4-share-long-1"
+PDF_EXPORT_VERSION = "v0.15.4-pdf-book-1"
+# Keep the legacy PDF version inside the canonical payload for Schemas 2.1/2.2.
+EXPORT_VERSION = "v0.9.9.9-pdf-light-routebook-layout-3"
 
 
 @dataclass(frozen=True)
@@ -52,7 +50,9 @@ def _day_source(day: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _plan_source(plan: dict[str, Any], *, include_advice: bool) -> dict[str, Any]:
+def _plan_source(
+    plan: dict[str, Any], *, include_advice: bool, include_travel_details: bool
+) -> dict[str, Any]:
     source = {
         "plan_id": plan["plan_id"],
         "title": plan["title"],
@@ -62,7 +62,13 @@ def _plan_source(plan: dict[str, Any], *, include_advice: bool) -> dict[str, Any
         "days": [_day_source(day) for day in plan.get("days", [])],
         "cost_estimate": plan["cost_estimate"],
     }
+    if include_travel_details:
+        for field in ("accommodation", "transport"):
+            if field in plan:
+                source[field] = plan[field]
     if include_advice:
+        if plan.get("opening"):
+            source["opening"] = plan["opening"]
         packing = []
         for item in plan.get("packing_checklist") or []:
             if not isinstance(item, dict):
@@ -91,10 +97,10 @@ def build_export_source_from_trip_result(
 ) -> ExportSource:
     if artifact_type not in {"pdf", "share_image"}:
         raise ValueError("unsupported artifact type")
-    export_version = (
-        PDF_EXPORT_VERSION if artifact_type == "pdf" else SHARE_IMAGE_EXPORT_VERSION
-    )
     include_advice = artifact_type == "pdf"
+    schema_23 = result.schema_version == "2.3"
+    pdf_version = PDF_EXPORT_VERSION if schema_23 else EXPORT_VERSION
+    export_version = pdf_version if include_advice else SHARE_IMAGE_EXPORT_VERSION
     projected = result.model_dump(mode="json", exclude_none=True)
     artifact_request = trip_results.artifact_request_fields(result)
     request = dict(projected["request"])
@@ -112,12 +118,16 @@ def build_export_source_from_trip_result(
             "time_preferences": projected.get("time_preferences"),
             "must_include": projected.get("must_include", []),
             "plans": [
-                _plan_source(plan, include_advice=include_advice)
+                _plan_source(
+                    plan,
+                    include_advice=include_advice,
+                    include_travel_details=include_advice and schema_23,
+                )
                 for plan in projected.get("plans", [])
             ],
         },
     }
-    if projected.get("schema_version") == "2.3":
+    if schema_23:
         source["result"]["generation_policy_version"] = projected[
             "generation_policy_version"
         ]

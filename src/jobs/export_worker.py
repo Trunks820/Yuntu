@@ -29,6 +29,10 @@ from src.export.share_image_renderer import (
     ShareImageRenderError,
     render_share_image_artifact,
 )
+from src.export.trip_art import (
+    TripArtImageClient,
+    cleanup_expired_trip_art,
+)
 from src.jobs.export_store import (
     ExportArtifactRecord,
     claim_next_pending_artifact,
@@ -174,6 +178,15 @@ class ExportWorker:
         return count
 
     async def cleanup_expired_files(self) -> int:
+        settings = get_settings()
+        try:
+            await asyncio.to_thread(
+                cleanup_expired_trip_art,
+                Path(settings.export_storage_dir),
+                ttl_days=settings.export_artifact_ttl_days,
+            )
+        except OSError:
+            logger.warning("export worker failed to clean expired illustrations")
         records = await list_expired_ready_local_artifacts(
             limit=EXPIRED_CLEANUP_BATCH_SIZE,
         )
@@ -377,19 +390,31 @@ class ExportWorker:
         )
 
     def _default_pdf_renderer(self, source: ExportSource, output_path: Path) -> Any:
+        art_options = {}
+        if isinstance(self._city_background_client, TripArtImageClient):
+            art_options["ai_background_client"] = self._city_background_client
+        if art_options or self._city_photo_resolver is not None:
+            art_options["art_storage_dir"] = Path(get_settings().export_storage_dir)
         return render_pdf_artifact(
             source,
             output_path,
             city_photo_resolver=self._city_photo_resolver,
             storage_key=None,
+            **art_options,
         )
 
     def _default_share_image_renderer(self, source: ExportSource, output_path: Path) -> Any:
+        photo_options = (
+            {"city_photo_resolver": self._city_photo_resolver}
+            if self._city_photo_resolver is not None
+            else {}
+        )
         return render_share_image_artifact(
             source,
             output_path,
             ai_background_client=self._city_background_client,
             storage_key=None,
+            **photo_options,
         )
 
     def _timeout_for(self, artifact_type: str) -> float:
@@ -397,6 +422,8 @@ class ExportWorker:
         client_timeout = getattr(self._city_background_client, "timeout_seconds", None)
         if (
             artifact_type == "share_image"
+            # Keep the timeout contract for injected legacy renderers.
+            and not isinstance(self._city_background_client, TripArtImageClient)
             and isinstance(client_timeout, (int, float))
             and client_timeout > 0
         ):

@@ -24,5 +24,3 @@ export const CONCEPT_ASSETS = {
 } as const;
 
 export type ConceptImageKey = keyof typeof CONCEPT_ASSETS;
-
-export const HOME_HERO_IMAGE = CONCEPT_ASSETS.lake;

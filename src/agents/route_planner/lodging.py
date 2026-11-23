@@ -42,6 +42,7 @@ from src.agents.route_planner.places import (
     _coords,
     _place_id,
     coerce_place_id,
+    hav_km,
     _names_contain,
 )
 
@@ -52,6 +53,7 @@ HOTEL_GRID_METERS = 500
 METERS_PER_DEGREE = 111_320
 # Straight-line "near" for the lodging sentence. The search radius is separate.
 LODGING_NEAR_KM = 3.0
+LODGING_SWAP_NEAR_KM = 1.5
 HOTEL_PAGE_SIZE = 25
 HOTEL_TYPES = "100000"
 AROUND_URL = "https://restapi.amap.com/v5/place/around"
@@ -92,10 +94,10 @@ def _itinerary_places(plan: dict, by_id: dict[int, CandidatePlace]) -> list[Cand
     return found
 
 
-def _lodging_conflicts(area: CandidatePlace, itinerary: list[CandidatePlace]) -> bool:
+def _lodging_conflicts(area: CandidatePlace | AccommodationSuggestion, itinerary: list[CandidatePlace]) -> bool:
     """True when the anchor is a stop, or the two names contain each other."""
     for place in itinerary:
-        if area.place_id == place.place_id or _names_contain(area.name, place.name):
+        if getattr(area, "place_id", None) == place.place_id or _names_contain(area.name, place.name):
             return True
     return False
 
@@ -180,6 +182,39 @@ def _take_user_lodging(
     return None
 
 
+def _pick_area_lodging(
+    areas: list[CandidatePlace], itinerary: list[CandidatePlace], *,
+    proposed: CandidatePlace | AccommodationSuggestion | None = None,
+    center: tuple[float, float] | None = None,
+) -> tuple[CandidatePlace | None, list[str]]:
+    def popularity(place: CandidatePlace) -> tuple[int, int]:
+        return place.mention_count or 0, -place.place_id
+
+    if proposed is None:
+        proposed = max(areas, key=popularity, default=None)
+    safe = [place for place in areas if not _lodging_conflicts(place, itinerary)]
+    if proposed is not None and _lodging_conflicts(proposed, itinerary):
+        if center is not None:
+            reference = {"latitude": center[0], "longitude": center[1]}
+            district = getattr(proposed, "district", None)
+
+            def proximity(place: CandidatePlace) -> tuple[bool, float, int]:
+                from_proposed = hav_km(proposed, place)
+                same_area = from_proposed is not None and from_proposed <= LODGING_SWAP_NEAR_KM and (
+                    not district or not place.district or district == place.district
+                )
+                from_center = hav_km(reference, place)
+                return not same_area, from_center if from_center is not None else float("inf"), place.place_id
+
+            lodge = min(safe, key=proximity, default=None)
+        else:
+            lodge = max(safe, key=popularity, default=None)
+        change = f"改为「{lodge.name}」" if lodge is not None else "这次不写住处"
+        return lodge, [f"住处「{proposed.name}」与行程地点重名或互相包含，{change}"]
+    lodge = proposed if proposed in safe else max(safe, key=popularity, default=None)
+    return lodge, [f"住宿改为候选里提及最多的商圈「{lodge.name}」，记为自动推荐"] if lodge else []
+
+
 def _resolve_lodging(
     request: TripRequest,
     plan: dict,
@@ -213,25 +248,13 @@ def _resolve_lodging(
             return place, "model", place.name, adjustments
         rejected = place
     areas = [place for place in pool if place.place_type in AREA_TYPES and _coords(place)[0] is not None]
-    safe = [place for place in areas if not _lodging_conflicts(place, itinerary)]
-
-    def _remember(place: CandidatePlace, note: str) -> tuple:
-        adjustments.append(note)
+    place, notes = _pick_area_lodging(areas, itinerary, proposed=rejected)
+    adjustments.extend(notes)
+    if place is not None:
         plan["lodging"] = {**lodging, "anchor": place.place_id, "area": place.name}
         return place, "auto", place.name, adjustments
-
-    if safe:
-        place = max(safe, key=lambda item: (item.mention_count or 0, -item.place_id))
-        if rejected is not None:
-            return _remember(place, f"住处「{rejected.name}」与行程地点重名或互相包含，改为「{place.name}」")
-        top = max(areas, key=lambda item: (item.mention_count or 0, -item.place_id))
-        if top.place_id != place.place_id:
-            return _remember(place, f"住处「{top.name}」与行程地点重名或互相包含，改为「{place.name}」")
-        return _remember(place, f"住宿改为候选里提及最多的商圈「{place.name}」，记为自动推荐")
-    blocked = rejected or (max(areas, key=lambda item: (item.mention_count or 0, -item.place_id)) if areas else None)
-    if blocked is not None:
+    if notes:
         plan["lodging"] = {**lodging, "anchor": None, "area": ""}
-        adjustments.append(f"住处「{blocked.name}」与行程地点重名或互相包含，这次不写住处")
     return None, "", "", adjustments
 
 

@@ -38,6 +38,7 @@ OVER_LIMIT_INFOCODES = frozenset({
 ROUTE_KEY_BUCKET = "route"
 POI_DETAIL_KEY_BUCKET = "poi_detail"
 SEARCH_KEY_BUCKET = "search"
+STATICMAP_KEY_BUCKET = "staticmap"
 
 _QUOTA_TEXT_MARKERS = (
     "USER_DAILY_QUERY_OVER_LIMIT",
@@ -141,12 +142,14 @@ class AmapKeyCoordinator:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counter = 0
+        self._staticmap_counter = 0
         self._quota_until: dict[tuple[str, str], float] = {}
         self._over_limit_until: dict[tuple[str, str], float] = {}
 
     def reset(self) -> None:
         with self._lock:
             self._counter = 0
+            self._staticmap_counter = 0
             self._quota_until.clear()
             self._over_limit_until.clear()
 
@@ -171,8 +174,13 @@ class AmapKeyCoordinator:
             )
             if not usable:
                 return None
-            index = self._counter
-            self._counter += 1
+            # PDF exports should not advance the existing shared rotation.
+            if bucket == STATICMAP_KEY_BUCKET:
+                index = self._staticmap_counter
+                self._staticmap_counter += 1
+            else:
+                index = self._counter
+                self._counter += 1
         return usable[index % len(usable)]
 
     def usable_keys(

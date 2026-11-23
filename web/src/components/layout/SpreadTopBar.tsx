@@ -4,17 +4,20 @@ import { useTripStore } from "@/stores/tripStore";
 import { useTripTaskStore } from "@/stores/tripTaskStore";
 import "@/styles/spread.css";
 
-export type SpreadNavSection = "depart" | "book" | "trips";
+export type SpreadNavSection = "depart" | "trips";
 
-function resolveActiveSection(pathname: string): SpreadNavSection {
-  if (pathname === "/history") return "trips";
-  if (
+/** 正在装订或已经翻开的那一本（等待页、攻略页） */
+function isBookRoute(pathname: string): boolean {
+  return (
     pathname.startsWith("/planning/") ||
     pathname.startsWith("/result/") ||
     pathname.startsWith("/plan/")
-  ) {
-    return "book";
-  }
+  );
+}
+
+function resolveActiveSection(pathname: string): SpreadNavSection {
+  // 每一本都放在「我的行程」这个书架上，翻开时也高亮它
+  if (pathname === "/history" || isBookRoute(pathname)) return "trips";
   return "depart";
 }
 
@@ -40,54 +43,14 @@ export function SpreadTopBar() {
   const budgets = useTripTaskStore((s) => s.budgets);
   const acknowledgeTask = useTripTaskStore((s) => s.acknowledgeTask);
 
-  const currentResult = useTripStore((s) => s.result);
   const currentJobId = useTripStore((s) => s.currentJobId);
   const stageProgress = useTripStore((s) => s.stageProgress);
 
   const activeSection = resolveActiveSection(location.pathname);
-
-  const latestTask = useMemo(() => {
-    const list = Object.values(tasks);
-    if (list.length === 0) return null;
-    const pending = list.find((t) => t.status === "pending");
-    if (pending) return pending;
-    const unread = list
-      .filter((t) => t.notificationState === "unread")
-      .sort((a, b) => b.startedAt - a.startedAt)[0];
-    if (unread) return unread;
-    return list.sort((a, b) => b.startedAt - a.startedAt)[0] ?? null;
-  }, [tasks]);
-
-  const bookHref = useMemo(() => {
-    if (activeSection === "book") {
-      return `${location.pathname}${location.search}`;
-    }
-    if (latestTask) {
-      if (latestTask.status === "pending") {
-        return `/planning/${latestTask.jobId}`;
-      }
-      if (latestTask.status === "ready" && latestTask.resultRecordId) {
-        return buildResultHref(latestTask.resultRecordId, latestTask.jobId);
-      }
-    }
-    if (currentResult?.resultId) {
-      return buildResultHref(currentResult.resultId, currentResult.jobId);
-    }
-    if (currentJobId) {
-      return `/planning/${currentJobId}`;
-    }
-    return "/history";
-  }, [
-    activeSection,
-    location.pathname,
-    location.search,
-    latestTask,
-    currentResult,
-    currentJobId,
-  ]);
+  const onBookRoute = isBookRoute(location.pathname);
 
   const bindChip = useMemo(() => {
-    if (activeSection === "book") return null;
+    if (onBookRoute) return null;
 
     // 1. Running task in tripTaskStore
     const runningTask = Object.values(tasks).find((t) => t.status === "pending");
@@ -159,7 +122,7 @@ export function SpreadTopBar() {
     }
 
     return null;
-  }, [activeSection, tasks, budgets, currentJobId, stageProgress]);
+  }, [onBookRoute, tasks, budgets, currentJobId, stageProgress]);
 
   const handleBindChipClick = () => {
     if (!bindChip) return;
@@ -189,13 +152,6 @@ export function SpreadTopBar() {
           aria-current={activeSection === "depart" ? "page" : undefined}
         >
           出发
-        </Link>
-        <Link
-          to={bookHref}
-          data-view="book"
-          aria-current={activeSection === "book" ? "page" : undefined}
-        >
-          旅行册
         </Link>
         <Link
           to="/history"

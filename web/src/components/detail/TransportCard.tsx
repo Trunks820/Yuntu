@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { TripTransport, TransportMode, TransportOption } from "@/types/trip";
-import { ChevronUp, ChevronDown, TriangleAlert } from "lucide-react";
+import { ChevronUp, ChevronDown, Plane, TrainFront, TriangleAlert } from "lucide-react";
 
 interface TransportCardProps {
   data: TripTransport | null | undefined;
@@ -48,8 +48,15 @@ function ModeOptionsList({ mode }: { mode: TransportMode }) {
             className="flex flex-wrap items-center justify-between text-xs text-gray-700 sm:flex-nowrap"
           >
             <div className="flex items-center gap-2 font-mono font-medium text-gray-900 min-w-[90px]">
-              <span className="shrink-0 font-normal">
-                {opt.type === "flight" ? "✈️" : "🚄"}
+              <span
+                className="inline-flex shrink-0 items-center font-normal text-primary-600"
+                aria-hidden="true"
+              >
+                {opt.type === "flight" ? (
+                  <Plane size={14} style={{ width: 14, height: 14 }} />
+                ) : (
+                  <TrainFront size={14} style={{ width: 14, height: 14 }} />
+                )}
               </span>
               <span>{titleText}</span>
             </div>
@@ -82,7 +89,6 @@ interface ModeRowProps {
 function ModeRow({ mode, isSelected, onSelect }: ModeRowProps) {
   const [expanded, setExpanded] = useState(false);
   const isFlight = mode.mode === "flight";
-  const iconEmoji = isFlight ? "✈️" : "🚄";
   const modeTitle = isFlight ? "飞机" : "高铁";
   const hasOptions = mode.options && mode.options.length > 0;
   const showStaticBadge =
@@ -106,7 +112,16 @@ function ModeRow({ mode, isSelected, onSelect }: ModeRowProps) {
         {/* 等权摘要行：图标 + 模式 + 耗时 + 价格 + 班次 */}
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="font-bold text-gray-900 flex items-center gap-1">
-            <span aria-hidden="true">{iconEmoji}</span>
+            <span
+              className="inline-flex items-center text-primary-600"
+              aria-hidden="true"
+            >
+              {isFlight ? (
+                <Plane size={15} style={{ width: 15, height: 15 }} />
+              ) : (
+                <TrainFront size={15} style={{ width: 15, height: 15 }} />
+              )}
+            </span>
             <span>{modeTitle}</span>
           </span>
           {isSelected && (
@@ -188,7 +203,7 @@ export function TransportCard({
   // 确定顶图标
   const hasTrain = data.modes.some((m) => m.mode === "train");
   const hasFlight = data.modes.some((m) => m.mode === "flight");
-  const headerIcon = hasTrain && hasFlight ? "🚄 / ✈️" : hasFlight ? "✈️" : "🚄";
+  const showTrain = hasTrain || !hasFlight;
 
   // 收集最晚的余票查询时间（ISO 最大值）
   const checkedIsoList = data.modes
@@ -224,8 +239,19 @@ export function TransportCard({
           <div className="flex flex-1 flex-col items-center px-4">
             <div className="flex w-full items-center gap-2">
               <div className="h-[1px] flex-1 bg-gray-200" />
-              <span className="text-base text-primary-600" aria-hidden="true">
-                {headerIcon}
+              <span
+                className="inline-flex items-center gap-1 text-base text-primary-600"
+                aria-hidden="true"
+              >
+                {showTrain && (
+                  <TrainFront size={18} style={{ width: 18, height: 18 }} />
+                )}
+                {hasTrain && hasFlight && (
+                  <span className="text-xs text-gray-300">/</span>
+                )}
+                {hasFlight && (
+                  <Plane size={18} style={{ width: 18, height: 18 }} />
+                )}
               </span>
               <div className="h-[1px] flex-1 bg-gray-200" />
             </div>
