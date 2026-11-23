@@ -1170,12 +1170,12 @@ def resolve_role_config(role: str) -> RoleConfig:
         model = (
             "deepseek-chat"
             if provider == "deepseek"
-            else "gemini-2.5-flash"
+            else "gemini-3.8-flash"
             if provider == "gemini"
             else "gpt-4.1-mini"
         )
-    elif model == "gemini-flash-latest":
-        model = "gemini-2.5-flash" if provider == "gemini" else "deepseek-chat"
+    elif model in {"gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro"}:
+        model = "gemini-3.8-flash" if provider == "gemini" else "deepseek-chat"
     return RoleConfig(
         provider=provider,
         model=model,

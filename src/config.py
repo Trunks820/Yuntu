@@ -226,7 +226,7 @@ class Settings(BaseSettings):
 
     intent_provider: str = "gemini"
     intent_relay_profile: str = ""
-    intent_model: str = "gemini-2.5-flash"
+    intent_model: str = "gemini-3.8-flash"
     intent_api_key: str = ""
     intent_base_url: str = ""
 
@@ -259,7 +259,7 @@ class Settings(BaseSettings):
 
     review_provider: str = "gemini"
     review_relay_profile: str = ""
-    review_model: str = "gemini-2.5-flash"
+    review_model: str = "gemini-3.8-flash"
     review_api_key: str = ""
     review_base_url: str = ""
     review_plan_concurrency_enabled: bool = True
@@ -283,7 +283,7 @@ class Settings(BaseSettings):
 
     grouping_provider: str = "gemini"
     grouping_relay_profile: str = ""
-    grouping_model: str = "gemini-2.5-flash"
+    grouping_model: str = "gemini-3.8-flash"
     grouping_api_key: str = ""
     grouping_base_url: str = ""
     grouping_temperature: float = 0.3

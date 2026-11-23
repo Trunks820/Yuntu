@@ -153,7 +153,7 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 
 # 方式 C：按角色混用不同模型 / 网关（可选）
 # ROUTE_PLANNER_PROVIDER=gemini
-# ROUTE_PLANNER_MODEL=gemini-2.5-flash
+# ROUTE_PLANNER_MODEL=gemini-3.8-flash
 # ROUTE_PLANNER_API_KEY=your_gemini_key
 # WRITER_PROVIDER=deepseek
 # WRITER_MODEL=deepseek-chat

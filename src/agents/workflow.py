@@ -1032,8 +1032,12 @@ async def _run_trip_workflow_inner(
             accommodation = await accommodation_coro
     if v2_enabled:
         accommodation_context = accommodation
-        accommodation = (accommodation_context.anchors[0].suggestion
-                         if accommodation_context.state == "fixed" else None)
+        accommodation = (
+            accommodation_context.anchors[0].suggestion
+            if accommodation_context.anchors
+            and accommodation_context.state in {"fixed", "auto_candidates"}
+            else None
+        )
     if _accommodation_fallback_notice_required(
         trip_request,
         accommodation,
@@ -1328,8 +1332,12 @@ async def _run_trip_workflow_inner(
             anchor = locked.accommodation_anchor
             if anchor is not None and anchor.suggestion is not None:
                 accommodation = anchor.suggestion
-            elif route_source == "scheduled_fallback" and accommodation is not None and accommodation.source == "auto_recommended":
-                accommodation = None
+            elif (
+                accommodation is None
+                and accommodation_context is not None
+                and accommodation_context.anchors
+            ):
+                accommodation = accommodation_context.anchors[0].suggestion
             if (
                 route_source == "model"
                 and accommodation_context is not None
@@ -1339,7 +1347,17 @@ async def _run_trip_workflow_inner(
             ):
                 route_notices.append(ACCOMMODATION_FALLBACK_NOTICE)
         elif coupling_enabled:
-            accommodation = locked.accommodation_anchor.suggestion if locked.accommodation_anchor else None
+            if (
+                locked.accommodation_anchor is not None
+                and locked.accommodation_anchor.suggestion is not None
+            ):
+                accommodation = locked.accommodation_anchor.suggestion
+            elif (
+                accommodation is None
+                and accommodation_context is not None
+                and accommodation_context.anchors
+            ):
+                accommodation = accommodation_context.anchors[0].suggestion
     except (
         route_planning.RoutePlanInvariantError,
         route_planning.RouteMustIncludeConflictError,
@@ -1614,9 +1632,24 @@ async def _run_trip_workflow_inner(
             raise
 
     route_plans = pipeline.route_plans
-    if coupling_enabled:
-        for output in plans:
-            output.accommodation = accommodation.model_copy(deep=True) if accommodation else None
+    for output in plans:
+        if coupling_enabled:
+            output.accommodation = (
+                accommodation.model_copy(deep=True) if accommodation else None
+            )
+        elif output.accommodation is None and accommodation is not None:
+            output.accommodation = accommodation.model_copy(deep=True)
+        if (
+            output.accommodation is not None
+            and "【住宿" not in (output.plan_text or "")
+        ):
+            acc = output.accommodation
+            if acc.source == "user_specified":
+                line = f"【住宿建议】从你住的{acc.name}出发，每天安排已考虑往返距离。\n\n"
+            else:
+                reason = f"，{acc.reason}" if acc.reason else ""
+                line = f"【住宿建议】建议住在{acc.name}附近{reason}。\n\n"
+            output.plan_text = line + (output.plan_text or "")
     poi_identity_results = pipeline.poi_identity_results or []
     budget_results = pipeline.budget_results or []
     composition_blueprints = pipeline.composition_blueprints or []

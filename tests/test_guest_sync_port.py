@@ -41,8 +41,8 @@ def test_single_key_gemini_routes_all_roles_and_table_config(monkeypatch):
         cfg = llm.resolve_role_config(role)
         assert cfg.provider == "gemini"
         assert cfg.api_key == "test-gemini-key"
-    assert llm.resolve_role_config("writer").model == "gemini-2.5-pro"
-    assert llm.resolve_role_config("route_planner").model == "gemini-2.5-flash"
+    assert llm.resolve_role_config("writer").model == "gemini-3.8-flash"
+    assert llm.resolve_role_config("route_planner").model == "gemini-3.8-flash"
 
 
 def test_per_role_writer_key_falls_back_to_other_roles(monkeypatch):
@@ -124,4 +124,45 @@ def test_legacy_model_names_and_workflow_policy_default(monkeypatch):
     )
     monkeypatch.setattr(llm, "get_settings", lambda: settings)
     assert resolve_open_source_leg(settings, "selector").model == "deepseek-chat"
-    assert llm.resolve_role_config("review").model == "gemini-2.5-flash"
+    assert llm.resolve_role_config("review").model == "gemini-3.8-flash"
+
+
+def test_food_preference_notice_reconciles_scheduled_seed_restaurants():
+    from src.agents.preference_notices import build_preference_notices
+    from src.agents.schema import CandidatePlace, RouteDayGroup, RoutePlan, TripRequest
+
+    request = TripRequest(to_city="重庆", days=2, preferences=["美食"])
+    route = RoutePlan(
+        label="A",
+        day_groups=[
+            RouteDayGroup(
+                day=1,
+                area="解放碑",
+                places=[
+                    CandidatePlace(
+                        place_id=101,
+                        name="大井巷社区火锅",
+                        place_type="restaurant",
+                        latitude=29.558,
+                        longitude=106.578,
+                        mention_count=0,
+                        top_reasons=[],
+                    ),
+                    CandidatePlace(
+                        place_id=102,
+                        name="杨记隆府(解放碑总店)",
+                        place_type="restaurant",
+                        latitude=29.557,
+                        longitude=106.577,
+                        mention_count=0,
+                        top_reasons=[],
+                    ),
+                ],
+            )
+        ]
+    )
+    notices = build_preference_notices(request, route)
+    assert all("没排到网友提过的正餐店" not in notice for notice in notices.trip_lines)
+
+
+

@@ -47,12 +47,12 @@ PROVIDER_DEFAULT_MODELS: Mapping[str, dict[str, str]] = MappingProxyType({
         "extract": "deepseek-chat",
     },
     "gemini": {
-        "selector": "gemini-2.5-flash",
-        "route_planner": "gemini-2.5-flash",
-        "writer": "gemini-2.5-pro",
-        "writer_gemini": "gemini-2.5-pro",
-        "repair": "gemini-2.5-flash",
-        "extract": "gemini-2.5-flash",
+        "selector": "gemini-3.8-flash",
+        "route_planner": "gemini-3.8-flash",
+        "writer": "gemini-3.8-flash",
+        "writer_gemini": "gemini-3.8-flash",
+        "repair": "gemini-3.8-flash",
+        "extract": "gemini-3.8-flash",
     },
     "openai": {
         "selector": "gpt-4.1-mini",
@@ -65,7 +65,7 @@ PROVIDER_DEFAULT_MODELS: Mapping[str, dict[str, str]] = MappingProxyType({
 })
 
 DS_FLASH_MODEL = "deepseek-chat"
-WRITER_OPUS_MODEL = "gemini-2.5-pro"
+WRITER_OPUS_MODEL = "gemini-3.8-flash"
 
 
 @dataclass(frozen=True)
@@ -179,7 +179,7 @@ MODEL_ROUTES: tuple[AgentRoute, ...] = (
             "primary",
             GEMINI_OFFICIAL,
             _GEMINI_OPENAI_URL,
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
             "openai_chat",
             "ROUTE_PLANNER_GEMINI_API_KEY",
             "route_planner",
@@ -209,7 +209,7 @@ MODEL_ROUTES: tuple[AgentRoute, ...] = (
             "primary",
             GEMINI_OFFICIAL,
             _GEMINI_OPENAI_URL,
-            "gemini-2.5-pro",
+            "gemini-3.8-flash",
             "openai_chat",
             "WRITER_API_KEY",
             "writer-primary",
@@ -237,7 +237,7 @@ MODEL_ROUTES: tuple[AgentRoute, ...] = (
             "primary",
             GEMINI_OFFICIAL,
             _GEMINI_OPENAI_URL,
-            "gemini-2.5-pro",
+            "gemini-3.8-flash",
             "openai_chat",
             "WRITER_GEMINI_API_KEY",
             "writer-gemini",
@@ -256,7 +256,7 @@ MODEL_ROUTES: tuple[AgentRoute, ...] = (
             "primary",
             GEMINI_OFFICIAL,
             _GEMINI_OPENAI_URL,
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
             "openai_chat",
             "REPAIR_API_KEY",
             "repair-primary",
@@ -345,8 +345,8 @@ def _normalize_legacy_model(model: str, provider: str, default_model: str) -> st
     cleaned = _clean_str(model)
     if not cleaned or cleaned == "gpt-5.5":
         return default_model
-    if cleaned == "gemini-flash-latest":
-        return "gemini-2.5-flash" if provider == "gemini" else default_model
+    if cleaned in {"gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro"}:
+        return "gemini-3.8-flash" if provider == "gemini" else default_model
     return cleaned
 
 

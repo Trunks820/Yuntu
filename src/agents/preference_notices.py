@@ -471,10 +471,11 @@ def _food_sentence(status: object) -> str:
 
 
 def _food_fulfilled(places) -> bool:
-    """A tea house counts. Light food and an unmentioned restaurant do not.
+    """True when the finalized route includes a tea house or a proper meal restaurant.
 
-    The fixed sentence says the route has no visitor-mentioned proper meal.
-    Coverage status only chooses the reason clause; it does not invent one.
+    Light food (coffee, bakery, snacks) does not count as a proper meal. Any
+    proper restaurant or food stop scheduled on the route satisfies the meal
+    check so the opening never contradicts a route that already scheduled meals.
     """
     from src.agents.composition_blueprint import is_light_food_place
 
@@ -488,8 +489,7 @@ def _food_fulfilled(places) -> bool:
         kind = (place.place_type or "").strip().lower()
         if kind not in {"restaurant", "food"}:
             continue
-        if int(place.mention_count or 0) > 0 or bool(place.top_reasons):
-            return True
+        return True
     return False
 
 
